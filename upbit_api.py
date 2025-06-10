@@ -55,4 +55,7 @@ def print_asset_status(upbit):
     btc_qty, avg_price = get_balance_info(upbit)
     balances = upbit.get_balances()
     krw = next((float(b["balance"]) for b in balances if b["currency"] == "KRW"), 0.0)
-    print(f"[📊 자산 현황] KRW: {krw:,.0f} | BTC: {btc_qty:.6f} | 평단: {avg_price:,.0f} KRW")
+    current_price = get_market_data()["current_price"]
+    btc_value = btc_qty * current_price
+    total_asset = krw + btc_value
+    print(f"[📊 자산 현황] KRW: {krw:,.0f} | BTC: {btc_qty:.6f} | 평단: {avg_price:,.0f} KRW | 총 자산: {total_asset:,.0f} KRW")
