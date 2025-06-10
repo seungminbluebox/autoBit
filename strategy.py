@@ -8,6 +8,6 @@ def should_sell(data, btc_balance, avg_buy_price):
         return False, 0.0
 
     profit_ratio = (data["current_price"] - avg_buy_price) / avg_buy_price
-    if profit_ratio > 0.02 and data["rsi"] > 70:
+    if profit_ratio < 0.02: #and data["rsi"] > 70:
         return True, 0.5  # 50% 매도
     return False, 0.0

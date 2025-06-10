@@ -1,4 +1,7 @@
 # 실제 매매 함수
+from logutils import log_trade 
+import pyupbit 
+import time
 def execute_buy(upbit, ticker, amount_krw):
     try:
         # 현재 KRW 잔고 조회
@@ -12,7 +15,15 @@ def execute_buy(upbit, ticker, amount_krw):
         order = upbit.buy_market_order(ticker, amount_krw)
         print(f"[🔴매수] {amount_krw} KRW 매수 요청 완료")
         # 체결된 BTC 수량 반환
-        volume = float(order.get('executed_volume'))
+        for _ in range(5):
+            order_detail = upbit.get_order(order["uuid"])
+            volume = float(order_detail.get("executed_volume", 0.0))
+            if volume > 0:
+                break
+            time.sleep(1)
+        print(f"[🔴매수 체결] 체결된 BTC 수량: {volume:.8f} BTC")
+        price = pyupbit.get_current_price(ticker)
+        log_trade(ticker, "buy", price, volume)  # 체결 가격 추정
         return volume
     except Exception as e:
         # 예외 발생 시 에러 메시지 출력
@@ -32,7 +43,16 @@ def execute_sell(upbit, ticker, btc_balance, ratio):
         order = upbit.sell_market_order(ticker, sell_volume)
         print(f"[🔵매도] {sell_volume} BTC 매도 요청 완료")
         # 체결된 BTC 수량 반환
-        return float(order['volume'])
+        for _ in range(5):
+            order_detail = upbit.get_order(order["uuid"])
+            volume = float(order_detail.get("executed_volume", 0.0))
+            if volume > 0:
+                break
+            time.sleep(1)
+        print(f"[🔵매도 체결] 체결된 BTC 수량: {volume:.8f} BTC")
+        price = pyupbit.get_current_price(ticker)
+        log_trade(ticker, "sell", price , volume)
+        return volume
     
     except Exception as e:
         # 예외 발생 시 에러 메시지 출력

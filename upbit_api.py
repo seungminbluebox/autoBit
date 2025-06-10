@@ -9,7 +9,7 @@ def create_upbit(access_key, secret_key):
 
 # 현재가 등 지표 데이터 구성
 def get_market_data(ticker="KRW-BTC"):
-    df = get_ohlcv(ticker, interval="minute1", count=100)
+    df = get_ohlcv(ticker, interval="minute5", count=100)
 
     close_prices = df["close"].tolist()
     current_price = close_prices[-1]

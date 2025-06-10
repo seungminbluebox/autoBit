@@ -11,7 +11,7 @@ UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY")
 
 # 매매 설정
 TICKER = "KRW-BTC"           # 고정 종목
-BUY_AMOUNT_KRW = 10000       # 1회 매수 금액
+BUY_AMOUNT_KRW = 5500       # 1회 매수 금액
 INTERVAL_SEC = 5            # 매매 판단 주기 (초)
 
 # 파일 경로
