@@ -1,9 +1,24 @@
 import numpy as np
+import pandas as pd
 from upbit_api import get_ohlcv
 
-# 내부 판단 로직
+def calculate_ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+
+    ma_up = up.rolling(period).mean()
+    ma_down = down.rolling(period).mean()
+
+    rs = ma_up / (ma_down + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
 def _determine_market_context(df):
-    if len(df) < 12:
+    if len(df) < 30:
         return "sideways"
 
     sub_df = df[-288:] if len(df) >= 288 else df
@@ -12,24 +27,29 @@ def _determine_market_context(df):
     close_price = sub_df["close"].iloc[-1]
     return_ratio = (close_price - open_price) / open_price
 
-    # 최근 12봉 기준: 양봉/음봉 수
-    recent_closes = sub_df["close"].iloc[-12:]
-    recent_opens = sub_df["open"].iloc[-12:]
-    positive_candles = (recent_closes > recent_opens).sum()
-    negative_candles = (recent_closes < recent_opens).sum()
+    ema9 = calculate_ema(sub_df["close"], 9)
+    ema21 = calculate_ema(sub_df["close"], 21)
+    rsi = calculate_rsi(sub_df["close"])
 
-    if return_ratio > 0.007 and positive_candles >= 7:
+    ema_score = 1 if ema9.iloc[-1] > ema21.iloc[-1] else 0
+    rsi_score_bull = 1 if rsi.iloc[-1] > 55 else 0
+    rsi_score_def = 1 if rsi.iloc[-1] < 50 else 0  # 하락장 기준 완화됨
+    ret_score_bull = 1 if return_ratio > 0.005 else 0
+    ret_score_def = 1 if return_ratio < -0.005 else 0
+
+    bull_score = ema_score + rsi_score_bull + ret_score_bull
+    def_score = (1 - ema_score) + rsi_score_def + ret_score_def
+
+    if bull_score >= 2 and return_ratio > 0.003:
         return "bull"
-    elif return_ratio < -0.007 and negative_candles >= 7:
+    elif def_score >= 2 and return_ratio < -0.003:
         return "defensive"
     else:
         return "sideways"
 
-# 실전용
 def get_market_context(ticker="KRW-BTC", interval="minute5", count=288):
     df = get_ohlcv(ticker, interval, count)
     return _determine_market_context(df)
 
-# 백테스트용
 def get_market_context_from_df(df):
     return _determine_market_context(df)
