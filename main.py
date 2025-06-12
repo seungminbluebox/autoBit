@@ -4,8 +4,10 @@
 import time
 from config import UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY, TICKER, BUY_AMOUNT_KRW, INTERVAL_SEC
 from upbit_api import print_asset_status ,create_upbit, get_market_data, get_balance_info
-from strategy import should_buy, should_sell
 from trade import execute_buy, execute_sell
+from market_mode import get_market_context
+from strategy_loader import load_strategy
+
 
 def update_avg_buy_price(prev_qty, prev_avg, new_qty, new_price):
     total_qty = prev_qty + new_qty
@@ -28,6 +30,9 @@ while True:
     print(f"[시세🪙] 현재가: {current_price:,.0f} KRW")
     try:
         print('='* 50)
+        market_mode = get_market_context()
+        should_buy, should_sell = load_strategy(mode=market_mode)
+        print(f"🧠 시장 분석 결과: {market_mode.upper()} 전략 적용 중")
         print_asset_status(upbit)  # ← 루프 시작 시 현황
 
         # 1. 매수/매도 판단 지표 계산
@@ -52,7 +57,10 @@ while True:
                 print(f"[🔴매수 완료] 평단 갱신: {avg_price:,.0f} KRW, 보유: {btc_qty:.6f} BTC")
 
         # 1. 매도 판단 지표 계산
-        profit_ratio = (current_price - avg_price) / avg_price * 100
+        if avg_price > 0:
+            profit_ratio = (current_price - avg_price) / avg_price * 100
+        else:
+            profit_ratio = 0
         rsi = data["rsi"]
         ema9 = data["ema9"]
         ema21 = data["ema21"]
