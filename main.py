@@ -32,13 +32,14 @@ while True:
 
         # 1. 매수/매도 판단 지표 계산
         ma5 = data["ma5"]
-
+        ema9 = data["ema9"]
+        ema21 = data["ema21"]
         # 2. 매수/매도 판단
         buy_flag = should_buy(data)
         buy_log = (
-            f"[🔴매수 판단] 현재가: {current_price:,.0f} < MA5: {ma5:,.0f} → ✅ 조건 만족"
+            f"[🔴매수 판단] EMA9 > EMA21 ({ema9:,.0f} > {ema21:,.0f}) AND RSI > 50 → ✅ 조건 만족"
             if buy_flag else
-            f"[🔴매수 판단] 현재가: {current_price:,.0f} ≥ MA5: {ma5:,.0f} → ❌ 조건 불충족"
+            f"[🔴매수 판단] EMA9 ≤ EMA21 ({ema9:,.0f} ≤ {ema21:,.0f}) OR RSI ≤ 50 → ❌ 조건 불충족"
         )
         print(buy_log)
 
@@ -53,13 +54,14 @@ while True:
         # 1. 매도 판단 지표 계산
         profit_ratio = (current_price - avg_price) / avg_price * 100
         rsi = data["rsi"]
-
+        ema9 = data["ema9"]
+        ema21 = data["ema21"]
         # 2. 매도 판단
         sell_flag, sell_ratio = should_sell(data, btc_qty, avg_price)
         sell_log = (
-            f"[🔵매도 판단] 수익률: {profit_ratio:.2f}%, RSI: {rsi:.1f} → ✅ 조건 만족, {sell_ratio*100:.0f}% 매도"
+            f"[🔵매도 판단] EMA9 < EMA21 ({ema9:,.0f} > {ema21:,.0f}) OR RSI ≥ 70 → ✅ 조건 만족"
             if sell_flag else
-            f"[🔵매도 판단] 수익률: {profit_ratio:.2f}%, RSI: {rsi:.1f} → ❌ 조건 불충족"
+            f"[🔵매도 판단] EMA9 ≥ EMA21 ({ema9:,.0f} ≥ {ema21:,.0f}) OR RSI < 70 → ❌ 조건 불충족"
         )
         print(sell_log)
 

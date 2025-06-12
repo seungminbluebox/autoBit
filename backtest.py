@@ -1,4 +1,5 @@
 # backtest.py
+import pandas as pd  # ← 이거 추가
 
 import pyupbit
 import numpy as np
@@ -8,7 +9,7 @@ from upbit_api import calculate_rsi
 
 # 설정값
 TICKER = "KRW-BTC"
-INTERVAL = "minute60"
+INTERVAL = "minute5"
 COUNT = 200
 BUY_AMOUNT = 100000
 INITIAL_KRW = 1_000_000
@@ -20,9 +21,17 @@ avg_price = 0.0
 portfolio_history = []
 
 # 데이터 불러오기
-df = pyupbit.get_ohlcv(TICKER, interval=INTERVAL, count=COUNT)
+# df = pd.read_csv("하락장250221-250227.csv") #-0.81 #-3 손절X 2.72 v2 -0.71
+# df = pd.read_csv("횡보장250509-250517.csv") # -2.37 #-3 손절X -2.37 v2 -0.33
+df= pd.read_csv("상승장241211-241217.csv") #2.72% #-3 손절X 2.72 v2 1.36
+
 df["ma5"] = df["close"].rolling(window=5).mean()
 df["ma20"] = df["close"].rolling(window=20).mean()
+df["ema9"] = df["close"].ewm(span=9).mean()
+df["ema21"] = df["close"].ewm(span=21).mean()
+df["volume_ma10"] = df["volume"].rolling(window=10).mean()
+df["timestamp"] = pd.to_datetime(df["timestamp"])
+df.set_index("timestamp", inplace=True)
 
 # RSI 계산
 closes = df["close"].tolist()
@@ -46,6 +55,12 @@ for i in range(20, len(df)):
         "rsi": row["rsi"],
         "volume": row["volume"],
         "profit_ratio": profit_ratio,
+        "ema9": row["ema9"],
+        "ema21": row["ema21"],
+        "volume": row["volume"],
+        "volume_ma10": row["volume_ma10"],
+        "prev_rsi": df.iloc[i-1]["rsi"],
+
     }
 
     # 매수 판단
@@ -55,7 +70,7 @@ for i in range(20, len(df)):
         btc += qty
         avg_price = total_cost / btc
         krw -= BUY_AMOUNT
-        print(f"[매수] {price:,.0f}원에 {qty:.6f} BTC")
+        # print(f"[매수] {price:,.0f}원에 {qty:.6f} BTC")
 
     # 매도 판단
     sell_flag, sell_ratio = should_sell(data, btc, avg_price)
@@ -63,7 +78,7 @@ for i in range(20, len(df)):
         sell_qty = btc * sell_ratio
         krw += sell_qty * price
         btc -= sell_qty
-        print(f"[매도] {price:,.0f}원에 {sell_qty:.6f} BTC")
+        # print(f"[매도] {price:,.0f}원에 {sell_qty:.6f} BTC")
 
     # 자산 기록
     total_asset = krw + btc * price

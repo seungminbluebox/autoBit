@@ -15,11 +15,23 @@ def get_market_data(ticker="KRW-BTC"):
     current_price = close_prices[-1]
     ma5 = np.mean(close_prices[-5:])
     rsi = calculate_rsi(close_prices)
+    prev_rsi = calculate_rsi(close_prices[:-1])  # 바로 이전 시점 RSI 계산
+
+    ema9 = df["close"].ewm(span=9).mean().iloc[-1]
+    ema21 = df["close"].ewm(span=21).mean().iloc[-1]
+    volume_ma10 = df["volume"].rolling(window=10).mean().iloc[-1]
+    volume_now = df["volume"].iloc[-1]
 
     return {
         "current_price": current_price,
         "ma5": ma5,
-        "rsi": rsi
+        "rsi": rsi,
+        "ema9": ema9,
+        "ema21": ema21,  # 🔁 꼭 반환
+        "volume": volume_now,
+        "volume_ma10": volume_ma10,
+        "prev_rsi": prev_rsi,  # ✅ 추가
+
     }
 
 
