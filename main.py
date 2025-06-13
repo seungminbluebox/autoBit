@@ -7,6 +7,7 @@ from upbit_api import print_asset_status ,create_upbit, get_market_data, get_bal
 from trade import execute_buy, execute_sell
 from market_mode import get_market_context
 from strategy_loader import load_strategy
+from telegram_alert import send_telegram_message
 
 
 def update_avg_buy_price(prev_qty, prev_avg, new_qty, new_price):
@@ -34,6 +35,10 @@ while True:
         should_buy, should_sell = load_strategy(mode=market_mode)
         print(f"🧠 시장 분석 결과: {market_mode.upper()} 전략 적용 중 bull장일때만 매매 작동")
         # 루프 내부에서 시장 모드 판단 이후 추가
+        if market_mode != prev_mode:
+            send_telegram_message(
+                f"📈 시장 전환 감지!\n→ 이전: {prev_mode} → 현재: {market_mode}\n🕒"
+            )
         if prev_mode != market_mode and market_mode == "defensive" and btc_qty > 0:
             print(f"[⚠️ 전략 변경] 상승/횡보장에서 하락장(DEFENSIVE) 진입 → 보유 포지션 전량 청산")
             qty_sold = execute_sell(upbit, TICKER, btc_qty, 1.0)  # 전량
@@ -41,6 +46,9 @@ while True:
                 btc_qty = 0.0
                 avg_price = 0.0
                 print(f"[💣 청산 완료] DEFENSIVE 진입 시점 전량 정리")
+                send_telegram_message(
+                    f"⚠️ DEFENSIVE 전략 진입\n보유 포지션 전량 청산 완료\n수량: {qty_sold:.6f} BTC"
+                )
         print_asset_status(upbit)  # ← 루프 시작 시 현황
 
         # 1. 매수/매도 판단 지표 계산
@@ -68,7 +76,9 @@ while True:
                 avg_price = update_avg_buy_price(btc_qty, avg_price, qty_bought, current_price)
                 btc_qty += qty_bought
                 print(f"[🔴매수 완료] 평단 갱신: {avg_price:,.0f} KRW, 보유: {btc_qty:.6f} BTC")
-
+                send_telegram_message(
+                    f"🔴 매수 체결\n수량: {qty_bought:.6f} BTC\n단가: {current_price:,.0f} KRW\n총 보유량: {btc_qty:.6f} BTC\n평단: {avg_price:,.0f} KRW"
+                )
         # 1. 매도 판단 지표 계산
         if avg_price > 0:
             profit_ratio = (current_price - avg_price) / avg_price * 100
@@ -104,12 +114,21 @@ while True:
             if qty_sold > 0:
                 btc_qty -= qty_sold
                 print(f"[🔵매도 완료] 수익 실현: {qty_sold:.6f} BTC (≒ {int(current_price * qty_sold):,} KRW)")
-
+                send_telegram_message(
+                    f"🔵 매도 체결\n수량: {qty_sold:.6f} BTC\n단가: {current_price:,.0f} KRW\n잔여 보유량: {btc_qty:.6f} BTC\n수익률: {profit_ratio:.2f}%"
+                )
         # 6. 다음 루프까지 대기
         print_asset_status(upbit)  # ← 루프 시작 시 현황
+        for remaining in range(INTERVAL_SEC, 0, -1):
+            print(f"\r[⏰ 대기 중] 다음 실행까지 {remaining}초...", end="")
+            time.sleep(1)
+        print("\r" + " " * 50, end="\r")  # Clear the countdown line
         print('='* 50)
-        time.sleep(INTERVAL_SEC)
         prev_mode = market_mode
+        # send_telegram_message(
+        #     f"💹 현 수익률 리포트\n현재가: {current_price:,.0f} KRW\n평단: {avg_price:,.0f} KRW\n보유량: {btc_qty:.6f} BTC\n수익률: {profit_ratio:.2f}%"
+        # )
+
 
 
     except Exception as e:
