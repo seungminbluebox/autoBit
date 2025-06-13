@@ -21,6 +21,9 @@ def get_market_data(ticker="KRW-BTC"):
     ema21 = df["close"].ewm(span=21).mean().iloc[-1]
     volume_ma10 = df["volume"].rolling(window=10).mean().iloc[-1]
     volume_now = df["volume"].iloc[-1]
+    stddev = np.std(close_prices[-20:])
+    ma20 = np.mean(close_prices[-20:])
+    lower_band = ma20 - 2 * stddev
 
     return {
         "current_price": current_price,
@@ -31,6 +34,8 @@ def get_market_data(ticker="KRW-BTC"):
         "volume": volume_now,
         "volume_ma10": volume_ma10,
         "prev_rsi": prev_rsi,  # ✅ 추가
+        "lower_band": lower_band  # ✅ 추가
+
 
     }
 

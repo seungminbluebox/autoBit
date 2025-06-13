@@ -1,9 +1,6 @@
-### 📁 strategies/defensive.py (하락장 회피 전략 예시)
-
+### 🔻 하락장 전략 (유지)
 def should_buy(data):
-    return False  # 하락장에서는 진입 없음
+    return False  # 횡보장 매매 금지
 
 def should_sell(data, btc_balance, avg_price):
-    if btc_balance <= 0:
-        return False, 0.0
-    return True, 1.0  # 무조건 청산
+    return False, 0.0

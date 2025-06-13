@@ -14,6 +14,7 @@ INTERVAL = "minute5"
 COUNT = 200
 BUY_AMOUNT = 100000
 INITIAL_KRW = 1_000_000
+prev_mode = None  # 루프 바깥
 
 # 가상 자산 상태
 krw = INITIAL_KRW
@@ -41,7 +42,7 @@ df.set_index("timestamp", inplace=True)
 
 # RSI 계산
 closes = df["close"].tolist()
-df["rsi"] = [0]*len(df)
+df["rsi"] = np.nan
 for i in range(14, len(df)):
     df.loc[df.index[i], "rsi"] = calculate_rsi(closes[:i+1])
 mode_counter = Counter()
@@ -51,6 +52,12 @@ for i in range(20, len(df)):
     market_mode = get_market_context_from_df(df[:i])  # 최근 시세 기반
     mode_counter[market_mode] += 1  # ✅ 등장 횟수 누적
     should_buy, should_sell = load_strategy(market_mode)
+        # 루프 안: 시장 모드 판단 직후
+    if prev_mode != market_mode and market_mode == "defensive" and btc > 0:
+        krw += btc * price  # 전량 매도
+        btc = 0.0
+        avg_price = 0.0
+
     row = df.iloc[i]
     price = row["close"]
 
@@ -70,6 +77,10 @@ for i in range(20, len(df)):
         "volume_ma10": row["volume_ma10"],
         "prev_rsi": df.iloc[i-1]["rsi"],
     }
+    stddev = df.iloc[i-20:i]["close"].std()
+    ma20 = df.iloc[i-20:i]["close"].mean()
+    data["lower_band"] = ma20 - 2 * stddev
+
     low_5 = df.iloc[i-5:i]["low"].tolist()
     data["low_5"] = low_5
     high_5 = df.iloc[i-5:i]["high"].tolist()
@@ -94,6 +105,8 @@ for i in range(20, len(df)):
     # 자산 기록
     total_asset = krw + btc * price
     portfolio_history.append(total_asset)
+    prev_mode = market_mode
+
 
 # 결과 출력
 final_asset = krw + btc * closes[-1]
