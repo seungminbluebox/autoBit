@@ -40,6 +40,7 @@ def execute_sell(upbit, ticker, btc_balance, ratio):
         # 현재 BTC 잔고 조회, 비트 시세 확인
         price = pyupbit.get_current_price(ticker)
         sell_volume = round(btc_balance * ratio, 8)
+        print(f"[🔵매도] 요청 BTC 수량: {sell_volume:.8f} BTC (약 {sell_volume * price:,.0f} KRW)")
         # 잔고가 충분한지 확인
         if sell_volume <= 0:
             print("[✖️매도 비트 부족] 매도 수량이 0 이하")

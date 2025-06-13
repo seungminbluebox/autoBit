@@ -32,7 +32,7 @@ while True:
         print('='* 50)
         market_mode = get_market_context()
         should_buy, should_sell = load_strategy(mode=market_mode)
-        print(f"🧠 시장 분석 결과: {market_mode.upper()} 전략 적용 중")
+        print(f"🧠 시장 분석 결과: {market_mode.upper()} 전략 적용 중 bull장일때만 매매 작동")
         # 루프 내부에서 시장 모드 판단 이후 추가
         if prev_mode != market_mode and market_mode == "defensive" and btc_qty > 0:
             print(f"[⚠️ 전략 변경] 상승/횡보장에서 하락장(DEFENSIVE) 진입 → 보유 포지션 전량 청산")
@@ -49,15 +49,20 @@ while True:
         ema21 = data["ema21"]
         # 2. 매수/매도 판단
         buy_flag = should_buy(data)
-        buy_log = (
-            f"[🔴매수 판단] EMA9 > EMA21 ({ema9:,.0f} > {ema21:,.0f}) AND RSI > 50 → ✅ 조건 만족"
-            if buy_flag else
-            f"[🔴매수 판단] EMA9 ≤ EMA21 ({ema9:,.0f} ≤ {ema21:,.0f}) OR RSI ≤ 50 → ❌ 조건 불충족"
-        )
+        if market_mode == "bull":
+            buy_log = (
+                f"[🔴매수 판단] EMA9 > EMA21 ({ema9:,.0f} > {ema21:,.0f}) AND RSI > 55 ({rsi:.1f}) AND RSI 상승 → ✅ 조건 만족"
+                if buy_flag else
+                f"[🔴매수 판단] EMA9 ≤ EMA21 또는 RSI ≤ 55 또는 RSI 하락 → ❌ 조건 불충족"
+            )
+        else:
+            buy_log = (
+                f"[🔴매수 판단] 현재 시장 모드가 {market_mode.upper()} → ❌ 매수 불가"
+            )
         print(buy_log)
 
         # 3. 매수 실행
-        if buy_flag:#
+        if buy_flag:#True
             qty_bought = execute_buy(upbit, TICKER, BUY_AMOUNT_KRW)
             if qty_bought > 0:#
                 avg_price = update_avg_buy_price(btc_qty, avg_price, qty_bought, current_price)
@@ -72,17 +77,29 @@ while True:
         rsi = data["rsi"]
         ema9 = data["ema9"]
         ema21 = data["ema21"]
+        prev_rsi = data["prev_rsi"]
         # 2. 매도 판단
         sell_flag, sell_ratio = should_sell(data, btc_qty, avg_price)
-        sell_log = (
-            f"[🔵매도 판단] EMA9 < EMA21 ({ema9:,.0f} > {ema21:,.0f}) OR RSI ≥ 70 → ✅ 조건 만족"
-            if sell_flag else
-            f"[🔵매도 판단] EMA9 ≥ EMA21 ({ema9:,.0f} ≥ {ema21:,.0f}) OR RSI < 70 → ❌ 조건 불충족"
-        )
+        if avg_price > 0:
+            profit_ratio = (current_price - avg_price) / avg_price * 100
+        else:
+            profit_ratio = 0
+        if market_mode == "bull":
+            sell_log = (
+                f"[🔵매도 판단] 수익률 {profit_ratio:.2f}% ≥ 5% → ✅ 조건 만족"
+                if profit_ratio >= 5 else
+                f"[🔵매도 판단] 수익률 {profit_ratio:.2f}% ≥ 3% AND RSI 하락 ({rsi:.1f} < {prev_rsi:.1f}) → ✅ 조건 만족"
+                if profit_ratio >= 3 and rsi < prev_rsi else
+                f"[🔵매도 판단] 조건 불충족 (수익률 {profit_ratio:.2f}%, RSI {rsi:.1f} vs {prev_rsi:.1f}) → ❌"
+            )
+        else:
+            sell_log = (
+                f"[🔵매도 판단] 현재 시장 모드가 {market_mode.upper()} → ❌ 매도 불가"
+            )
         print(sell_log)
 
         # 3. 매도 실행
-        if sell_flag:#True
+        if sell_flag :#True
             qty_sold = execute_sell(upbit, TICKER, btc_qty, sell_ratio)
             if qty_sold > 0:
                 btc_qty -= qty_sold
