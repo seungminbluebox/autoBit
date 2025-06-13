@@ -31,6 +31,11 @@ def _determine_market_context(df):
     ema21 = calculate_ema(sub_df["close"], 21)
     rsi = calculate_rsi(sub_df["close"])
 
+    # ✅ 여기에 추가
+    spread = abs(ema9.iloc[-1] - ema21.iloc[-1]) / ema21.iloc[-1]
+    if rsi.iloc[-1] < 45 or spread < 0.0015:
+        return "sideways"
+    
     ema_score = 1 if ema9.iloc[-1] > ema21.iloc[-1] else 0
     rsi_score_bull = 1 if rsi.iloc[-1] > 55 else 0
     rsi_score_def = 1 if rsi.iloc[-1] < 50 else 0  # 하락장 기준 완화됨

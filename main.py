@@ -22,7 +22,7 @@ upbit = create_upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
 # 2. 프로그램 시작 시 보유량, 평단 불러오기
 btc_qty, avg_price = get_balance_info(upbit)
 print(f"[초기화] 보유 BTC: {btc_qty}, 평단: {avg_price:,.0f} KRW")
-
+prev_mode = None
 while True:
     # 3. 시세 및 지표 데이터 수집
     data = get_market_data(TICKER)
@@ -33,6 +33,14 @@ while True:
         market_mode = get_market_context()
         should_buy, should_sell = load_strategy(mode=market_mode)
         print(f"🧠 시장 분석 결과: {market_mode.upper()} 전략 적용 중")
+        # 루프 내부에서 시장 모드 판단 이후 추가
+        if prev_mode != market_mode and market_mode == "defensive" and btc_qty > 0:
+            print(f"[⚠️ 전략 변경] 상승/횡보장에서 하락장(DEFENSIVE) 진입 → 보유 포지션 전량 청산")
+            qty_sold = execute_sell(upbit, TICKER, btc_qty, 1.0)  # 전량
+            if qty_sold > 0:
+                btc_qty = 0.0
+                avg_price = 0.0
+                print(f"[💣 청산 완료] DEFENSIVE 진입 시점 전량 정리")
         print_asset_status(upbit)  # ← 루프 시작 시 현황
 
         # 1. 매수/매도 판단 지표 계산
@@ -84,6 +92,8 @@ while True:
         print_asset_status(upbit)  # ← 루프 시작 시 현황
         print('='* 50)
         time.sleep(INTERVAL_SEC)
+        prev_mode = market_mode
+
 
     except Exception as e:
         print(f"[오류 발생] {e}")
