@@ -46,10 +46,13 @@ def _determine_market_context(df):
     def_score = (1 - ema_score) + rsi_score_def + ret_score_def
 
     if bull_score >= 2 and return_ratio > 0.003:
+        print(f"bull_score: {bull_score}, def_score: {def_score}, return_ratio: {return_ratio:.4f}")
         return "bull"
     elif def_score >= 2 and return_ratio < -0.003:
+        print(f"bull_score: {bull_score}, def_score: {def_score}, return_ratio: {return_ratio:.4f}")
         return "defensive"
     else:
+        print(f"bull_score: {bull_score}, def_score: {def_score}, return_ratio: {return_ratio:.4f}")
         return "sideways"
 
 def get_market_context(ticker="KRW-BTC", interval="minute5", count=288):
