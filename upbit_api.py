@@ -43,6 +43,8 @@ def get_market_data(ticker="KRW-BTC"):
 # 보유량, 평단 불러오기
 def get_balance_info(upbit, ticker="KRW-BTC"):
     balances = upbit.get_balances()
+    print("DEBUG balances:", balances)  # 👈 이 줄 추가
+
     for b in balances:
         if b["currency"] == "BTC":
             qty = float(b["balance"])
