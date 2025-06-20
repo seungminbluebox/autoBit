@@ -57,7 +57,23 @@ def _determine_market_context(df):
 
 def get_market_context(ticker="KRW-BTC", interval="minute5", count=288):
     df = get_ohlcv(ticker, interval, count)
-    return _determine_market_context(df)
+    mode = _determine_market_context(df)
+    # 판단에 사용된 주요 지표 출력 (종가, EMA, RSI, 수익률 등)
+    last_close = df["close"].iloc[-1]
+    ema9 = calculate_ema(df["close"], 9).iloc[-1]
+    ema21 = calculate_ema(df["close"], 21).iloc[-1]
+    rsi = calculate_rsi(df["close"]).iloc[-1]
+    return_ratio = (last_close - df["open"].iloc[0]) / df["open"].iloc[0]
+
+    return {
+        "mode": mode,
+        "explanation": {
+            "종가 수익률": f"{return_ratio:.4f}",
+            "EMA9": round(ema9),
+            "EMA21": round(ema21),
+            "RSI": round(rsi, 1),
+        }
+    }
 
 def get_market_context_from_df(df):
     return _determine_market_context(df)

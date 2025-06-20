@@ -16,7 +16,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # 매매 설정
 TICKER = "KRW-BTC"           # 고정 종목
 BUY_AMOUNT_KRW = 20000       # 1회 매수 금액
-INTERVAL_SEC = 300          # 매매 판단 주기 (초)
+INTERVAL_SEC = 5          # 매매 판단 주기 (초)
 
 # 파일 경로
 LOG_FILE = "log.csv"

@@ -1,6 +1,5 @@
 #루프실행 + strategy.py + upbit_api.py + trade.py
 # main.py
-
 import time
 from config import UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY, TICKER, BUY_AMOUNT_KRW, INTERVAL_SEC
 from upbit_api import print_asset_status ,create_upbit, get_market_data, get_balance_info
@@ -8,6 +7,7 @@ from trade import execute_buy, execute_sell
 from market_mode import get_market_context
 from strategy_loader import load_strategy
 from telegram_alert import send_telegram_message
+from datetime import datetime
 
 
 def update_avg_buy_price(prev_qty, prev_avg, new_qty, new_price):
@@ -21,20 +21,24 @@ def update_avg_buy_price(prev_qty, prev_avg, new_qty, new_price):
 upbit = create_upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
 
 # 2. 프로그램 시작 시 보유량, 평단 불러오기
+send_telegram_message("📡 자동매매 봇 시작됨 (main.py 실행)")
+loop_count = 0
 btc_qty, avg_price = get_balance_info(upbit)
-print(f"[초기화] 보유 BTC: {btc_qty}, 평단: {avg_price:,.0f} KRW")
 prev_mode = None
 while True:
     # 3. 시세 및 지표 데이터 수집
     data = get_market_data(TICKER)
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     current_price = data["current_price"]
-    print(f"[시세🪙] 현재가: {current_price:,.0f} KRW")
+    print('='* 50)
+    print(f"[{current_time}] [시세🪙] 현재가: {current_price:,.0f} KRW")
     try:
-        print('='* 50)
-        market_mode = get_market_context()
+        # 시장 판단 + 설명 출력
+        context = get_market_context()
+        market_mode = context["mode"]
+        explanation = context["explanation"]
         should_buy, should_sell = load_strategy(mode=market_mode)
-        print(f"🧠 시장 분석 결과: {market_mode.upper()} 전략 적용 중 bull장일때만 매매 작동")
-        # 루프 내부에서 시장 모드 판단 이후 추가
+        print(f"[🧠 시장 판단] 현재 시장 모드: {market_mode.upper()}")
         if market_mode != prev_mode:
             send_telegram_message(
                 f"📈 시장 전환 감지!\n→ 이전: {prev_mode} → 현재: {market_mode}\n🕒"
@@ -128,8 +132,9 @@ while True:
         # send_telegram_message(
         #     f"💹 현 수익률 리포트\n현재가: {current_price:,.0f} KRW\n평단: {avg_price:,.0f} KRW\n보유량: {btc_qty:.6f} BTC\n수익률: {profit_ratio:.2f}%"
         # )
-
-
+        loop_count += 1
+        if loop_count % (86400 // INTERVAL_SEC) == 0:  # 86400 seconds = 24 hours
+            send_telegram_message(f"✅ 루프 정상 작동 중 ({loop_count}회 경과)")
 
     except Exception as e:
         print(f"[오류 발생] {e}")

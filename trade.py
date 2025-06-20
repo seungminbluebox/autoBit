@@ -1,6 +1,8 @@
 # 실제 매매 함수
 from logutils import log_trade 
 import pyupbit 
+# trade.py 상단에 추가
+from telegram_alert import send_telegram_message
 import time
 
 MIN_SELL_KRW = 5200  # 업비트 시장가 최소 주문 금액
@@ -32,6 +34,7 @@ def execute_buy(upbit, ticker, amount_krw):
     except Exception as e:
         # 예외 발생 시 에러 메시지 출력
         print(f"[💥매수 실패] {e}")
+        send_telegram_message(f"❌ 매수 실패: {e}")
         return 0.0
 
 
@@ -67,4 +70,5 @@ def execute_sell(upbit, ticker, btc_balance, ratio):
     except Exception as e:
         # 예외 발생 시 에러 메시지 출력
         print(f"[💥매도 실패] {e}")
+        send_telegram_message(f"❌ 매도 실패: {e}")
         return 0.0
