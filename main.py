@@ -26,13 +26,13 @@ loop_count = 0
 btc_qty, avg_price = get_balance_info(upbit)
 prev_mode = None
 while True:
-    # 3. 시세 및 지표 데이터 수집
-    data = get_market_data(TICKER)
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    current_price = data["current_price"]
-    print('='* 50)
-    print(f"[{current_time}] [시세🪙] 현재가: {current_price:,.0f} KRW")
     try:
+        # 3. 시세 및 지표 데이터 수집
+        data = get_market_data(TICKER)
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_price = data["current_price"]
+        print('='* 50)
+        print(f"[{current_time}] [시세🪙] 현재가: {current_price:,.0f} KRW")
         # 시장 판단 + 설명 출력
         context = get_market_context()
         market_mode = context["mode"]
