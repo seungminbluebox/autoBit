@@ -1,6 +1,6 @@
 # strategy_loader.py
 
-def load_strategy(mode="bull"):
+def load_strategy(mode="sideways"):
     if mode == "bull":
         from strategies.bull import should_buy, should_sell
     elif mode == "sideways":
