@@ -11,7 +11,7 @@ from datetime import datetime
 # 1. 업비트 객체 생성
 upbit = create_upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
 # 2. 프로그램 시작 시 보유량, 평단 불러오기
-send_telegram_message("📡 자동매매 봇 시작됨 (main.py 실행)")
+send_telegram_message("📡 자동매매 봇 시작됨 V1.1 (main.py 실행)")
 loop_count = 0
 prev_mode = None
 
