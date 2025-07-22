@@ -1,8 +1,9 @@
-### ✅ 상승장 전략 (완성)
+### ✅ 상승장 전략 (v2 - 완화된 기준 적용)
 def should_buy(data):
+    # [수정] RSI 기준을 55 -> 52로 완화하여 market_mode.py와 일관성 유지
     return (
         data["ema9"] > data["ema21"] and
-        data["rsi"] > 55 and
+        data["rsi"] > 52 and
         data["rsi"] > data["prev_rsi"]
     )
 

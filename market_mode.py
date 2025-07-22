@@ -37,18 +37,25 @@ def _determine_market_context(df):
         return "sideways"
     
     ema_score = 1 if ema9.iloc[-1] > ema21.iloc[-1] else 0
-    rsi_score_bull = 1 if rsi.iloc[-1] > 55 else 0
-    rsi_score_def = 1 if rsi.iloc[-1] < 50 else 0  # 하락장 기준 완화됨
-    ret_score_bull = 1 if return_ratio > 0.005 else 0
-    ret_score_def = 1 if return_ratio < -0.005 else 0
+    
+    # [상승장 추가 완화] 거의 모든 상승 시도를 포착하도록 기준 조정
+    rsi_score_bull = 1 if rsi.iloc[-1] > 49 else 0        # RSI가 50에 근접만 해도 점수 부여
+    ret_score_bull = 1 if return_ratio > 0.001 else 0     # 0.1%만 올라도 추세 점수 부여
+
+    # [하락장 추가 완화] 하락 신호를 더 민감하게 감지하도록 기준 조정
+    rsi_score_def = 1 if rsi.iloc[-1] < 53 else 0         # RSI가 53 미만이면 하락 점수 부여
+    ret_score_def = 1 if return_ratio < 0 else 0          # 수익률이 조금이라도 마이너스(-)이면 하락 점수 부여
 
     bull_score = ema_score + rsi_score_bull + ret_score_bull
     def_score = (1 - ema_score) + rsi_score_def + ret_score_def
 
-    if bull_score >= 2 and return_ratio > 0.003:
+    # [상승장 판단 유지]
+    if bull_score >= 2 and return_ratio > 0:
         print(f"bull_score: {bull_score}, def_score: {def_score}, return_ratio: {return_ratio:.4f}")
         return "bull"
-    elif def_score >= 2 and return_ratio < -0.003:
+        
+    # [하락장 추가 완화] 점수 조건만으로 판단하여 반응 속도 극대화
+    elif def_score >= 2:
         print(f"bull_score: {bull_score}, def_score: {def_score}, return_ratio: {return_ratio:.4f}")
         return "defensive"
     else:
