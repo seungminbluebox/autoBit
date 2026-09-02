@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -20,10 +21,14 @@ from autobit.indicators.trend import compute_trend_indicators
 from autobit.validation.models import CostScenario, FoldWindow, TrialConfig, WalkForwardConfig
 from autobit.validation.runner import (
     BacktestRequest,
+    _run_request,
     core_backtest,
     run_walk_forward,
 )
 from autobit.validation.splits import build_rolling_folds
+
+
+FIXTURES = Path(__file__).parents[1] / "fixtures"
 
 
 def _frame(periods: int = 5_000) -> pd.DataFrame:
@@ -65,6 +70,82 @@ def _result(request: BacktestRequest, values: tuple[float, ...] = (100.0, 110.0,
         final_equity=values[-1],
         total_fees=0.0,
         total_slippage=0.0,
+    )
+
+
+def _order_lifecycle(
+    request: BacktestRequest,
+    *,
+    order_id: str,
+    side: str,
+    requested_quantity: float,
+    terminal_status: OrderStatus = OrderStatus.COMPLETED,
+    terminal_filled_quantity: float | None = None,
+    signal_time: object | None = None,
+) -> tuple[OrderRecord, ...]:
+    """Build a native-shaped lifecycle with cumulative quantity semantics."""
+    signal = (
+        request.frame.index[-2].to_pydatetime()
+        if signal_time is None
+        else signal_time
+    )
+    occurred = request.frame.index[-1].to_pydatetime()
+    filled = requested_quantity if terminal_filled_quantity is None else terminal_filled_quantity
+    remainder = requested_quantity - filled
+    common = dict(
+        order_id=order_id,
+        side=side,
+        requested_quantity=requested_quantity,
+        occurred_at=occurred,
+        signal_time=signal,
+    )
+    return (
+        OrderRecord(
+            status=OrderStatus.CREATED,
+            filled_quantity=0.0,
+            remainder_quantity=requested_quantity,
+            **common,
+        ),
+        OrderRecord(
+            status=OrderStatus.SUBMITTED,
+            filled_quantity=0.0,
+            remainder_quantity=requested_quantity,
+            **common,
+        ),
+        OrderRecord(
+            status=OrderStatus.ACCEPTED,
+            filled_quantity=0.0,
+            remainder_quantity=requested_quantity,
+            **common,
+        ),
+        OrderRecord(
+            status=terminal_status,
+            filled_quantity=filled,
+            remainder_quantity=remainder,
+            fill_time=occurred if filled > 0.0 else None,
+            fill_price=100.0 if filled > 0.0 else None,
+            **common,
+        ),
+    )
+
+
+def _fixture(name: str) -> pd.DataFrame:
+    return pd.read_csv(FIXTURES / name, parse_dates=["timestamp"], index_col="timestamp")
+
+
+def _real_core_request(frame: pd.DataFrame, config: BacktestConfig) -> BacktestRequest:
+    return BacktestRequest(
+        phase="OOS",
+        fold_id="fold-000",
+        trial_id="baseline",
+        trial=TrialConfig("baseline", 200, 50, 20, 14, 2.5),
+        cost_id="zero",
+        cost=CostScenario("zero", 0.0, 0.0),
+        frame=frame,
+        config=config,
+        initial_equity=100.0,
+        initial_state=PositionState.FLAT,
+        pending_orders=0,
     )
 
 
@@ -268,6 +349,266 @@ def test_runner_retains_malformed_nested_backtest_evidence_as_failed_rows() -> N
         )
         assert stitched.status == "INCOMPLETE"
         assert stitched.equity_curve == ()
+
+
+def test_runner_retains_a_rebased_phase_curve_as_failed_and_incomplete() -> None:
+    """A fold must report its own fresh-100 execution path, not an arbitrary rebasing."""
+    frame = _frame()
+    folds = _folds(frame)
+
+    def fake_backtest(request: BacktestRequest) -> BacktestResult:
+        if (
+            request.phase == "OOS"
+            and request.trial_id == "baseline"
+            and request.cost_id == "zero"
+        ):
+            return _result(request, (50.0, 60.0, 60.0))
+        return _result(request)
+
+    result = run_walk_forward(frame, folds, fake_backtest)
+    failed = next(
+        run
+        for run in result.runs
+        if run.phase == "OOS" and run.trial_id == "baseline" and run.cost_id == "zero"
+    )
+    stitched = next(
+        item
+        for item in result.stitched_oos
+        if item.trial_id == "baseline" and item.cost_id == "zero"
+    )
+
+    assert failed.status == "FAILED"
+    assert "first phase equity" in (failed.error or "")
+    assert stitched.status == "INCOMPLETE"
+    assert stitched.equity_curve == ()
+
+
+def test_runner_accepts_tiny_initial_equity_floating_point_drift() -> None:
+    """The strict initial-equity guard must not reject harmless binary rounding."""
+    frame = _frame()
+    folds = _folds(frame)
+
+    def fake_backtest(request: BacktestRequest) -> BacktestResult:
+        if (
+            request.phase == "OOS"
+            and request.trial_id == "baseline"
+            and request.cost_id == "zero"
+        ):
+            return _result(request, (100.0 + 5e-11, 110.0, 121.0))
+        return _result(request)
+
+    result = run_walk_forward(frame, folds, fake_backtest)
+    run = next(
+        item
+        for item in result.runs
+        if item.phase == "OOS" and item.trial_id == "baseline" and item.cost_id == "zero"
+    )
+    assert run.status == "COMPLETED"
+
+
+def test_runner_retains_economically_inconsistent_order_and_trade_evidence() -> None:
+    """A well-shaped ledger must still conserve inventory and closed trade quantity."""
+    frame = _frame()
+    folds = _folds(frame)
+    invalid = {
+        ("baseline", "zero"): "zero_completed",
+        ("baseline", "baseline"): "undersized_completed",
+        ("ema_150", "zero"): "negative_inventory",
+        ("ema_150", "baseline"): "trade_quantity_mismatch",
+        ("ema_250", "zero"): "mutated_signal",
+        ("ema_250", "baseline"): "fee_without_fill",
+    }
+
+    def fake_backtest(request: BacktestRequest) -> BacktestResult:
+        result = _result(request)
+        kind = invalid.get((request.trial_id, request.cost_id))
+        if request.phase != "OOS" or kind is None:
+            return result
+        if kind == "zero_completed":
+            return replace(
+                result,
+                orders=_order_lifecycle(
+                    request,
+                    order_id="zero-completed",
+                    side="BUY",
+                    requested_quantity=1.0,
+                    terminal_filled_quantity=0.0,
+                ),
+            )
+        if kind == "undersized_completed":
+            return replace(
+                result,
+                orders=_order_lifecycle(
+                    request,
+                    order_id="undersized-completed",
+                    side="BUY",
+                    requested_quantity=1.0,
+                    terminal_filled_quantity=0.5,
+                ),
+            )
+        if kind == "negative_inventory":
+            return replace(
+                result,
+                orders=_order_lifecycle(
+                    request,
+                    order_id="sell-without-buy",
+                    side="SELL",
+                    requested_quantity=1.0,
+                ),
+            )
+        if kind == "trade_quantity_mismatch":
+            end = request.frame.index[-1].to_pydatetime()
+            return replace(
+                result,
+                orders=(
+                    *_order_lifecycle(
+                        request,
+                        order_id="buy",
+                        side="BUY",
+                        requested_quantity=1.0,
+                    ),
+                    *_order_lifecycle(
+                        request,
+                        order_id="sell",
+                        side="SELL",
+                        requested_quantity=1.0,
+                    ),
+                ),
+                trades=(
+                    TradeRecord(
+                        entry_time=end,
+                        exit_time=end,
+                        quantity=0.5,
+                        entry_price=100.0,
+                        exit_price=100.0,
+                        gross_pnl=0.0,
+                        net_pnl=0.0,
+                        fees=0.0,
+                        exit_reason="FORCED_END",
+                    ),
+                ),
+            )
+        if kind == "fee_without_fill":
+            buy = list(_order_lifecycle(
+                request,
+                order_id="buy-with-phantom-fee",
+                side="BUY",
+                requested_quantity=1.0,
+            ))
+            buy[2] = replace(buy[2], fee=1.0)
+            buy[3] = replace(buy[3], fee=1.0)
+            end = request.frame.index[-1].to_pydatetime()
+            return replace(
+                result,
+                orders=(
+                    *buy,
+                    *_order_lifecycle(
+                        request,
+                        order_id="sell-after-phantom-fee",
+                        side="SELL",
+                        requested_quantity=1.0,
+                    ),
+                ),
+                trades=(
+                    TradeRecord(
+                        entry_time=end,
+                        exit_time=end,
+                        quantity=1.0,
+                        entry_price=100.0,
+                        exit_price=100.0,
+                        gross_pnl=0.0,
+                        net_pnl=-1.0,
+                        fees=1.0,
+                        exit_reason="FORCED_END",
+                    ),
+                ),
+                total_fees=1.0,
+            )
+        lifecycle = list(_order_lifecycle(
+            request,
+            order_id="signal-mutated",
+            side="BUY",
+            requested_quantity=1.0,
+        ))
+        lifecycle[1] = replace(
+            lifecycle[1],
+            signal_time=request.frame.index[-3].to_pydatetime(),
+        )
+        return replace(result, orders=tuple(lifecycle))
+
+    result = run_walk_forward(frame, folds, fake_backtest)
+    failed = {
+        (run.trial_id, run.cost_id)
+        for run in result.runs
+        if run.phase == "OOS" and run.status == "FAILED"
+    }
+
+    assert failed == set(invalid)
+    phantom_fee = next(
+        run
+        for run in result.runs
+        if run.phase == "OOS" and run.trial_id == "ema_250" and run.cost_id == "baseline"
+    )
+    assert "fill increments" in (phantom_fee.error or "")
+    for trial_id, cost_id in invalid:
+        stitched = next(
+            item
+            for item in result.stitched_oos
+            if item.trial_id == trial_id and item.cost_id == cost_id
+        )
+        assert stitched.status == "INCOMPLETE"
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "config"),
+    (
+        ("entry_next_open.csv", BacktestConfig(force_liquidate_at_end=True)),
+        (
+            "partial_entry.csv",
+            BacktestConfig(entry_fill_fraction=0.5, force_liquidate_at_end=True),
+        ),
+        (
+            "partial_exit.csv",
+            BacktestConfig(exit_fill_fraction=0.5, force_liquidate_at_end=True),
+        ),
+        ("gap_stop.csv", BacktestConfig(force_liquidate_at_end=True)),
+    ),
+)
+def test_runner_phase_validation_accepts_real_core_lifecycles(
+    fixture_name: str,
+    config: BacktestConfig,
+) -> None:
+    """Plan 1 full/partial/stop and forced terminal lifecycles remain valid evidence."""
+    request = _real_core_request(_fixture(fixture_name), config)
+
+    run = _run_request(request, core_backtest)
+
+    assert run.status == "COMPLETED", run.error
+    assert run.result is not None
+    assert run.result.equity_curve[0].equity == pytest.approx(request.initial_equity)
+
+
+def test_runner_phase_validation_accepts_real_core_same_bar_stop() -> None:
+    """Same-bar entry and protective-stop fills remain economically ordered evidence."""
+    frame = _fixture("entry_next_open.csv").iloc[:612].copy()
+    frame.loc[pd.Timestamp("2025-01-05T04:00:00Z"), ["open", "high", "low", "close"]] = [
+        100.0,
+        101.0,
+        94.0,
+        100.0,
+    ]
+    request = _real_core_request(
+        frame,
+        BacktestConfig(
+            costs=CostConfig(fee_rate=0.0005, slippage_rate=0.001),
+            entry_fill_fraction=0.5,
+            force_liquidate_at_end=True,
+        ),
+    )
+
+    run = _run_request(request, core_backtest)
+
+    assert run.status == "COMPLETED", run.error
 
 
 def test_runner_uses_only_pre_test_context_and_excludes_future_and_embargo_rows() -> None:
