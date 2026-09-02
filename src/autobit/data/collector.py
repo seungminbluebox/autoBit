@@ -85,6 +85,7 @@ def collect_evidence_range(
 
     while True:
         request_to_utc = evidence.next_to_utc
+        request_boundary = _parse_utc(request_to_utc)
         page = client.fetch_page(request_to_utc)
         if not page:
             evidence = persist_raw_page(
@@ -101,6 +102,8 @@ def collect_evidence_range(
 
         timestamps = [_parse_utc(_timestamp_from(row)) for row in page]
         oldest = min(timestamps)
+        if oldest >= request_boundary:
+            raise ValueError("public candle page did not move backward")
         oldest_text = _format_utc(oldest)
         complete = oldest < start
         evidence = persist_raw_page(
@@ -115,10 +118,6 @@ def collect_evidence_range(
             return CollectionResult(
                 _frame_from_pages(load_raw_pages(evidence), start, end), evidence
             )
-        if len(evidence.pages) > 1:
-            prior_oldest = evidence.pages[-2].oldest_timestamp_utc
-            if prior_oldest is not None and oldest >= _parse_utc(prior_oldest):
-                raise ValueError("public candle page did not move backward")
 
 
 def _collect_legacy_range(

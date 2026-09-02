@@ -388,9 +388,13 @@ def _validate_pagination_state(
     label: str,
 ) -> None:
     """Ensure page order and pagination boundaries describe one backward walk."""
-    expected_request_to = end_utc
+    if complete and not pages:
+        raise ValueError(f"{label} has no terminal response")
+    start_boundary = _parse_utc_boundary(start_utc, label)
+    expected_request_to = _parse_utc_boundary(end_utc, label)
     for position, page in enumerate(pages):
-        if page.request_to_utc != expected_request_to:
+        request_to = _parse_utc_boundary(page.request_to_utc, label)
+        if request_to != expected_request_to:
             raise ValueError(f"{label} has invalid pagination boundaries")
         if page.row_count == 0:
             if (
@@ -399,21 +403,41 @@ def _validate_pagination_state(
                 or not complete
             ):
                 raise ValueError(f"{label} has invalid pagination boundaries")
-            expected_request_to = page.request_to_utc
+            expected_request_to = request_to
             continue
         if page.oldest_timestamp_utc is None:
             raise ValueError(f"{label} has invalid pagination boundaries")
-        expected_request_to = page.oldest_timestamp_utc
+        oldest = _parse_utc_boundary(page.oldest_timestamp_utc, label)
+        if oldest >= request_to:
+            raise ValueError(f"{label} has invalid pagination boundaries")
+        if position != len(pages) - 1 and oldest < start_boundary:
+            raise ValueError(f"{label} crossed requested start before its terminal response")
+        if not complete and oldest < start_boundary:
+            raise ValueError(f"{label} incomplete evidence already crossed requested start")
+        expected_request_to = oldest
 
-    if next_to_utc != expected_request_to:
+    if _parse_utc_boundary(next_to_utc, label) != expected_request_to:
         raise ValueError(f"{label} has invalid pagination boundaries")
     expected_previous = pages[-1].oldest_timestamp_utc if pages else None
-    if previous_oldest_utc != expected_previous:
+    if previous_oldest_utc != expected_previous or (
+        previous_oldest_utc is not None
+        and _parse_utc_boundary(previous_oldest_utc, label) != expected_request_to
+    ):
         raise ValueError(f"{label} has invalid pagination boundaries")
     if complete and pages and pages[-1].row_count > 0:
         oldest = pages[-1].oldest_timestamp_utc
-        if oldest is None or oldest >= start_utc:
+        if oldest is None or _parse_utc_boundary(oldest, label) >= start_boundary:
             raise ValueError(f"{label} claims completion before the requested start")
+
+
+def _parse_utc_boundary(value: str, label: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{label} has an invalid UTC pagination timestamp") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} has an invalid UTC pagination timestamp")
+    return parsed.astimezone(timezone.utc)
 
 
 def load_raw_pages(evidence: CollectionEvidence) -> tuple[list[dict[str, object]], ...]:

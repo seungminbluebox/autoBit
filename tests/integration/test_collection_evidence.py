@@ -61,6 +61,28 @@ def _collect(
     )
 
 
+def _replace_checkpoint_state(root: Path, state: dict[str, object]) -> None:
+    """Write a hash-linked state fixture without changing its raw page evidence."""
+    contents = storage._canonical_json_bytes(state)
+    snapshot_hash = hashlib.sha256(contents).hexdigest()
+    (root / f"collection-{snapshot_hash}.json").write_bytes(contents)
+    checkpoint = {
+        **state,
+        "collection_snapshot": f"collection-{snapshot_hash}.json",
+        "collection_snapshot_sha256": snapshot_hash,
+    }
+    (root / "checkpoint.json").write_bytes(storage._canonical_json_bytes(checkpoint))
+
+
+def _checkpoint_state(root: Path) -> dict[str, object]:
+    checkpoint = json.loads((root / "checkpoint.json").read_text(encoding="utf-8"))
+    return {
+        key: value
+        for key, value in checkpoint.items()
+        if key not in {"collection_snapshot", "collection_snapshot_sha256"}
+    }
+
+
 def test_interrupted_collection_resumes_from_saved_page_without_refetching_it(
     tmp_path: Path,
 ) -> None:
@@ -453,6 +475,150 @@ def test_checkpoint_with_a_nonsequential_request_boundary_fails_before_network(
         _collect(tmp_path, recovery_client)
 
     assert recovery_client.calls == []
+
+
+def test_repeated_page_does_not_advance_checkpoint_and_restart_uses_last_boundary(
+    tmp_path: Path,
+) -> None:
+    """A no-progress response is rejected before it can become recovery authority."""
+    first_page = [_candle("2026-01-01T08:00:00Z", 108), _candle("2026-01-01T04:00:00Z", 104)]
+
+    with pytest.raises(ValueError, match="move backward"):
+        _collect(tmp_path, _ScriptedPublicClient([first_page, first_page]))
+
+    checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert len(checkpoint["pages"]) == 1
+    assert checkpoint["next_to_utc"] == "2026-01-01T04:00:00Z"
+    resumed_client = _ScriptedPublicClient(
+        [
+            [
+                _candle("2026-01-01T04:00:00Z", 104),
+                _candle("2026-01-01T00:00:00Z", 100),
+                _candle("2025-12-31T20:00:00Z", 96),
+            ]
+        ]
+    )
+
+    resumed = _collect(tmp_path, resumed_client)
+
+    assert resumed_client.calls == ["2026-01-01T04:00:00Z"]
+    assert resumed.evidence.complete
+    assert len(resumed.evidence.pages) == 2
+
+
+def test_completed_checkpoint_without_a_terminal_response_is_rejected_before_network(
+    tmp_path: Path,
+) -> None:
+    """A completed range is meaningful only when an API terminal response exists."""
+    _collect(tmp_path, _ScriptedPublicClient([[]]))
+    state = _checkpoint_state(tmp_path)
+    state["pages"] = []
+    state["next_to_utc"] = "2026-01-01T12:00:00Z"
+    state["previous_oldest_utc"] = None
+    state["complete"] = True
+    _replace_checkpoint_state(tmp_path, state)
+    client = _ScriptedPublicClient([])
+
+    with pytest.raises(ValueError, match="terminal response"):
+        _collect(tmp_path, client)
+
+    assert client.calls == []
+
+
+def test_incomplete_checkpoint_that_already_crossed_start_is_rejected_before_network(
+    tmp_path: Path,
+) -> None:
+    """A terminal non-empty page cannot be relabeled as resumable evidence."""
+    _collect(
+        tmp_path,
+        _ScriptedPublicClient(
+            [[_candle("2026-01-01T04:00:00Z"), _candle("2025-12-31T20:00:00Z")]]
+        ),
+    )
+    state = _checkpoint_state(tmp_path)
+    state["complete"] = False
+    _replace_checkpoint_state(tmp_path, state)
+    client = _ScriptedPublicClient([])
+
+    with pytest.raises(ValueError, match="incomplete.*crossed"):
+        _collect(tmp_path, client)
+
+    assert client.calls == []
+
+
+def test_nonempty_page_crossing_start_is_an_accepted_terminal_response(
+    tmp_path: Path,
+) -> None:
+    """The first page whose oldest candle predates start completes the chain."""
+    result = _collect(
+        tmp_path,
+        _ScriptedPublicClient(
+            [[_candle("2026-01-01T04:00:00Z"), _candle("2025-12-31T20:00:00Z")]]
+        ),
+    )
+    rerun_client = _ScriptedPublicClient([])
+
+    rerun = _collect(tmp_path, rerun_client)
+
+    assert result.evidence.complete
+    assert result.evidence.pages[-1].oldest_timestamp_utc == "2025-12-31T20:00:00Z"
+    assert rerun.evidence.complete
+    assert rerun_client.calls == []
+
+
+def test_final_empty_page_is_an_accepted_terminal_response(tmp_path: Path) -> None:
+    """A final empty response also establishes a completed evidence chain."""
+    result = _collect(
+        tmp_path,
+        _ScriptedPublicClient(
+            [
+                [_candle("2026-01-01T08:00:00Z"), _candle("2026-01-01T04:00:00Z")],
+                [],
+            ]
+        ),
+    )
+    rerun_client = _ScriptedPublicClient([])
+
+    rerun = _collect(tmp_path, rerun_client)
+
+    assert result.evidence.complete
+    assert result.evidence.pages[-1].row_count == 0
+    assert result.evidence.pages[-1].oldest_timestamp_utc is None
+    assert rerun.evidence.complete
+    assert rerun_client.calls == []
+
+
+def test_checkpointless_recovery_ignores_a_longer_nonprogress_snapshot_tip(
+    tmp_path: Path,
+) -> None:
+    """Recovery must not select a hash-valid duplicate-page snapshot as its tip."""
+    first_page = [_candle("2026-01-01T08:00:00Z"), _candle("2026-01-01T04:00:00Z")]
+    with pytest.raises(PublicDataUnavailable):
+        _collect(
+            tmp_path,
+            _ScriptedPublicClient([first_page, PublicDataUnavailable("temporary outage")]),
+        )
+    state = _checkpoint_state(tmp_path)
+    pages = state["pages"]
+    assert isinstance(pages, list)
+    duplicate = dict(pages[0])
+    duplicate["request_to_utc"] = "2026-01-01T04:00:00Z"
+    state["pages"] = [*pages, duplicate]
+    state["next_to_utc"] = "2026-01-01T04:00:00Z"
+    state["previous_oldest_utc"] = "2026-01-01T04:00:00Z"
+    _replace_checkpoint_state(tmp_path, state)
+    (tmp_path / "checkpoint.json").unlink()
+
+    recovered = storage.load_collection_evidence(
+        tmp_path,
+        source_url=PUBLIC_CANDLE_URL,
+        start_utc="2026-01-01T00:00:00Z",
+        end_utc="2026-01-01T12:00:00Z",
+        config=DataConfig(page_size=2),
+    )
+
+    assert len(recovered.pages) == 1
+    assert recovered.next_to_utc == "2026-01-01T04:00:00Z"
 
 
 def test_data_quality_accepts_completed_evidence_chain_offline(tmp_path: Path) -> None:
