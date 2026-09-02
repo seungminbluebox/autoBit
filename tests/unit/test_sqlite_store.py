@@ -492,6 +492,42 @@ def test_public_transaction_rejects_an_incomplete_raw_projection(tmp_path: Path)
     assert store.replay_state().last_sequence == 0
 
 
+def test_public_transaction_does_not_expose_commit_or_rollback(tmp_path: Path) -> None:
+    store = _open_store(tmp_path / "paper.sqlite3")
+
+    with store.transaction() as transaction:
+        assert not hasattr(transaction, "commit")
+        assert not hasattr(transaction, "rollback")
+        with pytest.raises(AttributeError):
+            getattr(transaction, "commit")()
+        with pytest.raises(AttributeError):
+            getattr(transaction, "rollback")()
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        " COMMIT",
+        "-- leading comment\nRoLlBaCk",
+        "/* block comment */ SAVEPOINT escaped",
+        "\n\tBEGIN IMMEDIATE",
+        "-- first\n/* second */ RELEASE SAVEPOINT escaped",
+        "END",
+    ],
+)
+def test_public_transaction_rejects_transaction_control_sql(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    store = _open_store(tmp_path / (sha256_text(statement) + ".sqlite3"))
+
+    with pytest.raises(ValueError, match="transaction-control SQL is not allowed"):
+        with store.transaction() as transaction:
+            transaction.execute(statement)
+
+    assert store.replay_state().last_sequence == 0
+
+
 def test_two_store_instances_contend_safely_for_one_idempotency_key(tmp_path: Path) -> None:
     path = tmp_path / "paper.sqlite3"
     first = _open_store(path)
@@ -549,6 +585,19 @@ def test_order_projection_corruption_fails_closed(tmp_path: Path) -> None:
         store.replay_state()
 
 
+def test_sub_tolerance_order_projection_mutation_is_still_corruption(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.record_order_once("entry", "BUY", 0.2, order_id="entry-1", occurred_at=UTC_0)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE orders SET filled_quantity = 5e-11 WHERE order_id = 'entry-1'",
+        )
+
+    with pytest.raises(StoreCorruptionError, match="order projection does not match event replay"):
+        store.replay_state()
+
+
 def test_deleted_tail_event_is_detected_from_autoincrement_history(tmp_path: Path) -> None:
     path = tmp_path / "paper.sqlite3"
     store = _open_store(path)
@@ -560,6 +609,241 @@ def test_deleted_tail_event_is_detected_from_autoincrement_history(tmp_path: Pat
 
     with pytest.raises(StoreCorruptionError, match="event tail was deleted"):
         store.replay_state()
+
+
+def test_event_stream_digest_detects_non_state_payload_and_envelope_tampering(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.append_event("first", "CYCLE_EVIDENCE", UTC_0, {"value": 1})
+    store.append_event("second", "CYCLE_EVIDENCE", UTC_4, {"value": 2})
+    assert len(store.replay_state().event_digest) == 64
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE events
+            SET event_id = 'changed', event_type = 'OTHER_EVIDENCE',
+                occurred_at_utc = '2026-01-01T02:00:00Z',
+                payload_json = '{"value":99}'
+            WHERE sequence = 1
+            """,
+        )
+
+    with pytest.raises(StoreCorruptionError, match="snapshot.*sequence 1"):
+        store.replay_state()
+
+
+def test_every_historical_snapshot_is_checked_not_only_latest(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.append_event("first", "CYCLE_EVIDENCE", UTC_0, {"value": 1})
+    store.append_event("second", "CYCLE_EVIDENCE", UTC_4, {"value": 2})
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT state_json FROM snapshots WHERE sequence = 1",
+        ).fetchone()
+        state = json.loads(row[0])
+        state["cash"] = 99.0
+        connection.execute(
+            "UPDATE snapshots SET state_json = ? WHERE sequence = 1",
+            (json.dumps(state, sort_keys=True, separators=(",", ":")),),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="snapshot.*sequence 1"):
+        store.replay_state()
+
+
+def test_sub_tolerance_historical_snapshot_mutation_is_still_corruption(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.append_event("first", "CYCLE_EVIDENCE", UTC_0, {})
+    with sqlite3.connect(path) as connection:
+        state = json.loads(
+            connection.execute(
+                "SELECT state_json FROM snapshots WHERE sequence = 1",
+            ).fetchone()[0],
+        )
+        state["cash"] += 1e-11
+        connection.execute(
+            "UPDATE snapshots SET state_json = ? WHERE sequence = 1",
+            (json.dumps(state, sort_keys=True, separators=(",", ":")),),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="snapshot.*sequence 1"):
+        store.replay_state()
+
+
+@pytest.mark.parametrize(
+    "weakness",
+    [
+        "missing_unique",
+        "wrong_declared_type",
+        "missing_autoincrement",
+        "comment_only_autoincrement",
+        "missing_not_null",
+        "hidden_generated_column",
+    ],
+)
+def test_constraint_light_lookalike_schema_is_rejected(
+    tmp_path: Path,
+    weakness: str,
+) -> None:
+    reference_path = tmp_path / f"reference-{weakness}.sqlite3"
+    reference = _open_store(reference_path)
+    reference.close()
+    with sqlite3.connect(reference_path) as connection:
+        initial_snapshot = connection.execute(
+            "SELECT state_json FROM snapshots WHERE sequence = 0",
+        ).fetchone()[0]
+    counterfeit_path = tmp_path / f"counterfeit-{weakness}.sqlite3"
+    _create_counterfeit_schema(counterfeit_path, initial_snapshot, weakness)
+
+    store = SQLiteStore(counterfeit_path)
+    with pytest.raises(StoreCorruptionError, match="schema (definition|constraint)"):
+        store.initialize()
+
+
+def test_positive_btc_dust_is_never_reclassified_or_destroyed(tmp_path: Path) -> None:
+    store = _open_store(tmp_path / "paper.sqlite3")
+    store.append_fill("entry", "BUY", 5e-11, 1.0, 0.0, UTC_0)
+    after_buy = store.replay_state()
+    assert after_buy.position_state is PositionState.LONG
+    assert after_buy.btc_quantity == 5e-11
+    assert after_buy.btc_cost_basis == 5e-11
+
+    store.append_fill("exit", "SELL", 1e-11, 1.0, 0.0, UTC_4)
+    after_partial_sell = store.replay_state()
+    assert after_partial_sell.position_state is PositionState.LONG
+    assert after_partial_sell.btc_quantity == 4e-11
+    assert after_partial_sell.btc_cost_basis == 4e-11
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload", "message"),
+    [
+        ("BREAKER_STATE", {"halt_entries": 1}, "halt_entries must be a bool"),
+        ("BREAKER_STATE", {"reasons": "API_FAILURES"}, "reasons must be a list"),
+        ("BREAKER_STATE", {"reasons": [""]}, "reason must be a non-empty"),
+        ("HEALTH_STATE", {"halt_entries": 0}, "halt_entries must be a bool"),
+        ("HEALTH_STATE", {"unresolved_orders": -1}, "unresolved_orders"),
+        ("HEALTH_STATE", {"ledger_matches": 1}, "ledger_matches must be a bool"),
+    ],
+)
+def test_known_safety_fields_are_strictly_validated_before_append(
+    tmp_path: Path,
+    event_type: str,
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    store = _open_store(tmp_path / (sha256_text(repr(payload)) + ".sqlite3"))
+
+    with pytest.raises(ValueError, match=message):
+        store.append_event("unsafe", event_type, UTC_0, payload)
+
+    assert store.replay_state().last_sequence == 0
+
+
+def test_corrupt_known_safety_field_fails_replay_instead_of_failing_open(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.append_event("breaker", "BREAKER_STATE", UTC_0, {"halt_entries": True})
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE event_id = 'breaker'",
+            ('{"halt_entries":1}',),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="halt_entries must be a bool"):
+        store.replay_state()
+
+
+def test_transition_order_status_cancels_partial_entry_and_survives_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.record_order_once("entry", "BUY", 0.2, order_id="entry-1", occurred_at=UTC_0)
+    assert store.transition_order_status(
+        "entry-1",
+        "entry-submitted",
+        OrderStatus.SUBMITTED,
+        "2026-01-01T01:00:00Z",
+    )
+    assert store.transition_order_status(
+        "entry-1",
+        "entry-accepted",
+        OrderStatus.ACCEPTED,
+        "2026-01-01T02:00:00Z",
+    )
+    store.append_fill("entry-1", "BUY", 0.1, 100.0, 0.0, UTC_4)
+    assert store.transition_order_status(
+        "entry-1",
+        "entry-canceled",
+        OrderStatus.CANCELED,
+        UTC_8,
+        reason="PARTIAL_REMAINDER",
+    )
+    assert not store.transition_order_status(
+        "entry-1",
+        "entry-canceled",
+        OrderStatus.CANCELED,
+        UTC_8,
+        reason="PARTIAL_REMAINDER",
+    )
+    store.close()
+
+    reopened = _open_store(path)
+    state = reopened.replay_state()
+    assert state.position_state is PositionState.LONG
+    assert state.btc_quantity == pytest.approx(0.1)
+    assert state.pending_orders == ()
+
+
+def test_transition_order_status_rejects_conflict_illegal_transition_and_terminal_fill(
+    tmp_path: Path,
+) -> None:
+    store = _open_store(tmp_path / "paper.sqlite3")
+    store.record_order_once("entry", "BUY", 0.2, order_id="entry-1", occurred_at=UTC_0)
+    with pytest.raises(ValueError, match="illegal order status transition"):
+        store.transition_order_status(
+            "entry-1",
+            "illegal",
+            OrderStatus.ACCEPTED,
+            "2026-01-01T01:00:00Z",
+        )
+    assert store.transition_order_status(
+        "entry-1",
+        "cancel",
+        OrderStatus.CANCELED,
+        "2026-01-01T02:00:00Z",
+    )
+    with pytest.raises(IdempotencyConflictError, match="different transition payload"):
+        store.transition_order_status(
+            "entry-1",
+            "cancel",
+            OrderStatus.REJECTED,
+            "2026-01-01T02:00:00Z",
+        )
+    with pytest.raises(ValueError, match="terminal order"):
+        store.append_fill("entry-1", "BUY", 0.1, 100.0, 0.0, UTC_4)
+
+
+def test_created_order_can_end_as_insufficient_cash_atomically(tmp_path: Path) -> None:
+    store = _open_store(tmp_path / "paper.sqlite3")
+    store.record_order_once("entry", "BUY", 1.0, order_id="entry-1", occurred_at=UTC_0)
+
+    assert store.transition_order_status(
+        "entry-1",
+        "entry-insufficient",
+        OrderStatus.INSUFFICIENT_CASH,
+        "2026-01-01T01:00:00Z",
+        reason="INSUFFICIENT_CASH",
+    )
+    state = store.replay_state()
+    assert state.pending_orders == ()
+    assert state.position_state is PositionState.FLAT
 
 
 def test_context_manager_and_close_are_idempotent(tmp_path: Path) -> None:
@@ -581,3 +865,81 @@ def _table_names(path: Path) -> set[str]:
                 "SELECT name FROM sqlite_master WHERE type = 'table'",
             )
         }
+
+
+def sha256_text(value: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _create_counterfeit_schema(
+    path: Path,
+    initial_snapshot: str,
+    weakness: str,
+) -> None:
+    event_id = "event_id TEXT NOT NULL UNIQUE"
+    requested_quantity = "requested_quantity REAL NOT NULL"
+    event_sequence = "sequence INTEGER PRIMARY KEY AUTOINCREMENT"
+    event_type = "event_type TEXT NOT NULL"
+    idempotency = "idempotency_key TEXT NOT NULL UNIQUE"
+    snapshot_extra = ""
+    if weakness == "missing_unique":
+        event_id = "event_id TEXT NOT NULL"
+        idempotency = "idempotency_key TEXT NOT NULL"
+    elif weakness == "wrong_declared_type":
+        requested_quantity = "requested_quantity TEXT NOT NULL"
+    elif weakness == "missing_autoincrement":
+        event_sequence = "sequence INTEGER PRIMARY KEY"
+    elif weakness == "comment_only_autoincrement":
+        event_sequence = (
+            "/* sequence INTEGER PRIMARY KEY AUTOINCREMENT */ "
+            "sequence INTEGER PRIMARY KEY"
+        )
+    elif weakness == "missing_not_null":
+        event_type = "event_type TEXT"
+    elif weakness == "hidden_generated_column":
+        snapshot_extra = ", hidden TEXT GENERATED ALWAYS AS ('x') VIRTUAL"
+
+    with sqlite3.connect(path) as connection:
+        if weakness in {"missing_autoincrement", "comment_only_autoincrement"}:
+            connection.execute(
+                "CREATE TABLE seed_sequence (sequence INTEGER PRIMARY KEY AUTOINCREMENT)",
+            )
+            connection.execute("DROP TABLE seed_sequence")
+        connection.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute(
+            f"""
+            CREATE TABLE events (
+                {event_sequence}, {event_id}, {event_type},
+                occurred_at_utc TEXT NOT NULL, payload_json TEXT NOT NULL
+            )
+            """,
+        )
+        connection.execute(
+            f"""
+            CREATE TABLE orders (
+                order_id TEXT PRIMARY KEY, {idempotency}, side TEXT NOT NULL,
+                {requested_quantity}, filled_quantity REAL NOT NULL,
+                status TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+            )
+            """,
+        )
+        connection.execute(
+            """
+            CREATE TABLE snapshots (
+                sequence INTEGER PRIMARY KEY, state_json TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL{snapshot_extra}
+            )
+            """.format(snapshot_extra=snapshot_extra),
+        )
+        connection.execute("INSERT INTO schema_version VALUES (1)")
+        connection.executemany(
+            "INSERT INTO metadata VALUES (?, ?)",
+            (("initial_equity", "100.0"), ("market", "KRW-BTC")),
+        )
+        connection.execute(
+            "INSERT INTO snapshots VALUES (0, ?, '1970-01-01T00:00:00Z')",
+            (initial_snapshot,),
+        )

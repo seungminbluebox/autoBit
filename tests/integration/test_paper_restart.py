@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 
@@ -99,3 +101,42 @@ def test_reopen_reads_completed_fill_but_does_not_apply_retry_twice(tmp_path: Pa
     assert after_retry == before_retry
     assert after_retry.cash == pytest.approx(79.98)
     assert after_retry.btc_quantity == pytest.approx(0.25)
+
+
+def test_replay_reads_one_consistent_snapshot_while_another_store_commits(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    ready = Event()
+    committed = Event()
+
+    class CoordinatedReader(SQLiteStore):
+        pause_after_event_projection = False
+
+        def _rebuild_from_events(self, connection):
+            result = super()._rebuild_from_events(connection)
+            if self.pause_after_event_projection:
+                self.pause_after_event_projection = False
+                ready.set()
+                assert committed.wait(timeout=5.0)
+            return result
+
+    reader = CoordinatedReader(path)
+    reader.initialize()
+    reader.append_event("before", "CYCLE_EVIDENCE", "2026-01-01T00:00:00Z", {})
+    writer = SQLiteStore(path)
+    writer.initialize()
+
+    def commit_during_replay() -> None:
+        assert ready.wait(timeout=5.0)
+        writer.append_event("during", "CYCLE_EVIDENCE", "2026-01-01T04:00:00Z", {})
+        committed.set()
+
+    reader.pause_after_event_projection = True
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(commit_during_replay)
+        reader_view = reader.replay_state()
+        future.result(timeout=5.0)
+
+    assert reader_view.last_sequence == 1
+    assert reader.replay_state().last_sequence == 2

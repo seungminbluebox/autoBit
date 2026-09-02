@@ -11,6 +11,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from hashlib import sha256
 import json
 import math
@@ -29,6 +30,7 @@ _MARKET = "KRW-BTC"
 _INITIAL_EQUITY = 100.0
 _TOLERANCE = 1e-10
 _EPOCH = "1970-01-01T00:00:00Z"
+_EMPTY_EVENT_DIGEST = sha256(b"").hexdigest()
 _UTC_Z_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$",
 )
@@ -46,30 +48,84 @@ _ACTIVE_ORDER_STATUSES = frozenset(
 _ORDER_SEED_STATUSES = frozenset(
     {OrderStatus.CREATED, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED},
 )
+_LEGAL_ORDER_TRANSITIONS = {
+    OrderStatus.CREATED: frozenset(
+        {
+            OrderStatus.SUBMITTED,
+            OrderStatus.CANCELED,
+            OrderStatus.INSUFFICIENT_CASH,
+            OrderStatus.REJECTED,
+        },
+    ),
+    OrderStatus.SUBMITTED: frozenset(
+        {
+            OrderStatus.ACCEPTED,
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+            OrderStatus.INSUFFICIENT_CASH,
+            OrderStatus.REJECTED,
+        },
+    ),
+    OrderStatus.ACCEPTED: frozenset(
+        {
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+            OrderStatus.INSUFFICIENT_CASH,
+            OrderStatus.REJECTED,
+        },
+    ),
+    OrderStatus.PARTIAL: frozenset(
+        {
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+            OrderStatus.INSUFFICIENT_CASH,
+            OrderStatus.REJECTED,
+        },
+    ),
+}
 _REQUIRED_TABLES = frozenset(
     {"schema_version", "metadata", "events", "orders", "snapshots"},
 )
-_REQUIRED_COLUMNS = {
-    "schema_version": ("version",),
-    "metadata": ("key", "value"),
+_EXPECTED_TABLE_INFO = {
+    "schema_version": (("version", "INTEGER", 0, 1),),
+    "metadata": (("key", "TEXT", 0, 1), ("value", "TEXT", 1, 0)),
     "events": (
-        "sequence",
-        "event_id",
-        "event_type",
-        "occurred_at_utc",
-        "payload_json",
+        ("sequence", "INTEGER", 0, 1),
+        ("event_id", "TEXT", 1, 0),
+        ("event_type", "TEXT", 1, 0),
+        ("occurred_at_utc", "TEXT", 1, 0),
+        ("payload_json", "TEXT", 1, 0),
     ),
     "orders": (
-        "order_id",
-        "idempotency_key",
-        "side",
-        "requested_quantity",
-        "filled_quantity",
-        "status",
-        "updated_at_utc",
+        ("order_id", "TEXT", 0, 1),
+        ("idempotency_key", "TEXT", 1, 0),
+        ("side", "TEXT", 1, 0),
+        ("requested_quantity", "REAL", 1, 0),
+        ("filled_quantity", "REAL", 1, 0),
+        ("status", "TEXT", 1, 0),
+        ("updated_at_utc", "TEXT", 1, 0),
     ),
-    "snapshots": ("sequence", "state_json", "created_at_utc"),
+    "snapshots": (
+        ("sequence", "INTEGER", 0, 1),
+        ("state_json", "TEXT", 1, 0),
+        ("created_at_utc", "TEXT", 1, 0),
+    ),
 }
+_TRANSACTION_CONTROL_KEYWORDS = frozenset(
+    {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"},
+)
+_REASON_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_KNOWN_BOOLEAN_STATE_FIELDS = frozenset(
+    {
+        "halt_entries",
+        "ledger_matches",
+        "timestamps_monotonic",
+        "latest_candle_valid",
+    },
+)
+_KNOWN_COUNT_STATE_FIELDS = frozenset(
+    {"api_failures", "api_successes", "unresolved_orders"},
+)
 
 
 class StoreError(RuntimeError):
@@ -120,6 +176,65 @@ class PaperSnapshot:
     breaker_state: Mapping[str, object]
     health_state: Mapping[str, object]
     event_evidence: tuple[StoredEvent, ...]
+    event_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayResult:
+    state: PaperSnapshot
+    snapshot_mappings: tuple[dict[str, object], ...]
+    snapshot_timestamps: tuple[str, ...]
+
+
+class _RestrictedCursor:
+    """Cursor results without a route back to the owned SQLite connection."""
+
+    __slots__ = ("__cursor",)
+
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
+        self.__cursor = cursor
+
+    @property
+    def lastrowid(self) -> int | None:
+        return self.__cursor.lastrowid
+
+    @property
+    def rowcount(self) -> int:
+        return self.__cursor.rowcount
+
+    def fetchone(self) -> sqlite3.Row | tuple[Any, ...] | None:
+        return self.__cursor.fetchone()
+
+    def fetchall(self) -> list[sqlite3.Row] | list[tuple[Any, ...]]:
+        return self.__cursor.fetchall()
+
+    def __iter__(self):
+        return iter(self.__cursor)
+
+
+class _TransactionFacade:
+    """Restricted SQL view that cannot end or replace the store-owned transaction."""
+
+    __slots__ = ("__connection",)
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.__connection = connection
+
+    def execute(
+        self,
+        sql: str,
+        parameters: Sequence[object] | Mapping[str, object] = (),
+    ) -> _RestrictedCursor:
+        _reject_transaction_control_sql(sql)
+        return _RestrictedCursor(self.__connection.execute(sql, parameters))
+
+    def executemany(
+        self,
+        sql: str,
+        parameters: Sequence[Sequence[object]],
+    ) -> _RestrictedCursor:
+        _reject_transaction_control_sql(sql)
+        return _RestrictedCursor(self.__connection.executemany(sql, parameters))
 
 
 class SQLiteStore:
@@ -166,7 +281,8 @@ class SQLiteStore:
         with self._lock:
             connection = self._connect()
             if self._initialized:
-                self._validate_schema_and_identity(connection)
+                with self._read_transaction() as read_connection:
+                    self._validate_schema_and_identity(read_connection)
                 return
 
             tables = self._application_tables(connection)
@@ -182,7 +298,8 @@ class SQLiteStore:
 
             self._initialized = True
             try:
-                self._replay_and_verify(connection)
+                with self._read_transaction() as read_connection:
+                    self._replay_and_verify(read_connection)
             except Exception:
                 self._initialized = False
                 raise
@@ -204,11 +321,11 @@ class SQLiteStore:
             self._closed = True
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self) -> Iterator[_TransactionFacade]:
         """Run a public mutation boundary using ``BEGIN IMMEDIATE``."""
         self._ensure_ready()
         with self._transaction(require_initialized=True) as connection:
-            yield connection
+            yield _TransactionFacade(connection)
             self._replay_and_verify(connection)
 
     def append_event(
@@ -225,9 +342,14 @@ class SQLiteStore:
             "event type must be non-empty",
         )
         occurred_at_utc, occurred_datetime = _canonical_timestamp(occurred_at)
-        payload_json, _ = _canonical_payload(payload)
+        payload_json, normalized_payload = _canonical_payload(payload)
+        _validate_known_state_payload(
+            normalized_event_type,
+            normalized_payload,
+            corruption=False,
+        )
 
-        with self.transaction() as connection:
+        with self._mutation_transaction() as connection:
             self._replay_and_verify(connection)
             if connection.execute(
                 "SELECT 1 FROM events WHERE event_id = ?",
@@ -250,8 +372,8 @@ class SQLiteStore:
                 ),
             )
             sequence = int(cursor.lastrowid)
-            state = self._rebuild_from_events(connection)
-            self._insert_snapshot(connection, state, occurred_at_utc)
+            replay = self._rebuild_from_events(connection)
+            self._insert_snapshot(connection, replay.state, occurred_at_utc)
             return sequence
 
     def record_order_once(
@@ -298,7 +420,7 @@ class SQLiteStore:
         }
         payload_json, _ = _canonical_payload(payload)
 
-        with self.transaction() as connection:
+        with self._mutation_transaction() as connection:
             current = self._replay_and_verify(connection)
             existing = connection.execute(
                 """
@@ -365,8 +487,8 @@ class SQLiteStore:
                     occurred_at_utc,
                 ),
             )
-            state = self._rebuild_from_events(connection)
-            self._insert_snapshot(connection, state, occurred_at_utc)
+            replay = self._rebuild_from_events(connection)
+            self._insert_snapshot(connection, replay.state, occurred_at_utc)
             return True
 
     def append_fill(
@@ -410,7 +532,7 @@ class SQLiteStore:
             else f"fill:{sha256((occurred_at_utc + payload_json).encode('utf-8')).hexdigest()}"
         )
 
-        with self.transaction() as connection:
+        with self._mutation_transaction() as connection:
             current = self._replay_and_verify(connection)
             existing = connection.execute(
                 """
@@ -431,17 +553,22 @@ class SQLiteStore:
                 )
 
             self._validate_timestamp_order(connection, occurred_datetime)
+            quantity_decimal = Decimal(str(normalized_quantity))
+            price_decimal = Decimal(str(normalized_price))
+            fee_decimal = Decimal(str(normalized_fee))
+            cash_decimal = Decimal(str(current.cash))
+            btc_decimal = Decimal(str(current.btc_quantity))
             if normalized_side == "BUY":
-                resulting_cash = current.cash - (
-                    normalized_quantity * normalized_price + normalized_fee
+                resulting_cash = cash_decimal - (
+                    quantity_decimal * price_decimal + fee_decimal
                 )
             else:
-                if normalized_quantity > current.btc_quantity:
+                if quantity_decimal > btc_decimal:
                     raise ValueError("fill would oversell BTC")
-                resulting_cash = current.cash + (
-                    normalized_quantity * normalized_price - normalized_fee
+                resulting_cash = cash_decimal + (
+                    quantity_decimal * price_decimal - fee_decimal
                 )
-            if resulting_cash < 0.0:
+            if resulting_cash < 0:
                 raise ValueError("fill would make cash negative")
 
             order = connection.execute(
@@ -465,11 +592,11 @@ class SQLiteStore:
                     order["filled_quantity"],
                     "invalid filled quantity in order projection",
                 )
-                total_filled = already_filled + normalized_quantity
-                if total_filled > requested:
+                total_filled = Decimal(str(already_filled)) + quantity_decimal
+                requested_decimal = Decimal(str(requested))
+                if total_filled > requested_decimal:
                     raise ValueError("fill exceeds requested quantity")
-                if _numbers_close(total_filled, requested):
-                    total_filled = requested
+                if total_filled == requested_decimal:
                     next_status = OrderStatus.COMPLETED
                 else:
                     next_status = OrderStatus.PARTIAL
@@ -480,7 +607,7 @@ class SQLiteStore:
                     WHERE order_id = ?
                     """,
                     (
-                        total_filled,
+                        float(total_filled),
                         next_status.value,
                         occurred_at_utc,
                         normalized_order_id,
@@ -494,23 +621,137 @@ class SQLiteStore:
                 """,
                 (normalized_fill_id, occurred_at_utc, payload_json),
             )
-            state = self._rebuild_from_events(connection)
-            self._insert_snapshot(connection, state, occurred_at_utc)
+            replay = self._rebuild_from_events(connection)
+            self._insert_snapshot(connection, replay.state, occurred_at_utc)
+            return True
+
+    def transition_order_status(
+        self,
+        order_id: str,
+        idempotency_key: str,
+        status: OrderStatus,
+        occurred_at: str | datetime,
+        *,
+        reason: str | None = None,
+    ) -> bool:
+        """Persist one legal, idempotent order lifecycle transition."""
+        normalized_order_id = _nonempty_text(order_id, "order id must be non-empty")
+        normalized_key = _nonempty_text(
+            idempotency_key,
+            "idempotency key must be non-empty",
+        )
+        if not isinstance(status, OrderStatus):
+            raise ValueError("status must be a valid OrderStatus")
+        if reason is not None:
+            normalized_reason = _nonempty_text(reason, "reason must be non-empty")
+        else:
+            normalized_reason = None
+        occurred_at_utc, occurred_datetime = _canonical_timestamp(occurred_at)
+        event_id = f"order-status:{sha256(normalized_key.encode('utf-8')).hexdigest()}"
+        payload = {
+            "idempotency_key": normalized_key,
+            "order_id": normalized_order_id,
+            "reason": normalized_reason,
+            "status": status.value,
+        }
+        payload_json, _ = _canonical_payload(payload)
+
+        with self._mutation_transaction() as connection:
+            self._replay_and_verify(connection)
+            existing_event = connection.execute(
+                """
+                SELECT event_type, occurred_at_utc, payload_json
+                FROM events WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if existing_event is not None:
+                if (
+                    str(existing_event["event_type"]) == "ORDER_STATUS"
+                    and str(existing_event["occurred_at_utc"]) == occurred_at_utc
+                    and str(existing_event["payload_json"]) == payload_json
+                ):
+                    return False
+                raise IdempotencyConflictError(
+                    f"idempotency key has different transition payload: {normalized_key}",
+                )
+
+            order = connection.execute(
+                """
+                SELECT requested_quantity, filled_quantity, status
+                FROM orders WHERE order_id = ?
+                """,
+                (normalized_order_id,),
+            ).fetchone()
+            if order is None:
+                raise ValueError(f"unknown order id: {normalized_order_id}")
+            current_status = _stored_order_status(order["status"])
+            requested_quantity = _stored_positive_number(
+                order["requested_quantity"],
+                "invalid requested quantity in order projection",
+            )
+            filled_quantity = _stored_nonnegative_number(
+                order["filled_quantity"],
+                "invalid filled quantity in order projection",
+            )
+            _validate_order_status_transition(
+                current_status,
+                status,
+                requested_quantity=requested_quantity,
+                filled_quantity=filled_quantity,
+                corruption=False,
+            )
+            self._validate_timestamp_order(connection, occurred_datetime)
+            connection.execute(
+                """
+                INSERT INTO events (event_id, event_type, occurred_at_utc, payload_json)
+                VALUES (?, 'ORDER_STATUS', ?, ?)
+                """,
+                (event_id, occurred_at_utc, payload_json),
+            )
+            connection.execute(
+                """
+                UPDATE orders SET status = ?, updated_at_utc = ? WHERE order_id = ?
+                """,
+                (status.value, occurred_at_utc, normalized_order_id),
+            )
+            replay = self._rebuild_from_events(connection)
+            self._insert_snapshot(connection, replay.state, occurred_at_utc)
             return True
 
     def load_snapshot(self) -> PaperSnapshot:
         """Load the latest snapshot only after checking it against event replay."""
         self._ensure_ready()
-        assert self._connection is not None
-        with self._lock:
-            return self._replay_and_verify(self._connection)
+        with self._read_transaction() as connection:
+            return self._replay_and_verify(connection)
 
     def replay_state(self) -> PaperSnapshot:
         """Replay every immutable event and verify both mutable projections."""
         self._ensure_ready()
-        assert self._connection is not None
+        with self._read_transaction() as connection:
+            return self._replay_and_verify(connection)
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Pin all replay queries to one SQLite MVCC snapshot."""
+        self._ensure_ready()
+        connection = self._connect()
         with self._lock:
-            return self._replay_and_verify(self._connection)
+            owns_transaction = not connection.in_transaction
+            if owns_transaction:
+                connection.execute("BEGIN")
+            try:
+                yield connection
+            finally:
+                if owns_transaction and connection.in_transaction:
+                    connection.rollback()
+
+    @contextmanager
+    def _mutation_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Expose the raw connection only to store-owned mutation methods."""
+        with self._transaction(require_initialized=True) as connection:
+            yield connection
+            self._replay_and_verify(connection)
 
     @contextmanager
     def _transaction(
@@ -614,51 +855,110 @@ class SQLiteStore:
         )
 
     def _validate_schema_and_identity(self, connection: sqlite3.Connection) -> None:
-        tables = self._application_tables(connection)
-        if "schema_version" in tables:
-            try:
+        try:
+            tables = self._application_tables(connection)
+            if "schema_version" in tables:
                 rows = connection.execute(
                     "SELECT version FROM schema_version ORDER BY version",
                 ).fetchall()
-            except sqlite3.DatabaseError as error:
-                raise StoreCorruptionError("invalid schema version table") from error
-            versions = [int(row["version"]) for row in rows]
-            if versions != [SCHEMA_VERSION]:
-                values = [row[0] for row in rows]
+                versions = [row["version"] for row in rows]
+                if versions != [SCHEMA_VERSION]:
+                    values = [row[0] for row in rows]
+                    raise StoreCorruptionError(
+                        f"unsupported schema version: {values}",
+                    )
+            if tables != _REQUIRED_TABLES:
                 raise StoreCorruptionError(
-                    f"unsupported schema version: {values}",
+                    f"schema tables are inconsistent: {sorted(tables)}",
                 )
-        if tables != _REQUIRED_TABLES:
-            raise StoreCorruptionError(
-                f"schema tables are inconsistent: {sorted(tables)}",
-            )
-        for table, expected_columns in _REQUIRED_COLUMNS.items():
-            columns = tuple(
-                str(row["name"])
-                for row in connection.execute(f"PRAGMA table_info({table})")
-            )
-            if columns != expected_columns:
+            self._validate_schema_definition(connection)
+            metadata_rows = connection.execute(
+                "SELECT key, value FROM metadata ORDER BY key",
+            ).fetchall()
+            metadata = {str(row["key"]): str(row["value"]) for row in metadata_rows}
+            if set(metadata) != {"initial_equity", "market"}:
+                raise StoreCorruptionError("metadata keys are inconsistent")
+            if metadata["market"] != _MARKET:
                 raise StoreCorruptionError(
-                    f"schema columns are inconsistent for {table}: {columns}",
+                    f"stored market is not KRW-BTC: {metadata['market']}",
                 )
-        metadata_rows = connection.execute(
-            "SELECT key, value FROM metadata ORDER BY key",
-        ).fetchall()
-        metadata = {str(row["key"]): str(row["value"]) for row in metadata_rows}
-        if set(metadata) != {"initial_equity", "market"}:
-            raise StoreCorruptionError("metadata keys are inconsistent")
-        if metadata["market"] != _MARKET:
-            raise StoreCorruptionError(
-                f"stored market is not KRW-BTC: {metadata['market']}",
-            )
-        try:
             stored_equity = float(metadata["initial_equity"])
-        except ValueError as error:
-            raise StoreCorruptionError("stored initial equity is invalid") from error
-        if not math.isfinite(stored_equity) or stored_equity != _INITIAL_EQUITY:
-            raise StoreCorruptionError(
-                f"stored initial equity is not 100: {metadata['initial_equity']}",
+            if not math.isfinite(stored_equity) or stored_equity != _INITIAL_EQUITY:
+                raise StoreCorruptionError(
+                    f"stored initial equity is not 100: {metadata['initial_equity']}",
+                )
+        except StoreCorruptionError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError, KeyError) as error:
+            raise StoreCorruptionError("schema introspection or metadata is invalid") from error
+
+    def _validate_schema_definition(self, connection: sqlite3.Connection) -> None:
+        for table, expected_info in _EXPECTED_TABLE_INFO.items():
+            expected_xinfo = tuple((*column, 0) for column in expected_info)
+            actual_info = tuple(
+                (
+                    str(row["name"]),
+                    str(row["type"]).upper(),
+                    int(row["notnull"]),
+                    int(row["pk"]),
+                    int(row["hidden"]),
+                )
+                for row in connection.execute(f"PRAGMA table_xinfo({table})")
             )
+            if actual_info != expected_xinfo:
+                raise StoreCorruptionError(
+                    f"schema definition is inconsistent for {table}: {actual_info}",
+                )
+
+        events_sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+        ).fetchone()
+        events_sql = str(events_sql_row["sql"]) if events_sql_row is not None else ""
+        events_sql_without_comments = re.sub(
+            r"/\*.*?\*/|--[^\r\n]*",
+            " ",
+            events_sql,
+            flags=re.DOTALL,
+        )
+        if re.search(
+            r"\bsequence\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b",
+            events_sql_without_comments,
+            flags=re.IGNORECASE,
+        ) is None:
+            raise StoreCorruptionError("schema constraint AUTOINCREMENT is missing for events")
+        sqlite_sequence = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'",
+        ).fetchone()
+        if sqlite_sequence is None:
+            raise StoreCorruptionError("schema constraint AUTOINCREMENT is missing for events")
+
+        event_unique = self._unique_index_columns(connection, "events")
+        if ("event_id",) not in event_unique:
+            raise StoreCorruptionError("schema constraint UNIQUE(event_id) is missing")
+        order_unique = self._unique_index_columns(connection, "orders")
+        if ("idempotency_key",) not in order_unique:
+            raise StoreCorruptionError(
+                "schema constraint UNIQUE(idempotency_key) is missing",
+            )
+
+    def _unique_index_columns(
+        self,
+        connection: sqlite3.Connection,
+        table: str,
+    ) -> frozenset[tuple[str, ...]]:
+        unique_columns: set[tuple[str, ...]] = set()
+        for row in connection.execute(f"PRAGMA index_list({table})"):
+            if int(row["unique"]) != 1 or int(row["partial"]) != 0:
+                continue
+            index_name = str(row["name"])
+            columns = tuple(
+                str(index_row["name"])
+                for index_row in connection.execute(
+                    f"PRAGMA index_info('{index_name}')",
+                )
+            )
+            unique_columns.add(columns)
+        return frozenset(unique_columns)
 
     def _application_tables(self, connection: sqlite3.Connection) -> frozenset[str]:
         try:
@@ -676,47 +976,58 @@ class SQLiteStore:
 
     def _replay_and_verify(self, connection: sqlite3.Connection) -> PaperSnapshot:
         self._validate_schema_and_identity(connection)
-        rebuilt = self._rebuild_from_events(connection)
+        replay = self._rebuild_from_events(connection)
         snapshot_rows = connection.execute(
             "SELECT sequence, state_json, created_at_utc FROM snapshots ORDER BY sequence",
         ).fetchall()
-        expected_sequences = [0, *(event.sequence for event in rebuilt.event_evidence)]
+        expected_sequences = list(range(len(replay.snapshot_mappings)))
         actual_sequences = [int(row["sequence"]) for row in snapshot_rows]
         if actual_sequences != expected_sequences:
             raise StoreCorruptionError("snapshot sequence history is inconsistent")
-        latest = snapshot_rows[-1]
-        try:
-            persisted_mapping = json.loads(str(latest["state_json"]))
-        except (json.JSONDecodeError, TypeError) as error:
-            raise StoreCorruptionError("invalid snapshot JSON") from error
-        if not isinstance(persisted_mapping, dict):
-            raise StoreCorruptionError("invalid snapshot JSON")
-        try:
-            canonical = _canonical_json_value(persisted_mapping)
-        except ValueError as error:
-            raise StoreCorruptionError("invalid snapshot JSON") from error
-        if canonical != str(latest["state_json"]):
-            raise StoreCorruptionError("snapshot JSON is not canonical")
-        expected_mapping = _snapshot_mapping(rebuilt)
-        if not _json_values_match(expected_mapping, persisted_mapping):
-            raise StoreCorruptionError("snapshot does not match event replay")
-        if int(latest["sequence"]) != rebuilt.last_sequence:
-            raise StoreCorruptionError("snapshot does not match event replay")
-        stored_created_at, _ = _parse_stored_timestamp(latest["created_at_utc"])
-        expected_created_at = (
-            _canonical_datetime(rebuilt.event_evidence[-1].occurred_at_utc)
-            if rebuilt.event_evidence
-            else _EPOCH
-        )
-        if stored_created_at != expected_created_at:
-            raise StoreCorruptionError("snapshot timestamp does not match event replay")
-        return rebuilt
+        for row, expected_mapping, expected_timestamp in zip(
+            snapshot_rows,
+            replay.snapshot_mappings,
+            replay.snapshot_timestamps,
+            strict=True,
+        ):
+            sequence = int(row["sequence"])
+            try:
+                persisted_mapping = json.loads(str(row["state_json"]))
+            except (json.JSONDecodeError, TypeError) as error:
+                raise StoreCorruptionError(
+                    f"invalid snapshot JSON at sequence {sequence}",
+                ) from error
+            if not isinstance(persisted_mapping, dict):
+                raise StoreCorruptionError(
+                    f"invalid snapshot JSON at sequence {sequence}",
+                )
+            try:
+                canonical = _canonical_json_value(persisted_mapping)
+            except ValueError as error:
+                raise StoreCorruptionError(
+                    f"invalid snapshot JSON at sequence {sequence}",
+                ) from error
+            if canonical != str(row["state_json"]):
+                raise StoreCorruptionError(
+                    f"snapshot JSON is not canonical at sequence {sequence}",
+                )
+            expected_json = _canonical_json_value(expected_mapping)
+            if canonical != expected_json:
+                raise StoreCorruptionError(
+                    f"snapshot does not match event replay at sequence {sequence}",
+                )
+            stored_created_at, _ = _parse_stored_timestamp(row["created_at_utc"])
+            if stored_created_at != expected_timestamp:
+                raise StoreCorruptionError(
+                    f"snapshot timestamp does not match event replay at sequence {sequence}",
+                )
+        return replay.state
 
-    def _rebuild_from_events(self, connection: sqlite3.Connection) -> PaperSnapshot:
-        cash = _INITIAL_EQUITY
-        btc_quantity = 0.0
-        btc_cost_basis = 0.0
-        last_price: float | None = None
+    def _rebuild_from_events(self, connection: sqlite3.Connection) -> _ReplayResult:
+        cash = Decimal("100.0")
+        btc_quantity = Decimal("0")
+        btc_cost_basis = Decimal("0")
+        last_price: Decimal | None = None
         breaker_state: Mapping[str, object] = MappingProxyType({})
         health_state: Mapping[str, object] = MappingProxyType({})
         evidence: list[StoredEvent] = []
@@ -724,6 +1035,11 @@ class SQLiteStore:
         idempotency_keys: set[str] = set()
         previous_timestamp: datetime | None = None
         expected_sequence = 1
+        event_digest = _EMPTY_EVENT_DIGEST
+        snapshot_mappings: list[dict[str, object]] = [
+            _snapshot_mapping(_initial_snapshot()),
+        ]
+        snapshot_timestamps = [_EPOCH]
 
         rows = connection.execute(
             """
@@ -757,6 +1073,11 @@ class SQLiteStore:
                 raise StoreCorruptionError("invalid event JSON") from error
             if canonical_payload != payload_json:
                 raise StoreCorruptionError("event JSON is not canonical")
+            _validate_known_state_payload(
+                event_type,
+                normalized_payload,
+                corruption=True,
+            )
             frozen_payload = _freeze_json(normalized_payload)
             assert isinstance(frozen_payload, Mapping)
             evidence.append(
@@ -768,29 +1089,44 @@ class SQLiteStore:
                     payload=frozen_payload,
                 ),
             )
+            envelope = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "occurred_at_utc": occurred_at_utc,
+                "payload": normalized_payload,
+                "previous_digest": event_digest,
+                "sequence": sequence,
+            }
+            event_digest = sha256(
+                _canonical_json_value(envelope).encode("utf-8"),
+            ).hexdigest()
 
             if event_type == "ORDER_CREATED":
                 order = _order_from_created_payload(
                     normalized_payload,
                     occurred_datetime,
                 )
+                expected_event_id = (
+                    "order-created:"
+                    f"{sha256(order.idempotency_key.encode('utf-8')).hexdigest()}"
+                )
+                if event_id != expected_event_id:
+                    raise StoreCorruptionError("ORDER_CREATED event id is not deterministic")
                 if order.order_id in orders or order.idempotency_key in idempotency_keys:
                     raise StoreCorruptionError("duplicate order identity in event replay")
                 orders[order.order_id] = order
                 idempotency_keys.add(order.idempotency_key)
             elif event_type == "FILL":
                 fill = _fill_from_payload(normalized_payload)
-                quantity = fill["quantity"]
-                price = fill["price"]
-                fee = fill["fee"]
+                quantity = Decimal(str(fill["quantity"]))
+                price = Decimal(str(fill["price"]))
+                fee = Decimal(str(fill["fee"]))
                 side = fill["side"]
                 order_id = fill["order_id"]
                 if side == "BUY":
                     cash -= quantity * price + fee
-                    if cash < 0.0:
+                    if cash < 0:
                         raise StoreCorruptionError("fill replay makes cash negative")
-                    if abs(cash) <= _TOLERANCE:
-                        cash = 0.0
                     btc_quantity += quantity
                     btc_cost_basis += quantity * price + fee
                 else:
@@ -798,16 +1134,13 @@ class SQLiteStore:
                         raise StoreCorruptionError("fill replay oversells BTC")
                     prior_quantity = btc_quantity
                     cash += quantity * price - fee
-                    if cash < 0.0:
+                    if cash < 0:
                         raise StoreCorruptionError("fill replay makes cash negative")
-                    if abs(cash) <= _TOLERANCE:
-                        cash = 0.0
-                    if prior_quantity > _TOLERANCE:
+                    if prior_quantity > 0:
                         btc_cost_basis -= btc_cost_basis * (quantity / prior_quantity)
                     btc_quantity -= quantity
-                    if abs(btc_quantity) <= _TOLERANCE:
-                        btc_quantity = 0.0
-                        btc_cost_basis = 0.0
+                    if btc_quantity == 0:
+                        btc_cost_basis = Decimal("0")
                 last_price = price
                 if order_id in orders:
                     existing = orders[order_id]
@@ -815,11 +1148,11 @@ class SQLiteStore:
                         raise StoreCorruptionError("fill side conflicts with order replay")
                     if existing.status not in _ACTIVE_ORDER_STATUSES:
                         raise StoreCorruptionError("fill follows a terminal order")
-                    total_filled = existing.filled_quantity + quantity
-                    if total_filled > existing.requested_quantity:
+                    total_filled = Decimal(str(existing.filled_quantity)) + quantity
+                    requested_quantity = Decimal(str(existing.requested_quantity))
+                    if total_filled > requested_quantity:
                         raise StoreCorruptionError("fill exceeds requested quantity in replay")
-                    if _numbers_close(total_filled, existing.requested_quantity):
-                        total_filled = existing.requested_quantity
+                    if total_filled == requested_quantity:
                         next_status = OrderStatus.COMPLETED
                     else:
                         next_status = OrderStatus.PARTIAL
@@ -828,16 +1161,59 @@ class SQLiteStore:
                         idempotency_key=existing.idempotency_key,
                         side=existing.side,
                         requested_quantity=existing.requested_quantity,
-                        filled_quantity=total_filled,
+                        filled_quantity=float(total_filled),
                         status=next_status,
                         updated_at_utc=occurred_datetime,
                     )
+            elif event_type == "ORDER_STATUS":
+                transition = _order_status_from_payload(normalized_payload)
+                expected_event_id = (
+                    "order-status:"
+                    f"{sha256(transition['idempotency_key'].encode('utf-8')).hexdigest()}"
+                )
+                if event_id != expected_event_id:
+                    raise StoreCorruptionError("ORDER_STATUS event id is not deterministic")
+                order_id = transition["order_id"]
+                if order_id not in orders:
+                    raise StoreCorruptionError("ORDER_STATUS references an unknown order")
+                existing = orders[order_id]
+                _validate_order_status_transition(
+                    existing.status,
+                    transition["status"],
+                    requested_quantity=existing.requested_quantity,
+                    filled_quantity=existing.filled_quantity,
+                    corruption=True,
+                )
+                orders[order_id] = StoredOrder(
+                    order_id=existing.order_id,
+                    idempotency_key=existing.idempotency_key,
+                    side=existing.side,
+                    requested_quantity=existing.requested_quantity,
+                    filled_quantity=existing.filled_quantity,
+                    status=transition["status"],
+                    updated_at_utc=occurred_datetime,
+                )
             elif event_type == "BREAKER_STATE":
                 breaker_state = _freeze_json(normalized_payload)
                 assert isinstance(breaker_state, Mapping)
             elif event_type == "HEALTH_STATE":
                 health_state = _freeze_json(normalized_payload)
                 assert isinstance(health_state, Mapping)
+
+            prefix_state = _snapshot_from_components(
+                cash=cash,
+                btc_quantity=btc_quantity,
+                btc_cost_basis=btc_cost_basis,
+                last_price=last_price,
+                orders=orders,
+                breaker_state=breaker_state,
+                health_state=health_state,
+                last_sequence=sequence,
+                event_evidence=(),
+                event_digest=event_digest,
+            )
+            snapshot_mappings.append(_snapshot_mapping(prefix_state))
+            snapshot_timestamps.append(occurred_at_utc)
 
         autoincrement_row = connection.execute(
             "SELECT seq FROM sqlite_sequence WHERE name = 'events'",
@@ -848,40 +1224,22 @@ class SQLiteStore:
             raise StoreCorruptionError("event tail was deleted from immutable history")
 
         self._verify_order_projection(connection, orders)
-        pending_orders = tuple(
-            sorted(
-                (
-                    order
-                    for order in orders.values()
-                    if order.status in _ACTIVE_ORDER_STATUSES
-                ),
-                key=lambda order: (order.updated_at_utc, order.order_id),
-            ),
-        )
-        position_state = _position_state(
-            btc_quantity=btc_quantity,
-            pending_orders=pending_orders,
-            breaker_state=breaker_state,
-        )
-        average_entry_price = (
-            btc_cost_basis / btc_quantity if btc_quantity > _TOLERANCE else None
-        )
-        equity = cash + btc_quantity * last_price if last_price is not None else cash
-        return PaperSnapshot(
-            market=_MARKET,
-            initial_equity=_INITIAL_EQUITY,
+        state = _snapshot_from_components(
             cash=cash,
             btc_quantity=btc_quantity,
-            equity=equity,
             btc_cost_basis=btc_cost_basis,
-            average_entry_price=average_entry_price,
             last_price=last_price,
-            position_state=position_state,
-            pending_orders=pending_orders,
-            last_sequence=evidence[-1].sequence if evidence else 0,
+            orders=orders,
             breaker_state=breaker_state,
             health_state=health_state,
+            last_sequence=replayed_tail,
             event_evidence=tuple(evidence),
+            event_digest=event_digest,
+        )
+        return _ReplayResult(
+            state=state,
+            snapshot_mappings=tuple(snapshot_mappings),
+            snapshot_timestamps=tuple(snapshot_timestamps),
         )
 
     def _verify_order_projection(
@@ -989,6 +1347,53 @@ def _initial_snapshot() -> PaperSnapshot:
         breaker_state=MappingProxyType({}),
         health_state=MappingProxyType({}),
         event_evidence=(),
+        event_digest=_EMPTY_EVENT_DIGEST,
+    )
+
+
+def _snapshot_from_components(
+    *,
+    cash: Decimal,
+    btc_quantity: Decimal,
+    btc_cost_basis: Decimal,
+    last_price: Decimal | None,
+    orders: Mapping[str, StoredOrder],
+    breaker_state: Mapping[str, object],
+    health_state: Mapping[str, object],
+    last_sequence: int,
+    event_evidence: tuple[StoredEvent, ...],
+    event_digest: str,
+) -> PaperSnapshot:
+    pending_orders = tuple(
+        sorted(
+            (order for order in orders.values() if order.status in _ACTIVE_ORDER_STATUSES),
+            key=lambda order: (order.updated_at_utc, order.order_id),
+        ),
+    )
+    average_entry_price = (
+        float(btc_cost_basis / btc_quantity) if btc_quantity > 0 else None
+    )
+    equity = cash + (btc_quantity * last_price if last_price is not None else 0)
+    return PaperSnapshot(
+        market=_MARKET,
+        initial_equity=_INITIAL_EQUITY,
+        cash=float(cash),
+        btc_quantity=float(btc_quantity),
+        equity=float(equity),
+        btc_cost_basis=float(btc_cost_basis),
+        average_entry_price=average_entry_price,
+        last_price=float(last_price) if last_price is not None else None,
+        position_state=_position_state(
+            btc_quantity=float(btc_quantity),
+            pending_orders=pending_orders,
+            breaker_state=breaker_state,
+        ),
+        pending_orders=pending_orders,
+        last_sequence=last_sequence,
+        breaker_state=breaker_state,
+        health_state=health_state,
+        event_evidence=event_evidence,
+        event_digest=event_digest,
     )
 
 
@@ -1000,6 +1405,7 @@ def _snapshot_mapping(state: PaperSnapshot) -> dict[str, object]:
         "btc_quantity": state.btc_quantity,
         "cash": state.cash,
         "equity": state.equity,
+        "event_digest": state.event_digest,
         "health_state": _thaw_json(state.health_state),
         "initial_equity": state.initial_equity,
         "last_price": state.last_price,
@@ -1035,7 +1441,7 @@ def _position_state(
         return PositionState.HALTED
     if any(order.side == "SELL" for order in pending_orders):
         return PositionState.EXIT_PENDING
-    if btc_quantity > _TOLERANCE:
+    if btc_quantity > 0.0:
         return PositionState.LONG
     if any(order.side == "BUY" for order in pending_orders):
         return PositionState.ENTRY_PENDING
@@ -1073,6 +1479,8 @@ def _order_from_created_payload(
     if filled != 0.0:
         raise StoreCorruptionError("ORDER_CREATED must start unfilled")
     status = _stored_order_status(payload["status"])
+    if status not in _ORDER_SEED_STATUSES:
+        raise StoreCorruptionError("invalid ORDER_CREATED seed status")
     return StoredOrder(
         order_id=order_id,
         idempotency_key=key,
@@ -1096,13 +1504,131 @@ def _fill_from_payload(payload: Mapping[str, object]) -> dict[str, Any]:
     }
 
 
+def _order_status_from_payload(payload: Mapping[str, object]) -> dict[str, Any]:
+    if set(payload) != {"idempotency_key", "order_id", "reason", "status"}:
+        raise StoreCorruptionError("invalid ORDER_STATUS payload")
+    reason = payload["reason"]
+    if reason is not None:
+        reason = _stored_nonempty_text(reason, "invalid ORDER_STATUS reason")
+    return {
+        "idempotency_key": _stored_nonempty_text(
+            payload["idempotency_key"],
+            "invalid ORDER_STATUS idempotency key",
+        ),
+        "order_id": _stored_nonempty_text(
+            payload["order_id"],
+            "invalid ORDER_STATUS order id",
+        ),
+        "reason": reason,
+        "status": _stored_order_status(payload["status"]),
+    }
+
+
+def _validate_order_status_transition(
+    current: OrderStatus,
+    target: OrderStatus,
+    *,
+    requested_quantity: float,
+    filled_quantity: float,
+    corruption: bool,
+) -> None:
+    error_type: type[Exception] = StoreCorruptionError if corruption else ValueError
+    requested = Decimal(str(requested_quantity))
+    filled = Decimal(str(filled_quantity))
+    if filled < 0 or filled > requested:
+        raise error_type("order quantity invariants are invalid")
+    if target is OrderStatus.CREATED:
+        raise error_type("illegal order status transition")
+    if target is OrderStatus.PARTIAL:
+        if current is not OrderStatus.PARTIAL or not (0 < filled < requested):
+            raise error_type("illegal order status transition")
+        return
+    if target is OrderStatus.COMPLETED:
+        if current is not OrderStatus.COMPLETED or filled != requested:
+            raise error_type("illegal order status transition")
+        return
+    if target not in _LEGAL_ORDER_TRANSITIONS.get(current, frozenset()):
+        raise error_type("illegal order status transition")
+
+
+def _validate_known_state_payload(
+    event_type: str,
+    payload: Mapping[str, object],
+    *,
+    corruption: bool,
+) -> None:
+    if event_type not in {"BREAKER_STATE", "HEALTH_STATE"}:
+        return
+    error_type: type[Exception] = StoreCorruptionError if corruption else ValueError
+    for key in _KNOWN_BOOLEAN_STATE_FIELDS:
+        if key in payload and type(payload[key]) is not bool:
+            raise error_type(f"{key} must be a bool")
+    for key in _KNOWN_COUNT_STATE_FIELDS:
+        if key in payload:
+            value = payload[key]
+            if type(value) is not int or value < 0:
+                raise error_type(f"{key} must be a non-negative integer")
+    if "reasons" in payload:
+        reasons = payload["reasons"]
+        if not isinstance(reasons, list):
+            raise error_type("reasons must be a list")
+        for reason in reasons:
+            if not isinstance(reason, str) or _REASON_PATTERN.fullmatch(reason) is None:
+                raise error_type("reason must be a non-empty known-format string")
+        if len(set(reasons)) != len(reasons):
+            raise error_type("reasons must not contain duplicates")
+    if "fill_deviation" in payload:
+        try:
+            deviation = _finite_number(
+                payload["fill_deviation"],
+                "fill_deviation must be a finite non-negative number",
+            )
+        except ValueError as error:
+            raise error_type(str(error)) from error
+        if deviation < 0:
+            raise error_type("fill_deviation must be a finite non-negative number")
+    for key in ("last_success_at_utc", "last_failure_at_utc"):
+        if key in payload and payload[key] is not None:
+            try:
+                canonical, _ = _canonical_timestamp(payload[key])
+            except ValueError as error:
+                raise error_type(f"{key} must be strict UTC") from error
+            if canonical != payload[key]:
+                raise error_type(f"{key} must be canonical UTC")
+
+
+def _reject_transaction_control_sql(sql: object) -> None:
+    if not isinstance(sql, str) or not sql.strip():
+        raise ValueError("SQL must be a non-empty string")
+    remaining = sql.lstrip("\ufeff \t\r\n;")
+    while True:
+        if remaining.startswith("--"):
+            newline = remaining.find("\n")
+            if newline < 0:
+                raise ValueError("SQL must contain a statement")
+            remaining = remaining[newline + 1 :].lstrip(" \t\r\n;")
+            continue
+        if remaining.startswith("/*"):
+            end = remaining.find("*/", 2)
+            if end < 0:
+                raise ValueError("unterminated SQL comment")
+            remaining = remaining[end + 2 :].lstrip(" \t\r\n;")
+            continue
+        break
+    match = re.match(r"[A-Za-z]+", remaining)
+    if match is None:
+        raise ValueError("SQL must contain a statement")
+    if match.group(0).upper() in _TRANSACTION_CONTROL_KEYWORDS:
+        raise ValueError("transaction-control SQL is not allowed")
+
+
 def _orders_match(first: StoredOrder, second: StoredOrder) -> bool:
     return (
         first.order_id == second.order_id
         and first.idempotency_key == second.idempotency_key
         and first.side == second.side
-        and _numbers_close(first.requested_quantity, second.requested_quantity)
-        and _numbers_close(first.filled_quantity, second.filled_quantity)
+        and first.requested_quantity == second.requested_quantity
+        and first.filled_quantity == second.filled_quantity
         and first.status is second.status
         and first.updated_at_utc == second.updated_at_utc
     )
@@ -1162,23 +1688,6 @@ def _thaw_json(value: object) -> object:
     if isinstance(value, tuple):
         return [_thaw_json(item) for item in value]
     return value
-
-
-def _json_values_match(expected: object, actual: object) -> bool:
-    if isinstance(expected, Mapping) and isinstance(actual, Mapping):
-        return set(expected) == set(actual) and all(
-            _json_values_match(expected[key], actual[key]) for key in expected
-        )
-    if isinstance(expected, list) and isinstance(actual, list):
-        return len(expected) == len(actual) and all(
-            _json_values_match(left, right)
-            for left, right in zip(expected, actual, strict=True)
-        )
-    if isinstance(expected, bool) or isinstance(actual, bool):
-        return expected is actual
-    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-        return _numbers_close(float(expected), float(actual))
-    return expected == actual
 
 
 def _canonical_timestamp(value: str | datetime) -> tuple[str, datetime]:
