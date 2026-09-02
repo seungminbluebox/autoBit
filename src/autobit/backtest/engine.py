@@ -213,12 +213,10 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self._capture_new_fills(order)
         self._record_callback(order)
         if _same_order(order, self.entry_order) and order.status == order.Completed:
-            self.entry_price = float(order.executed.price)
-            self.high_water = self.entry_price
+            self._apply_entry_fill(order)
             self.entry_order = None
         if _same_order(order, self.entry_order) and order.status == order.Partial:
-            self.entry_price = float(order.executed.price)
-            self.high_water = self.entry_price
+            self._apply_entry_fill(order)
             self._entry_partial_pending = True
         if _same_order(order, self.entry_order) and order.status in (
             order.Canceled,
@@ -247,6 +245,14 @@ class _DonchianBacktestStrategy(bt.Strategy):
             _same_order(order, self.exit_order) or _same_order(order, self.stop_order)
         ):
             self._exit_partial_pending = True
+
+    def _apply_entry_fill(self, order: bt.Order) -> None:
+        self.entry_price = float(order.executed.price)
+        entry_atr = float(order.info.execution_atr)
+        initial_atr_mult = float(order.info.initial_atr_mult)
+        self.initial_stop = self.entry_price - initial_atr_mult * entry_atr
+        self.current_stop = self.initial_stop
+        self.high_water = self.entry_price
 
     def stop(self) -> None:
         for order in self._tracked_orders.values():

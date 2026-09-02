@@ -54,7 +54,7 @@ def test_gap_below_stop_fills_at_worse_open() -> None:
         for order in result.orders
         if order.reason == "HARD_STOP" and order.status == "COMPLETED"
     )
-    assert stop.stop_price == pytest.approx(95.0)
+    assert stop.stop_price == pytest.approx(100.0)
     assert stop.fill_price == pytest.approx(90.0)
 
 
@@ -121,14 +121,26 @@ def test_gap_that_exceeds_close_sizing_is_execution_capped() -> None:
     entry_events = [order for order in result.orders if order.side == "BUY"]
     partial = next(order for order in entry_events if order.status == "PARTIAL")
     canceled = next(order for order in entry_events if order.status == "CANCELED")
+    protective_stop = next(
+        order
+        for order in result.orders
+        if order.side == "SELL"
+        and order.status == "CREATED"
+        and order.reason == "HARD_STOP"
+    )
     assert partial.fill_time == pd.Timestamp("2025-01-05T04:00:00Z")
     assert 0.0 < partial.filled_quantity < partial.requested_quantity
     assert partial.reason == "EXECUTION_CAP"
     assert canceled.reason == "END_OF_DATA"
     assert not any(order.status == "INSUFFICIENT_CASH" for order in entry_events)
+    expected_stop = partial.fill_price - 2.5 * 2.0
+    assert protective_stop.stop_price == pytest.approx(expected_stop)
     filled_notional = partial.filled_quantity * partial.fill_price
     effective_risk = partial.filled_quantity * (
-        5.0 + partial.fill_price * fee_rate + (partial.fill_price - 5.0) * fee_rate
+        partial.fill_price
+        - protective_stop.stop_price
+        + partial.fill_price * fee_rate
+        + protective_stop.stop_price * fee_rate
     )
     assert filled_notional <= 70.0 + 1e-9
     assert filled_notional * (1.0 + fee_rate) <= 100.0 + 1e-9

@@ -48,7 +48,7 @@ class OneShotFractionalFiller:
             self._broker.notify(order)
             return 0.0
         if safe_fill < remainder - 1e-12:
-            cap_bound = float(decision.quantity) < remainder - 1e-12
+            cap_bound = float(decision.quantity) < requested_fill - 1e-12
             order.addinfo(partial_reason="EXECUTION_CAP" if cap_bound else "PARTIAL_FILL")
         return safe_fill
 

@@ -50,6 +50,36 @@ def test_half_entry_fills_once_then_cancels_remainder_without_retry() -> None:
     assert not any(order.status == "COMPLETED" for order in entry_events)
 
 
+def test_configured_entry_fraction_takes_reason_precedence_over_larger_execution_cap() -> None:
+    frame = _fixture("partial_entry.csv")
+    for timestamp in (
+        pd.Timestamp("2025-01-05T04:00:00Z"),
+        pd.Timestamp("2025-01-05T08:00:00Z"),
+    ):
+        frame.loc[timestamp, ["open", "high", "low", "close"]] = [
+            250.0,
+            251.0,
+            249.0,
+            250.0,
+        ]
+
+    result = run_backtest(
+        frame,
+        BacktestConfig(
+            costs=CostConfig(fee_rate=0.0, slippage_rate=0.0),
+            entry_fill_fraction=0.5,
+        ),
+    )
+
+    entry_events = [order for order in result.orders if order.side == "BUY"]
+    partial = next(order for order in entry_events if order.status == "PARTIAL")
+    canceled = next(order for order in entry_events if order.status == "CANCELED")
+    assert partial.filled_quantity == pytest.approx(partial.requested_quantity * 0.5)
+    assert partial.filled_quantity * partial.fill_price < 70.0
+    assert partial.reason == "PARTIAL_FILL"
+    assert canceled.reason == "PARTIAL_FILL"
+
+
 def test_half_exit_reissues_exact_remainder_once_for_next_open() -> None:
     slippage_rate = 0.001
     result = run_backtest(
