@@ -1,7 +1,7 @@
 """Isolated, deterministic execution of pre-registered walk-forward cells."""
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import math
 from typing import Literal
@@ -49,6 +49,15 @@ _TRIAL_IDS = (
     "stop_3_0",
 )
 _COST_IDS = ("zero", "baseline", "stress_10bps", "stress_20bps")
+_OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+_QUALITY_BOOLEAN_COLUMNS = (
+    "is_filled",
+    "is_quarantined",
+    "anomaly_spike",
+    "anomaly_flat",
+    "entry_data_valid",
+)
+_QUALITY_COLUMNS = (*_QUALITY_BOOLEAN_COLUMNS, "segment_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,8 +143,47 @@ BacktestFn = Callable[[BacktestRequest], BacktestResult]
 
 
 def core_backtest(request: BacktestRequest) -> BacktestResult:
-    """Production adapter retaining the core engine as the execution authority."""
-    return run_backtest(request.frame, request.config)
+    """Run each finite quality segment flat, never carrying BTC across a gap."""
+    segment_column = (
+        "_execution_segment_id"
+        if "_execution_segment_id" in request.frame
+        else "segment_id"
+    )
+    if segment_column not in request.frame or request.frame[segment_column].nunique() <= 1:
+        return run_backtest(request.frame, request.config)
+
+    equity: list[EquityPoint] = []
+    orders: list[OrderRecord] = []
+    trades: list[TradeRecord] = []
+    current_equity = float(request.config.initial_equity)
+    total_fees = 0.0
+    total_slippage = 0.0
+    for ordinal, (_, segment) in enumerate(
+        request.frame.groupby(segment_column, sort=False)
+    ):
+        segment_config = replace(request.config, initial_equity=current_equity)
+        segment_result = run_backtest(segment.copy(deep=True), segment_config)
+        if not segment_result.equity_curve:
+            raise ValueError("each executable quality segment must produce equity")
+        if not _close_enough(segment_result.equity_curve[0].equity, current_equity):
+            raise ValueError("quality segment must restart from carried flat equity")
+        equity.extend(segment_result.equity_curve)
+        orders.extend(
+            replace(order, order_id=f"segment-{ordinal:03d}:{order.order_id}")
+            for order in segment_result.orders
+        )
+        trades.extend(segment_result.trades)
+        current_equity = float(segment_result.final_equity)
+        total_fees += float(segment_result.total_fees)
+        total_slippage += float(segment_result.total_slippage)
+    return BacktestResult(
+        equity_curve=tuple(equity),
+        orders=tuple(orders),
+        trades=tuple(trades),
+        final_equity=current_equity,
+        total_fees=total_fees,
+        total_slippage=total_slippage,
+    )
 
 
 def run_walk_forward(
@@ -151,7 +199,7 @@ def run_walk_forward(
     phase end; it never observes later rows. Exceptions and invalid results
     are retained as failed rows rather than being removed from the matrix.
     """
-    validated_frame = _validated_frame(frame)
+    validated_frame = validate_walk_forward_frame(frame)
     validated_folds = _validated_folds(validated_frame.index, folds)
     if not callable(backtest_fn):
         raise ValueError("backtest_fn must be callable")
@@ -201,6 +249,11 @@ def _request_for_phase(
     context = frame.loc[frame.index < phase_end].copy(deep=True)
     enriched = compute_trend_indicators(context, strategy)
     execution = enriched.reindex(phase_index).copy(deep=True)
+    available = execution.loc[:, _OHLCV_COLUMNS].notna().all(axis=1)
+    execution["_execution_segment_id"] = (~available).cumsum()
+    execution = execution.loc[available].copy(deep=True)
+    if execution.empty:
+        raise ValueError("walk-forward phase has no executable quality segment")
     return BacktestRequest(
         phase=phase,
         fold_id=fold.fold_id,
@@ -330,20 +383,141 @@ def _within_fold_return(previous_equity: float, current_equity: float) -> float:
     raise ValueError("zero-equity recovery is not a valid OOS return path")
 
 
-def _validated_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def validate_walk_forward_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Validate finite candles plus canonical Plan 1 unavailable-price rows.
+
+    A missing-price row is accepted only when the complete quality surface
+    proves it is either quarantined or belongs to a segment-breaking long gap.
+    All five OHLCV values must be finite together or unavailable together.
+    """
     if not isinstance(frame, pd.DataFrame):
         raise ValueError("frame must be a pandas DataFrame")
-    required = ("open", "high", "low", "close", "volume")
-    missing = tuple(column for column in required if column not in frame.columns)
+    missing = tuple(column for column in _OHLCV_COLUMNS if column not in frame.columns)
     if missing:
         raise ValueError(f"frame is missing required columns: {', '.join(missing)}")
     index = _validated_utc_index(frame.index, "frame")
     if index.empty:
         raise ValueError("frame must not be empty")
-    numeric = frame.loc[:, required].apply(pd.to_numeric, errors="coerce")
-    if not math.isfinite(float(numeric.to_numpy().sum())) or not numeric.notna().all().all():
-        raise ValueError("frame OHLCV values must be finite")
-    return frame.copy(deep=True)
+    raw = frame.loc[:, _OHLCV_COLUMNS]
+    numeric = raw.apply(pd.to_numeric, errors="coerce")
+    coerced_missing = raw.notna() & numeric.isna()
+    if coerced_missing.any().any():
+        raise ValueError("frame OHLCV values must be numeric or canonically unavailable")
+    if any(
+        not math.isfinite(float(value))
+        for value in numeric.to_numpy().flat
+        if not pd.isna(value)
+    ):
+        raise ValueError("frame OHLCV values must be finite when available")
+    all_available = numeric.notna().all(axis=1)
+    all_unavailable = numeric.isna().all(axis=1)
+    if not (all_available | all_unavailable).all():
+        raise ValueError("frame OHLCV rows cannot be partially unavailable")
+    _validate_available_ohlcv(numeric, all_available)
+
+    present_quality = tuple(column for column in _QUALITY_COLUMNS if column in frame)
+    if present_quality and set(present_quality) != set(_QUALITY_COLUMNS):
+        raise ValueError("frame quality surface must be complete")
+    if all_unavailable.any() and not present_quality:
+        raise ValueError("unavailable OHLCV rows require canonical quality flags")
+    if present_quality:
+        _validate_quality_surface(frame, numeric, all_available, all_unavailable)
+
+    result = frame.copy(deep=True)
+    result.loc[:, _OHLCV_COLUMNS] = numeric
+    return result
+
+
+def _validated_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Backward-compatible private alias used by focused adversarial tests."""
+    return validate_walk_forward_frame(frame)
+
+
+def _validate_available_ohlcv(
+    numeric: pd.DataFrame, available: pd.Series
+) -> None:
+    rows = numeric.loc[available]
+    if (rows.loc[:, ("open", "high", "low", "close")] <= 0.0).any().any():
+        raise ValueError("available OHLC prices must be positive")
+    if (rows["volume"] < 0.0).any():
+        raise ValueError("available volume must be nonnegative")
+    if (
+        (rows["high"] < rows[["open", "close", "low"]].max(axis=1)).any()
+        or (rows["low"] > rows[["open", "close", "high"]].min(axis=1)).any()
+    ):
+        raise ValueError("available OHLC geometry is invalid")
+
+
+def _validate_quality_surface(
+    frame: pd.DataFrame,
+    numeric: pd.DataFrame,
+    available: pd.Series,
+    unavailable: pd.Series,
+) -> None:
+    for column in _QUALITY_BOOLEAN_COLUMNS:
+        if not pd.api.types.is_bool_dtype(frame[column].dtype) or frame[column].isna().any():
+            raise ValueError(f"quality flag {column} must contain strict booleans")
+    segments = pd.to_numeric(frame["segment_id"], errors="coerce")
+    if (
+        segments.isna().any()
+        or any(not math.isfinite(float(value)) for value in segments)
+        or (segments < 0).any()
+        or not (segments == segments.round()).all()
+    ):
+        raise ValueError("quality segment_id must be a nonnegative integer")
+    segment_values = tuple(int(value) for value in segments)
+    flags = frame.loc[:, _QUALITY_BOOLEAN_COLUMNS]
+    filled = flags["is_filled"]
+    quarantined = flags["is_quarantined"]
+    spike = flags["anomaly_spike"]
+    flat = flags["anomaly_flat"]
+    entry_valid = flags["entry_data_valid"]
+    if (filled & quarantined).any() or (spike & flat).any():
+        raise ValueError("quality flags contain an impossible combination")
+    if (unavailable & (filled | spike | flat)).any():
+        raise ValueError("unavailable rows cannot be filled or anomalous candles")
+    if (available & quarantined).any():
+        raise ValueError("quarantined rows must clear all OHLCV values")
+    filled_rows = numeric.loc[filled]
+    if not filled_rows.empty and (
+        not (filled_rows["volume"] == 0.0).all()
+        or not (
+            filled_rows["open"] == filled_rows["high"]
+        ).all()
+        or not (
+            filled_rows["open"] == filled_rows["low"]
+        ).all()
+        or not (
+            filled_rows["open"] == filled_rows["close"]
+        ).all()
+    ):
+        raise ValueError("filled quality rows must be flat zero-volume candles")
+
+    long_gap = unavailable & ~quarantined
+    current_segment = 0
+    inside_gap = False
+    for position, (segment, is_gap) in enumerate(
+        zip(segment_values, long_gap.tolist(), strict=True)
+    ):
+        if position == 0 and segment != 0:
+            raise ValueError("quality segment_id must start at zero")
+        if inside_gap and not is_gap:
+            current_segment += 1
+            inside_gap = False
+        if segment != current_segment:
+            raise ValueError("quality segment_id transition does not follow a long gap")
+        inside_gap = inside_gap or bool(is_gap)
+    if inside_gap:
+        raise ValueError("a long-gap region must end at a new finite segment")
+
+    contamination = filled | quarantined | spike | flat
+    expected_entry = available & ~(
+        contamination.groupby(segments, sort=False)
+        .transform(lambda rows: rows.rolling(200, min_periods=1).max())
+        .astype(bool)
+    )
+    if not entry_valid.equals(expected_entry.astype(bool)):
+        raise ValueError("quality entry_data_valid is inconsistent with contamination")
 
 
 def _validated_folds(index: pd.DatetimeIndex, folds: Sequence[FoldWindow]) -> tuple[FoldWindow, ...]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 import math
 from pathlib import Path
 
@@ -16,14 +17,17 @@ from autobit.backtest.engine import (
     run_backtest,
 )
 from autobit.config import CostConfig, StrategyConfig
+from autobit.data.quality import canonicalize_ohlcv
 from autobit.domain.models import OrderStatus, PositionState
 from autobit.indicators.trend import compute_trend_indicators
 from autobit.validation.models import CostScenario, FoldWindow, TrialConfig, WalkForwardConfig
+from autobit.validation import runner as validation_runner
 from autobit.validation.runner import (
     BacktestRequest,
     _run_request,
     core_backtest,
     run_walk_forward,
+    validate_walk_forward_frame,
 )
 from autobit.validation.splits import build_rolling_folds
 
@@ -1111,6 +1115,65 @@ def test_runner_rejects_noncanonical_frame_and_overlapping_oos_folds() -> None:
         run_walk_forward(frame, (folds[0], overlap), _result)
 
 
+def test_runner_accepts_real_canonical_gap_and_quarantine_without_crossing_them() -> None:
+    """Plan 1 gaps stay on-grid but never become executable or seed a new segment."""
+    raw = _frame(5_600).loc[:, ["open", "high", "low", "close", "volume"]]
+    gap_times = tuple(raw.index[100:102])
+    quarantine_time = raw.index[300]
+    after_gap = raw.index[102]
+    after_quarantine = raw.index[301]
+    raw = raw.drop(index=list(gap_times))
+    raw.loc[quarantine_time, "high"] = raw.loc[quarantine_time, "low"] - 1.0
+    quality = canonicalize_ohlcv(
+        raw,
+        (raw.index[-1] + timedelta(hours=8)).to_pydatetime(),
+    )
+    canonical = validate_walk_forward_frame(quality.frame)
+    folds = tuple(build_rolling_folds(canonical.index, WalkForwardConfig()))
+    observed: list[pd.DataFrame] = []
+
+    def fake_backtest(request: BacktestRequest) -> BacktestResult:
+        if request.phase == "TRAIN" and request.trial_id == "baseline" and request.cost_id == "zero":
+            observed.append(request.frame.copy(deep=True))
+        assert request.frame[["open", "high", "low", "close", "volume"]].notna().all().all()
+        return _result(request)
+
+    result = run_walk_forward(canonical, folds, fake_backtest)
+
+    assert result.runs
+    first = observed[0]
+    assert not set(gap_times).intersection(first.index)
+    assert quarantine_time not in first.index
+    assert int(first.loc[after_gap, "segment_id"]) == 1
+    assert pd.isna(first.loc[after_gap, "ema_200"])
+    assert not bool(first.loc[after_quarantine, "entry_data_valid"])
+
+
+@pytest.mark.parametrize("malformation", ("unflagged_nan", "entry_true", "infinity", "bad_segment"))
+def test_gap_acceptance_rejects_unflagged_or_malformed_invalid_rows(
+    malformation: str,
+) -> None:
+    raw = _frame(20).loc[:, ["open", "high", "low", "close", "volume"]]
+    gap_times = tuple(raw.index[5:7])
+    raw = raw.drop(index=list(gap_times))
+    canonical = canonicalize_ohlcv(
+        raw,
+        (raw.index[-1] + timedelta(hours=8)).to_pydatetime(),
+    ).frame
+    malformed = canonical.copy(deep=True)
+    if malformation == "unflagged_nan":
+        malformed = malformed.loc[:, ["open", "high", "low", "close", "volume"]]
+    elif malformation == "entry_true":
+        malformed.loc[gap_times[0], "entry_data_valid"] = True
+    elif malformation == "infinity":
+        malformed.loc[gap_times[0], "close"] = math.inf
+    else:
+        malformed.loc[raw.index[5]:, "segment_id"] = 0
+
+    with pytest.raises(ValueError, match="quality|finite|segment|entry_data_valid"):
+        validate_walk_forward_frame(malformed)
+
+
 def test_core_adapter_executes_the_real_core_backtest_with_the_request_config() -> None:
     """A runner adapter that bypassed the core engine would not preserve execution semantics."""
     frame = compute_trend_indicators(_frame(604), StrategyConfig())
@@ -1133,3 +1196,107 @@ def test_core_adapter_executes_the_real_core_backtest_with_the_request_config() 
     )
 
     assert core_backtest(request) == run_backtest(request.frame, request.config)
+
+
+def test_core_adapter_restarts_flat_at_each_quality_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing-price region cannot carry inventory or a price return across segments."""
+    frame = compute_trend_indicators(_frame(8), StrategyConfig())
+    frame.loc[:, "segment_id"] = [0] * 4 + [1] * 4
+    calls: list[tuple[int, float]] = []
+
+    def segment_backtest(segment: pd.DataFrame, config: BacktestConfig) -> BacktestResult:
+        segment_id = int(segment["segment_id"].iloc[0])
+        calls.append((segment_id, config.initial_equity))
+        final = config.initial_equity * 1.10
+        return BacktestResult(
+            equity_curve=(
+                EquityPoint(segment.index[0].to_pydatetime(), config.initial_equity),
+                EquityPoint(segment.index[-1].to_pydatetime(), final),
+            ),
+            orders=(), trades=(), final_equity=final,
+            total_fees=0.0, total_slippage=0.0,
+        )
+
+    monkeypatch.setattr(validation_runner, "run_backtest", segment_backtest)
+    request = BacktestRequest(
+        phase="OOS", fold_id="fold-000", trial_id="baseline",
+        trial=TrialConfig("baseline", 200, 50, 20, 14, 2.5),
+        cost_id="zero", cost=CostScenario("zero", 0.0, 0.0),
+        frame=frame,
+        config=BacktestConfig(
+            strategy=StrategyConfig(), costs=CostConfig(0.0, 0.0),
+            force_liquidate_at_end=True,
+        ),
+        initial_equity=100.0, initial_state=PositionState.FLAT, pending_orders=0,
+    )
+
+    result = core_backtest(request)
+
+    assert calls == [(0, 100.0), (1, 110.00000000000001)]
+    assert [point.equity for point in result.equity_curve] == pytest.approx(
+        [100.0, 110.0, 110.0, 121.0]
+    )
+    assert result.final_equity == pytest.approx(121.0)
+
+
+def test_real_core_completes_canonical_gap_and_quarantine_segments_flat() -> None:
+    """The production engine closes before every unavailable-price region."""
+    raw = _frame(1_250).loc[:, ["open", "high", "low", "close", "volume"]]
+    gap_times = tuple(raw.index[620:622])
+    quarantine_time = raw.index[900]
+    raw = raw.drop(index=list(gap_times))
+    raw.loc[quarantine_time, "high"] = raw.loc[quarantine_time, "low"] - 1.0
+    canonical = canonicalize_ohlcv(
+        raw, (raw.index[-1] + timedelta(hours=8)).to_pydatetime()
+    ).frame
+    enriched = compute_trend_indicators(canonical, StrategyConfig())
+    available = enriched[["open", "high", "low", "close", "volume"]].notna().all(axis=1)
+    enriched["_execution_segment_id"] = (~available).cumsum()
+    execution = enriched.loc[available].copy(deep=True)
+    request = BacktestRequest(
+        phase="OOS", fold_id="fold-000", trial_id="baseline",
+        trial=TrialConfig("baseline", 200, 50, 20, 14, 2.5),
+        cost_id="baseline", cost=CostScenario("baseline", 0.0005, 0.0005),
+        frame=execution,
+        config=BacktestConfig(
+            strategy=StrategyConfig(), costs=CostConfig(0.0005, 0.0005),
+            force_liquidate_at_end=True,
+        ),
+        initial_equity=100.0, initial_state=PositionState.FLAT, pending_orders=0,
+    )
+
+    completed = _run_request(request, core_backtest)
+
+    assert completed.status == "COMPLETED"
+    assert completed.result is not None
+    unavailable_datetimes = {
+        timestamp.to_pydatetime() for timestamp in (*gap_times, quarantine_time)
+    }
+    assert not unavailable_datetimes.intersection(
+        point.timestamp for point in completed.result.equity_curve
+    )
+    for unavailable_time in (gap_times[-1], quarantine_time):
+        before = max(
+            (
+                point for point in completed.result.equity_curve
+                if point.timestamp < unavailable_time.to_pydatetime()
+            ),
+            key=lambda point: point.timestamp,
+        )
+        after = min(
+            (
+                point for point in completed.result.equity_curve
+                if point.timestamp > unavailable_time.to_pydatetime()
+            ),
+            key=lambda point: point.timestamp,
+        )
+        assert after.equity == pytest.approx(before.equity)
+    assert all(
+        not (
+            trade.entry_time < unavailable.to_pydatetime() < trade.exit_time
+        )
+        for unavailable in (*gap_times, quarantine_time)
+        for trade in completed.result.trades
+    )

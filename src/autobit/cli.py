@@ -47,7 +47,7 @@ from autobit.validation.models import (
     WalkForwardRun,
 )
 from autobit.validation.overfit import cpcv_splits
-from autobit.validation.runner import run_walk_forward
+from autobit.validation.runner import run_walk_forward, validate_walk_forward_frame
 from autobit.validation.splits import build_rolling_folds
 from autobit.validation.trials import registered_cost_scenarios, registered_trials
 
@@ -226,6 +226,7 @@ def _run_walk_forward(arguments: argparse.Namespace) -> int:
         folds = tuple(build_rolling_folds(frame.index, _walk_forward_config()))
         if len(folds) < 2:
             raise ValueError("walk-forward validation requires at least two complete folds")
+        _preflight_validation_output(arguments.output)
         result = run_walk_forward(frame, folds)
         report = _validation_report(frame, folds, result)
         write_validation_bundle(arguments.output, report)
@@ -532,30 +533,44 @@ def _benchmark_rows(
     ].copy(deep=True)
     rows: list[BenchmarkComparisonRow] = []
     for cost in registered_cost_scenarios():
-        benchmark = run_buy_and_hold(
-            oos,
-            CostConfig(fee_rate=cost.fee_rate, slippage_rate=cost.slippage_rate),
-        )
+        benchmark_return, benchmark_drawdown = _segmented_benchmark(oos, cost)
         strategy = trial_snapshots[("baseline", cost.cost_id)]
         rows.append(
             BenchmarkComparisonRow(
                 cost_id=cost.cost_id,
                 strategy_net_return=strategy.net_return,
-                buy_and_hold_net_return=benchmark.total_return,
+                buy_and_hold_net_return=benchmark_return,
                 strategy_max_drawdown=strategy.max_drawdown,
-                buy_and_hold_max_drawdown=_benchmark_drawdown(oos, benchmark, cost),
+                buy_and_hold_max_drawdown=benchmark_drawdown,
             )
         )
     return tuple(rows)
 
 
-def _benchmark_drawdown(
-    frame: pd.DataFrame,
-    benchmark: BuyAndHoldResult,
-    cost: CostScenario,
-) -> float:
+def _segmented_benchmark(
+    frame: pd.DataFrame, cost: CostScenario
+) -> tuple[float, float]:
+    available = frame.loc[:, ("open", "high", "low", "close", "volume")].notna().all(axis=1)
+    run_ids = (~available).cumsum()
+    capital = 100.0
+    combined: list[float] = []
+    costs = CostConfig(fee_rate=cost.fee_rate, slippage_rate=cost.slippage_rate)
+    for _, segment in frame.loc[available].groupby(run_ids.loc[available], sort=False):
+        benchmark = run_buy_and_hold(segment, costs)
+        normalized = _benchmark_equity(segment, benchmark, cost)
+        scaled = tuple(capital * value / 100.0 for value in normalized)
+        combined.extend(scaled)
+        capital = scaled[-1]
+    if not combined:
+        return 0.0, 0.0
+    return capital / 100.0 - 1.0, _maximum_drawdown(tuple(combined))
+
+
+def _benchmark_equity(
+    frame: pd.DataFrame, benchmark: BuyAndHoldResult, cost: CostScenario
+) -> tuple[float, ...]:
     if benchmark.entry_time is None or benchmark.exit_time is None:
-        return 0.0
+        return (100.0,) * max(1, len(frame))
     cash = max(
         0.0,
         benchmark.initial_equity
@@ -573,7 +588,7 @@ def _benchmark_drawdown(
             liquidation_price = float(close) * (1.0 - cost.slippage_rate)
             liquidation_notional = benchmark.quantity * liquidation_price
             values.append(cash + liquidation_notional * (1.0 - cost.fee_rate))
-    return _maximum_drawdown(tuple(values))
+    return tuple(values)
 
 
 def _equity_from_returns(returns: tuple[float, ...]) -> tuple[float, ...]:
@@ -630,43 +645,7 @@ def _read_walk_forward_csv(path: Path) -> pd.DataFrame:
 
 
 def _validated_walk_forward_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    required = ("open", "high", "low", "close", "volume")
-    missing = tuple(column for column in required if column not in frame)
-    if missing:
-        raise ValueError(f"processed CSV is missing required columns: {', '.join(missing)}")
-    index = frame.index
-    if (
-        not isinstance(index, pd.DatetimeIndex)
-        or index.empty
-        or index.hasnans
-        or not index.is_unique
-        or not index.is_monotonic_increasing
-    ):
-        raise ValueError("processed timestamps must be nonempty, sorted, and unique")
-    if (index.asi8 % _FOUR_HOURS.value != 0).any():
-        raise ValueError("processed timestamps must align to UTC 4-hour boundaries")
-    if len(index) > 1 and not (
-        index[1:].asi8 - index[:-1].asi8 == _FOUR_HOURS.value
-    ).all():
-        raise ValueError("processed timestamps must have exact contiguous 4-hour spacing")
-
-    numeric = frame.loc[:, required].apply(pd.to_numeric, errors="coerce")
-    if not numeric.notna().all().all() or not all(
-        math.isfinite(float(value)) for value in numeric.to_numpy().flat
-    ):
-        raise ValueError("processed OHLCV values must be finite")
-    if (numeric.loc[:, ("open", "high", "low", "close")] <= 0.0).any().any():
-        raise ValueError("processed OHLC prices must be positive")
-    if (numeric["volume"] < 0.0).any():
-        raise ValueError("processed volume must be nonnegative")
-    if (
-        (numeric["high"] < numeric[["open", "close", "low"]].max(axis=1)).any()
-        or (numeric["low"] > numeric[["open", "close", "high"]].min(axis=1)).any()
-    ):
-        raise ValueError("processed OHLC geometry is invalid")
-    result = frame.copy(deep=True)
-    result.loc[:, required] = numeric
-    return result
+    return validate_walk_forward_frame(frame)
 
 
 def _apply_walk_forward_end(
@@ -682,6 +661,38 @@ def _apply_walk_forward_end(
     if filtered.empty:
         raise ValueError("end-utc excludes all input candles")
     return filtered
+
+
+def _preflight_validation_output(output_dir: Path) -> None:
+    """Create only missing parents after rejecting link and collision hazards."""
+    if not isinstance(output_dir, Path):
+        raise ValueError("walk-forward output must be a Path")
+    output = output_dir.absolute()
+    if output.exists() or _is_link_or_junction(output):
+        raise ValueError("validation report output already exists or is a link/junction")
+    _validate_real_directory_chain(output.parent)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _validate_real_directory_chain(output.parent)
+
+
+def _validate_real_directory_chain(path: Path) -> None:
+    current = path
+    while True:
+        if _is_link_or_junction(current):
+            raise ValueError("validation report parent must not contain a link or junction")
+        if current.exists() and not current.is_dir():
+            raise ValueError("validation report parent components must be directories")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    checker = getattr(path, "is_junction", None)
+    return bool(checker is not None and checker())
 
 
 def _read_ohlcv(path: Path) -> pd.DataFrame:

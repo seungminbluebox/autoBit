@@ -1,13 +1,20 @@
+from datetime import timedelta
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
+from autobit import cli as cli_module
 from autobit.cli import (
     _apply_walk_forward_end,
+    _preflight_validation_output,
     _read_walk_forward_csv,
+    _segmented_benchmark,
     build_parser,
     main,
 )
+from autobit.data.quality import canonicalize_ohlcv
+from autobit.validation.models import CostScenario
 
 
 GOLDEN = Path("tests/fixtures/validation_golden.csv")
@@ -102,6 +109,53 @@ def test_walk_forward_rejects_unsorted_processed_data_without_repair(
     assert not output.exists()
 
 
+def test_cli_reads_actual_canonical_long_gap_and_quarantine_rows(
+    tmp_path: Path,
+) -> None:
+    index = pd.date_range("2024-01-01", periods=24, freq="4h", tz="UTC")
+    raw = pd.DataFrame(
+        {
+            "open": 100.0, "high": 102.0, "low": 99.0,
+            "close": 101.0, "volume": 2.0,
+        },
+        index=index,
+    ).drop(index=list(index[5:7]))
+    raw.loc[index[12], "high"] = 98.0
+    canonical = canonicalize_ohlcv(
+        raw, (index[-1] + timedelta(hours=8)).to_pydatetime()
+    ).frame
+    source = tmp_path / "processed.csv"
+    canonical.to_csv(source, index=True, index_label="timestamp")
+
+    loaded = _read_walk_forward_csv(source)
+
+    assert loaded.index.equals(canonical.index)
+    assert loaded.loc[index[5:6], "close"].isna().all()
+    assert bool(loaded.loc[index[12], "is_quarantined"])
+    assert pd.isna(loaded.loc[index[12], "close"])
+
+
+def test_segmented_benchmark_never_marks_across_missing_price_regions() -> None:
+    index = pd.date_range("2025-01-01", periods=6, freq="4h", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "open": [100.0, 100.0, float("nan"), 1_000.0, 1_000.0, 900.0],
+            "high": [101.0, 111.0, float("nan"), 1_001.0, 1_001.0, 901.0],
+            "low": [99.0, 99.0, float("nan"), 899.0, 899.0, 899.0],
+            "close": [100.0, 110.0, float("nan"), 1_000.0, 900.0, 900.0],
+            "volume": [1.0, 1.0, float("nan"), 1.0, 1.0, 1.0],
+        },
+        index=index,
+    )
+
+    net_return, max_drawdown = _segmented_benchmark(
+        frame, CostScenario("zero", 0.0, 0.0)
+    )
+
+    assert net_return == pytest.approx(-0.01)
+    assert max_drawdown == pytest.approx(0.10)
+
+
 def test_walk_forward_has_no_private_execution_arguments() -> None:
     with pytest.raises(SystemExit):
         build_parser().parse_args(
@@ -114,3 +168,59 @@ def test_walk_forward_has_no_private_execution_arguments() -> None:
                 "--live",
             ]
         )
+
+
+def test_walk_forward_preflight_creates_nested_smoke_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    output = Path("reports/validation-smoke")
+
+    _preflight_validation_output(output)
+
+    assert output.parent.is_dir()
+    assert not output.exists()
+
+
+def test_walk_forward_preflight_preserves_existing_output_and_runs_before_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "report"
+    output.mkdir()
+    marker = output / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    called = False
+
+    def forbidden_runner(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("matrix must not start")
+
+    monkeypatch.setattr(cli_module, "run_walk_forward", forbidden_runner)
+    code = main(
+        ["walk-forward", "--input", str(GOLDEN), "--output", str(output)]
+    )
+
+    assert code != 0
+    assert not called
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_walk_forward_preflight_rejects_an_unsafe_parent_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir()
+    original = Path.is_junction
+    monkeypatch.setattr(
+        Path,
+        "is_junction",
+        lambda self: self == unsafe or original(self),
+    )
+
+    with pytest.raises(ValueError, match="link|junction"):
+        _preflight_validation_output(unsafe / "nested" / "report")
+    assert not (unsafe / "nested").exists()

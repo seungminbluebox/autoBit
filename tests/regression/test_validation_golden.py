@@ -3,10 +3,8 @@ import hashlib
 import json
 from pathlib import Path
 
-import pytest
-
 from autobit import cli
-from autobit.reporting.validation import REPORT_FILENAMES, write_validation_bundle
+from autobit.reporting.validation import REPORT_FILENAMES
 
 
 GOLDEN = Path("tests/fixtures/validation_golden.csv")
@@ -15,20 +13,12 @@ EXPECTED = Path("tests/fixtures/validation_golden_expected.json")
 
 def test_real_walk_forward_golden_is_exact_and_byte_stable(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Run the real 9x4 core once, then prove deterministic publication twice."""
+    """Run two independent real 9x4 pipelines and compare every published byte."""
     expected = json.loads(EXPECTED.read_text(encoding="utf-8"))
     primary = tmp_path / "primary"
     repeated = tmp_path / "repeated"
-    captured = []
-
-    def capture_and_write(output_dir, report):
-        captured.append(report)
-        return write_validation_bundle(output_dir, report)
-
-    monkeypatch.setattr(cli, "write_validation_bundle", capture_and_write)
-    code = cli.main(
+    primary_code = cli.main(
         [
             "walk-forward",
             "--input",
@@ -38,13 +28,21 @@ def test_real_walk_forward_golden_is_exact_and_byte_stable(
         ]
     )
 
-    assert code == 0
-    assert len(captured) == 1
+    repeated_code = cli.main(
+        [
+            "walk-forward",
+            "--input",
+            str(GOLDEN),
+            "--output",
+            str(repeated),
+        ]
+    )
+
+    assert primary_code == 0
+    assert repeated_code == 0
     assert tuple(path.name for path in sorted(primary.iterdir())) == tuple(
         sorted(REPORT_FILENAMES)
     )
-    write_validation_bundle(repeated, captured[0])
-
     summary = json.loads(
         (primary / "validation-summary.json").read_text(encoding="utf-8")
     )
