@@ -4,7 +4,14 @@ import pandas as pd
 import pytest
 import backtrader as bt
 
-from autobit.backtest.engine import BacktestConfig, run_backtest
+from autobit.backtest.engine import (
+    BacktestConfig,
+    EnrichedPandasData,
+    _DonchianBacktestStrategy,
+    _prepare_frame,
+    run_backtest,
+)
+from autobit.config import StrategyConfig
 from autobit.config import CostConfig
 from autobit.execution.backtest_broker import EventBacktestBroker
 
@@ -101,16 +108,86 @@ def test_old_stop_wins_when_bar_also_reaches_two_r() -> None:
     assert not any(order.reason == "TRAILING_STOP" for order in result.orders)
 
 
-def test_gap_that_exceeds_cash_reports_margin_without_negative_equity() -> None:
+def test_gap_that_exceeds_close_sizing_is_execution_capped() -> None:
+    fee_rate = 0.0005
+    slippage_rate = 0.0005
     result = run_backtest(
         _fixture("margin_gap.csv"),
+        BacktestConfig(
+            costs=CostConfig(fee_rate=fee_rate, slippage_rate=slippage_rate)
+        ),
+    )
+
+    entry_events = [order for order in result.orders if order.side == "BUY"]
+    partial = next(order for order in entry_events if order.status == "PARTIAL")
+    canceled = next(order for order in entry_events if order.status == "CANCELED")
+    assert partial.fill_time == pd.Timestamp("2025-01-05T04:00:00Z")
+    assert 0.0 < partial.filled_quantity < partial.requested_quantity
+    assert partial.reason == "EXECUTION_CAP"
+    assert canceled.reason == "END_OF_DATA"
+    assert not any(order.status == "INSUFFICIENT_CASH" for order in entry_events)
+    filled_notional = partial.filled_quantity * partial.fill_price
+    effective_risk = partial.filled_quantity * (
+        5.0 + partial.fill_price * fee_rate + (partial.fill_price - 5.0) * fee_rate
+    )
+    assert filled_notional <= 70.0 + 1e-9
+    assert filled_notional * (1.0 + fee_rate) <= 100.0 + 1e-9
+    assert effective_risk <= 2.0 + 1e-9
+    assert result.final_equity >= 0.0
+
+
+def test_final_bar_entry_has_truthful_ordered_terminal_lifecycle() -> None:
+    frame = _fixture("entry_next_open.csv").iloc[:611]
+    result = run_backtest(
+        frame,
         BacktestConfig(costs=CostConfig(fee_rate=0.0, slippage_rate=0.0)),
     )
 
     entry_events = [order for order in result.orders if order.side == "BUY"]
-    assert any(order.status == "INSUFFICIENT_CASH" for order in entry_events)
-    assert not any(order.status == "COMPLETED" for order in entry_events)
-    assert result.final_equity == pytest.approx(100.0)
+    assert [order.status.value for order in entry_events] == [
+        "CREATED",
+        "SUBMITTED",
+        "CANCELED",
+    ]
+    assert entry_events[-1].reason == "END_OF_DATA"
+    keys = [(order.order_id, order.status, order.filled_quantity) for order in entry_events]
+    assert len(keys) == len(set(keys))
+
+
+def test_final_bar_partial_entry_remainder_is_terminally_canceled() -> None:
+    frame = _fixture("partial_entry.csv").iloc[:612]
+    result = run_backtest(
+        frame,
+        BacktestConfig(
+            costs=CostConfig(fee_rate=0.0, slippage_rate=0.0),
+            entry_fill_fraction=0.5,
+        ),
+    )
+
+    entry_events = [order for order in result.orders if order.side == "BUY"]
+    assert [order.status.value for order in entry_events] == [
+        "CREATED",
+        "SUBMITTED",
+        "ACCEPTED",
+        "PARTIAL",
+        "CANCELED",
+    ]
+    assert entry_events[-1].reason == "END_OF_DATA"
+    assert entry_events[-1].filled_quantity == pytest.approx(entry_events[-2].filled_quantity)
+    assert entry_events[-1].remainder_quantity == pytest.approx(
+        entry_events[-2].remainder_quantity
+    )
+    order_ids = {order.order_id for order in result.orders}
+    for order_id in order_ids:
+        lifecycle = [order for order in result.orders if order.order_id == order_id]
+        assert len(lifecycle) > 1
+        assert lifecycle[-1].status in {
+            "COMPLETED",
+            "CANCELED",
+            "EXPIRED",
+            "INSUFFICIENT_CASH",
+            "REJECTED",
+        }
 
 
 def test_repeated_entry_signal_does_not_pyramid() -> None:
@@ -193,6 +270,46 @@ def test_broker_rejects_second_live_buy_order() -> None:
     terminal = [status for _, status in strategy.statuses if status in (bt.Order.Completed, bt.Order.Rejected)]
     assert terminal.count(bt.Order.Completed) == 1
     assert terminal.count(bt.Order.Rejected) == 1
+
+
+class _RejectedLedgerProbe(_DonchianBacktestStrategy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.probe_submitted = False
+
+    def next(self) -> None:
+        if self.probe_submitted:
+            return
+        self.probe_submitted = True
+        self.sell(
+            size=1.0,
+            signal_time=self._now().isoformat(),
+            reason="CLOSE_EXIT",
+        )
+
+
+def test_rejected_ledger_record_prefers_broker_guard_reason() -> None:
+    config = BacktestConfig(costs=CostConfig(fee_rate=0.0, slippage_rate=0.0))
+    frame = _prepare_frame(_fixture("entry_next_open.csv").iloc[:3], StrategyConfig())
+    reference_opens = {
+        pd.Timestamp(timestamp): float(open_price)
+        for timestamp, open_price in frame["open"].items()
+    }
+    cerebro = bt.Cerebro(cheat_on_open=False, stdstats=False)
+    broker = EventBacktestBroker()
+    cerebro.setbroker(broker)
+    broker.set_coc(False)
+    broker.setcash(100.0)
+    cerebro.adddata(EnrichedPandasData(dataname=frame))
+    cerebro.addstrategy(
+        _RejectedLedgerProbe,
+        adapter_config=config,
+        reference_opens=reference_opens,
+    )
+    strategy = cerebro.run()[0]
+
+    rejected = next(order for order in strategy.order_records if order.status == "REJECTED")
+    assert rejected.reason == "OVERSELL"
 
 
 def test_real_broker_order_can_expire() -> None:

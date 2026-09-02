@@ -7,7 +7,11 @@ from test_backtest_execution import _fixture
 
 
 def _completed_round_trip(result):
-    fills = [order for order in result.orders if order.status == "COMPLETED"]
+    fills = [
+        order
+        for order in result.orders
+        if order.status in ("PARTIAL", "COMPLETED") and order.filled_quantity > 0.0
+    ]
     return (
         next(order for order in fills if order.side == "BUY"),
         next(order for order in fills if order.reason == "CLOSE_EXIT"),

@@ -3,25 +3,90 @@
 import backtrader as bt
 from backtrader.order import BuyOrder, SellOrder
 
+from autobit.config import CostConfig
+from autobit.risk.position_sizer import calculate_size
+
 
 class OneShotFractionalFiller:
     """Fill a configured fraction once for each distinct Backtrader order."""
 
-    def __init__(self) -> None:
+    def __init__(self, broker: "EventBacktestBroker") -> None:
+        self._broker = broker
         self._filled_order_refs: set[int] = set()
 
     def __call__(self, order: bt.Order, price: float, ago: int) -> float:
-        del price, ago
+        del ago
         remainder = abs(float(order.executed.remsize))
         if order.ref in self._filled_order_refs:
             return remainder
         self._filled_order_refs.add(order.ref)
         fraction = float(order.info.get("fill_fraction", 1.0))
-        return remainder * fraction
+        requested_fill = remainder * fraction
+        if not order.isbuy() or not order.info.get("execution_cap_enabled", False):
+            return requested_fill
+
+        atr = float(order.info.execution_atr)
+        actual_stop = float(price) - float(order.info.initial_atr_mult) * atr
+        decision = calculate_size(
+            equity=float(self._broker.getvalue()),
+            cash=float(self._broker.getcash()),
+            entry=float(price),
+            stop=actual_stop,
+            current_atr_pct=atr / float(price),
+            baseline_atr_pct=float(order.info.baseline_atr_pct),
+            risk_rate=float(order.info.risk_rate),
+            exposure_cap=float(order.info.exposure_cap),
+            costs=CostConfig(
+                fee_rate=float(order.info.fee_rate),
+                slippage_rate=0.0,
+            ),
+        )
+        safe_fill = min(requested_fill, remainder, float(decision.quantity))
+        if safe_fill <= 0.0:
+            order.addinfo(rejection_reason="EXECUTION_CAP")
+            order.reject(self._broker)
+            self._broker.notify(order)
+            return 0.0
+        if safe_fill < remainder - 1e-12:
+            cap_bound = float(decision.quantity) < remainder - 1e-12
+            order.addinfo(partial_reason="EXECUTION_CAP" if cap_bound else "PARTIAL_FILL")
+        return safe_fill
 
 
 class EventBacktestBroker(bt.brokers.BackBroker):
     """A named broker boundary for the Backtrader execution adapter."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pre_submit_hook = None
+
+    def set_pre_submit_hook(self, hook) -> None:
+        """Register the strategy callback that observes native Created orders."""
+        self._pre_submit_hook = hook
+
+    def submit(self, order, check=True):
+        self._notify_pre_submit(order)
+        return super().submit(order, check=check)
+
+    def cancel_end_of_data(self, order: bt.Order) -> bool:
+        """Terminally cancel an order that cannot receive another broker cycle."""
+        order.addinfo(terminal_reason="END_OF_DATA")
+        try:
+            self.submitted.remove(order)
+        except ValueError:
+            pass
+        else:
+            order.cancel()
+            self.notify(order)
+            return True
+
+        if order in self.pending:
+            return self.cancel(order)
+        if order.alive():
+            order.cancel()
+            self.notify(order)
+            return True
+        return False
 
     def buy(
         self,
@@ -182,7 +247,12 @@ class EventBacktestBroker(bt.brokers.BackBroker):
         )
         order.addinfo(**kwargs)
         order.addinfo(rejection_reason=rejection_reason)
+        self._notify_pre_submit(order)
         order.reject(self)
         self.orders.append(order)
         self.notify(order)
         return order
+
+    def _notify_pre_submit(self, order: bt.Order) -> None:
+        if self._pre_submit_hook is not None:
+            self._pre_submit_hook(order)

@@ -134,6 +134,8 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self.total_fees = 0.0
         self.total_slippage = 0.0
         self._seen_execution_bits: dict[int, int] = {}
+        self._recorded_event_keys: set[tuple[int, OrderStatus, float]] = set()
+        self._tracked_orders: dict[int, bt.Order] = {}
         self._entry_fill_bits: list[tuple[datetime, float, float, float]] = []
         self._exit_fill_bits: list[tuple[datetime, float, float, float]] = []
         self._entry_partial_pending = False
@@ -146,6 +148,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self.entry_price: float | None = None
         self.high_water: float | None = None
         self.entry_signal_time: datetime | None = None
+        self.broker.set_pre_submit_hook(self._on_order_created)
 
     def next(self) -> None:
         self.equity_points.append(EquityPoint(self._now(), float(self.broker.getvalue())))
@@ -197,8 +200,14 @@ class _DonchianBacktestStrategy(bt.Strategy):
             signal_time=self.entry_signal_time.isoformat(),
             reason="ENTRY",
             fill_fraction=self.adapter_config.entry_fill_fraction,
+            execution_cap_enabled=True,
+            execution_atr=atr,
+            initial_atr_mult=self.adapter_config.strategy.initial_atr_mult,
+            baseline_atr_pct=baseline_atr_pct,
+            risk_rate=self.adapter_config.risk.base_risk_rate,
+            exposure_cap=self.adapter_config.risk.max_exposure,
+            fee_rate=self.adapter_config.costs.fee_rate,
         )
-        self._record_created(self.entry_order)
 
     def notify_order(self, order: bt.Order) -> None:
         self._capture_new_fills(order)
@@ -239,6 +248,13 @@ class _DonchianBacktestStrategy(bt.Strategy):
         ):
             self._exit_partial_pending = True
 
+    def stop(self) -> None:
+        for order in self._tracked_orders.values():
+            self._record_native_status(order)
+            if order.alive():
+                self.broker.cancel_end_of_data(order)
+                self._record_native_status(order)
+
     def _submit_stop(self) -> None:
         if self.current_stop is None or self.entry_signal_time is None:
             return
@@ -251,7 +267,6 @@ class _DonchianBacktestStrategy(bt.Strategy):
             reason="HARD_STOP",
             fill_fraction=self.adapter_config.exit_fill_fraction,
         )
-        self._record_created(self.stop_order)
 
     def _update_trailing_stop(self) -> None:
         if None in (self.entry_price, self.initial_stop, self.current_stop, self.high_water):
@@ -284,7 +299,6 @@ class _DonchianBacktestStrategy(bt.Strategy):
             reason="TRAILING_STOP",
             fill_fraction=self.adapter_config.exit_fill_fraction,
         )
-        self._record_created(self.stop_order)
 
     def _submit_close_exit(self) -> None:
         signal_time = self._now()
@@ -297,11 +311,12 @@ class _DonchianBacktestStrategy(bt.Strategy):
             reason="CLOSE_EXIT",
             fill_fraction=self.adapter_config.exit_fill_fraction,
         )
-        self._record_created(self.exit_order)
 
     def _cancel_entry_remainder(self) -> None:
         self._entry_partial_pending = False
         if self.entry_order is not None and self.entry_order.alive():
+            if self._is_last_bar():
+                self.entry_order.addinfo(terminal_reason="END_OF_DATA")
             self.cancel(self.entry_order)
         self.entry_order = None
 
@@ -315,12 +330,16 @@ class _DonchianBacktestStrategy(bt.Strategy):
             max(0.0, float(self.position.size)),
         )
         if original.alive():
+            if self._is_last_bar():
+                original.addinfo(terminal_reason="END_OF_DATA")
             self.cancel(original)
         if _same_order(original, self.stop_order):
             self.stop_order = None
         if _same_order(original, self.exit_order):
             self.exit_order = None
         if remainder <= 0.0:
+            return
+        if self._is_last_bar():
             return
         self.exit_order = self.sell(
             size=remainder,
@@ -330,7 +349,6 @@ class _DonchianBacktestStrategy(bt.Strategy):
             fill_fraction=1.0,
             is_remainder=True,
         )
-        self._record_created(self.exit_order)
 
     def _row(self) -> pd.Series:
         config = self.adapter_config.strategy
@@ -349,8 +367,11 @@ class _DonchianBacktestStrategy(bt.Strategy):
             }
         )
 
-    def _record_created(self, order: bt.Order) -> None:
-        self.order_records.append(self._order_record(order, OrderStatus.CREATED))
+    def _on_order_created(self, order: bt.Order) -> None:
+        if order.status != order.Created:
+            raise RuntimeError("pre-submit hook received a non-Created order")
+        self._tracked_orders[order.ref] = order
+        self._append_order_record(order, OrderStatus.CREATED)
 
     def _record_callback(self, order: bt.Order) -> None:
         statuses = {
@@ -365,7 +386,17 @@ class _DonchianBacktestStrategy(bt.Strategy):
         }
         status = statuses.get(order.status)
         if status is not None:
-            self.order_records.append(self._order_record(order, status))
+            self._append_order_record(order, status)
+
+    def _record_native_status(self, order: bt.Order) -> None:
+        self._record_callback(order)
+
+    def _append_order_record(self, order: bt.Order, status: OrderStatus) -> None:
+        key = (order.ref, status, abs(float(order.executed.size)))
+        if key in self._recorded_event_keys:
+            return
+        self._recorded_event_keys.add(key)
+        self.order_records.append(self._order_record(order, status))
 
     def _order_record(self, order: bt.Order, status: OrderStatus) -> OrderRecord:
         signal_time = _utc_datetime(order.info.signal_time)
@@ -385,8 +416,20 @@ class _DonchianBacktestStrategy(bt.Strategy):
             fee=float(order.executed.comm),
             slippage=self._execution_slippage(order),
             stop_price=order.info.get("stop_price"),
-            reason=order.info.get("reason"),
+            reason=self._event_reason(order, status),
         )
+
+    def _event_reason(self, order: bt.Order, status: OrderStatus) -> str | None:
+        if status == OrderStatus.REJECTED:
+            return order.info.get("rejection_reason", order.info.get("reason"))
+        if status == OrderStatus.CANCELED:
+            return order.info.get(
+                "terminal_reason",
+                order.info.get("partial_reason", order.info.get("reason")),
+            )
+        if status == OrderStatus.PARTIAL:
+            return order.info.get("partial_reason", order.info.get("reason"))
+        return order.info.get("reason")
 
     def _capture_new_fills(self, order: bt.Order) -> None:
         seen = self._seen_execution_bits.get(order.ref, 0)
@@ -454,6 +497,9 @@ class _DonchianBacktestStrategy(bt.Strategy):
     def _now(self) -> datetime:
         return _bt_utc(float(self.data.datetime[0]))
 
+    def _is_last_bar(self) -> bool:
+        return len(self.data) >= self.data.buflen()
+
 
 def run_backtest(frame: pd.DataFrame, config: BacktestConfig = BacktestConfig()) -> BacktestResult:
     prepared = _prepare_frame(frame, config.strategy)
@@ -463,7 +509,7 @@ def run_backtest(frame: pd.DataFrame, config: BacktestConfig = BacktestConfig())
     broker.set_coc(False)
     broker.setcash(float(config.initial_equity))
     broker.setcommission(commission=float(config.costs.fee_rate))
-    broker.set_filler(OneShotFractionalFiller())
+    broker.set_filler(OneShotFractionalFiller(broker))
     broker.set_slippage_perc(
         float(config.costs.slippage_rate),
         slip_open=True,
