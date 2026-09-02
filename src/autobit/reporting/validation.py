@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -36,16 +36,16 @@ REGIME_IDS: Final = ("rising", "falling", "sideways")
 _RECONCILIATION_TOLERANCE: Final = 1e-7
 _FINITE_RATIO_SENTINEL: Final = 1e12
 _NON_RECONCILED_FIELDS: Final = (
-    "median_holding_bars",
-    "exposure",
-    "turnover",
-    "cash_ratio",
-    "non_baseline.annualized_return",
-    "non_baseline.sharpe",
-    "non_baseline.sortino",
-    "non_baseline.calmar",
-    "non_baseline.max_drawdown",
-    "non_baseline.max_drawdown_duration_bars",
+    "all_stitched_trial_cost_cells.median_holding_bars",
+    "all_stitched_trial_cost_cells.exposure",
+    "all_stitched_trial_cost_cells.turnover",
+    "all_stitched_trial_cost_cells.cash_ratio",
+    "stitched_trial_cost_cells_except_baseline_default.annualized_return",
+    "stitched_trial_cost_cells_except_baseline_default.sharpe",
+    "stitched_trial_cost_cells_except_baseline_default.sortino",
+    "stitched_trial_cost_cells_except_baseline_default.calmar",
+    "stitched_trial_cost_cells_except_baseline_default.max_drawdown",
+    "stitched_trial_cost_cells_except_baseline_default.max_drawdown_duration_bars",
 )
 REPORT_FILENAMES: Final = (
     "validation-summary.json",
@@ -186,7 +186,11 @@ class RunFailureEvidence:
 
 @dataclass(frozen=True, slots=True)
 class ValidationReportInput:
-    """All explicit, typed evidence needed to publish one validation report."""
+    """All explicit, typed evidence needed to publish one validation report.
+
+    Stress survival is derived only from completed baseline/stress-20bps fold
+    metrics and their reconciled compounded return, never stitched path risk.
+    """
 
     diagnostic_evidence: ValidationDiagnosticEvidence
     fold_ids: tuple[str, ...]
@@ -352,6 +356,7 @@ def _validate_report(
         _validate_cell(
             row.status, row.error, row.metrics,
             complete_status="COMPLETE", cost_id=row.cost_id,
+            require_failure_error=False,
         )
         trial_map[key] = row
     if set(trial_map) != expected_trial_cells:
@@ -424,8 +429,25 @@ def _validate_report(
         / len(baseline_default_folds)
     )
     max_fold_profit_share = _max_positive_fold_contribution_share(fold_returns)
-    stress = baseline_metrics["stress_20bps"]
-    stress_survived = stress.net_return > -1.0 and stress.max_drawdown < 1.0
+    stress_folds = tuple(
+        fold_map[(fold_id, "baseline", "stress_20bps")].metrics
+        for fold_id in report.fold_ids
+    )
+    if any(metrics is None for metrics in stress_folds):
+        raise ValueError("baseline/stress_20bps fold evidence must be complete")
+    completed_stress_folds = tuple(
+        metrics for metrics in stress_folds if metrics is not None
+    )
+    stress_compounded_return = _compound_returns(tuple(
+        metrics.net_return for metrics in completed_stress_folds
+    ))
+    stress_survived = (
+        stress_compounded_return > -1.0
+        and all(
+            metrics.net_return > -1.0 and metrics.max_drawdown < 1.0
+            for metrics in completed_stress_folds
+        )
+    )
 
     inputs = ValidationInputs(
         oos_net_return=path_metrics.total_return,
@@ -440,7 +462,23 @@ def _validate_report(
         train_test_sharpe_ratio=train_test_ratio,
         stress_survived=stress_survived,
     )
-    return report, inputs, classify_validation(inputs)
+    normalized_trials = tuple(
+        row if row.status == "COMPLETE" else replace(
+            row,
+            error=_canonical_failure_error(tuple(
+                failure for failure in failures
+                if (failure.trial_id, failure.cost_id) == (row.trial_id, row.cost_id)
+            )),
+        )
+        for row in report.trial_metrics
+    )
+    normalized_report = replace(
+        report,
+        diagnostic_evidence=evidence,
+        trial_metrics=normalized_trials,
+        run_failures=failures,
+    )
+    return normalized_report, inputs, classify_validation(inputs)
 
 
 def _validate_cell(
@@ -450,6 +488,7 @@ def _validate_cell(
     *,
     complete_status: str,
     cost_id: str,
+    require_failure_error: bool = True,
 ) -> None:
     failed_status = "FAILED" if complete_status == "COMPLETED" else "INCOMPLETE"
     if status not in {complete_status, failed_status}:
@@ -459,7 +498,12 @@ def _validate_cell(
             raise ValueError("completed report cells require metrics and no error")
         _validate_metrics(metrics, cost_id=cost_id)
     else:
-        if not isinstance(error, str) or not error or metrics is not None:
+        valid_error = (
+            isinstance(error, str) and bool(error)
+            if require_failure_error
+            else error is None or isinstance(error, str)
+        )
+        if not valid_error or metrics is not None:
             raise ValueError("failed report cells require an error and no metrics")
 
 
@@ -502,7 +546,7 @@ def _trade_ledger(metrics: MetricSnapshot) -> _TradeLedger:
             "expectancy", "win_rate", "average_win", "average_loss",
             "profit_factor", "average_win_loss_ratio", "mean_holding_bars",
         ):
-            if not _close(getattr(metrics, name), 0.0):
+            if getattr(metrics, name) != 0.0:
                 raise ValueError(f"zero-trade metrics require {name}=0")
         return _TradeLedger(0, 0, 0, 0.0, 0.0, 0.0)
 
@@ -511,14 +555,14 @@ def _trade_ledger(metrics: MetricSnapshot) -> _TradeLedger:
     if wins < 0 or wins > count or not _close(wins_value, wins):
         raise ValueError("trade win count implied by win_rate must be integer-like")
     if wins == 0:
-        if not _close(metrics.average_win, 0.0):
+        if metrics.average_win != 0.0:
             raise ValueError("zero wins require average_win=0")
     elif metrics.average_win <= 0.0:
         raise ValueError("positive wins require positive average_win")
     gross_wins = wins * metrics.average_win
     net_pnl = metrics.expectancy * count
 
-    if _close(metrics.average_loss, 0.0):
+    if metrics.average_loss == 0.0:
         losses = 0
         gross_losses = 0.0
         if not _close(net_pnl, gross_wins):
@@ -537,9 +581,19 @@ def _trade_ledger(metrics: MetricSnapshot) -> _TradeLedger:
         if metrics.average_loss < 0.0
         else 0.0
     )
-    if not _close(metrics.profit_factor, expected_profit_factor):
+    profit_factor_matches = (
+        metrics.profit_factor == 0.0
+        if expected_profit_factor == 0.0
+        else _close(metrics.profit_factor, expected_profit_factor)
+    )
+    ratio_matches = (
+        metrics.average_win_loss_ratio == 0.0
+        if expected_ratio == 0.0
+        else _close(metrics.average_win_loss_ratio, expected_ratio)
+    )
+    if not profit_factor_matches:
         raise ValueError("profit_factor is inconsistent with trade algebra")
-    if not _close(metrics.average_win_loss_ratio, expected_ratio):
+    if not ratio_matches:
         raise ValueError("average_win_loss_ratio is inconsistent with trade algebra")
     return _TradeLedger(
         trade_count=count,
@@ -812,6 +866,25 @@ def _validate_run_failures(
     ))
 
 
+def _canonical_failure_error(
+    failures: tuple[RunFailureEvidence, ...],
+) -> str:
+    """Render one stable description from structured failure evidence."""
+    if not failures:
+        raise ValueError("canonical failure error requires structured evidence")
+    ordered = sorted(
+        failures,
+        key=lambda item: (
+            _fold_ordinal(item.fold_id), _trial_ordinal(item.trial_id),
+            _cost_ordinal(item.cost_id), 0 if item.phase == "TRAIN" else 1,
+        ),
+    )
+    return "; ".join(
+        f"[{item.phase} {item.fold_id} {item.trial_id}/{item.cost_id}] {item.error}"
+        for item in ordered
+    )
+
+
 def _validate_diagnostics(
     evidence: object,
     fold_ids: tuple[str, ...],
@@ -841,11 +914,16 @@ def _validate_diagnostics(
     if evidence.status != expected_status:
         raise ValueError("diagnostic status must follow baseline-cost trial completeness")
     if evidence.status == "INCOMPLETE":
-        if not isinstance(evidence.error, str) or not evidence.error:
-            raise ValueError("incomplete diagnostics require an error")
+        if evidence.error is not None and not isinstance(evidence.error, str):
+            raise ValueError("incomplete diagnostic error must be text or None")
         if evidence.paths != ():
             raise ValueError("incomplete diagnostics cannot contain fabricated PBO paths")
-        return evidence
+        relevant_failures = tuple(
+            failure for failure in failures if failure.cost_id == "baseline"
+        )
+        return replace(
+            evidence, error=_canonical_failure_error(relevant_failures)
+        )
     if evidence.error is not None:
         raise ValueError("complete diagnostics cannot carry an error")
     if not isinstance(evidence.paths, tuple) or len(evidence.paths) != 45:
@@ -894,6 +972,42 @@ def _close(left: Real, right: Real) -> bool:
     )
 
 
+def _stress_survival_evidence(report: ValidationReportInput) -> dict[str, object]:
+    rows = sorted(
+        (
+            row for row in report.fold_metrics
+            if (row.trial_id, row.cost_id) == ("baseline", "stress_20bps")
+        ),
+        key=lambda row: _fold_ordinal(row.fold_id),
+    )
+    metrics = tuple(row.metrics for row in rows if row.metrics is not None)
+    compounded = _compound_returns(tuple(item.net_return for item in metrics))
+    survived = (
+        len(metrics) == len(rows)
+        and compounded > -1.0
+        and all(item.net_return > -1.0 and item.max_drawdown < 1.0 for item in metrics)
+    )
+    return {
+        "source": "canonical completed baseline/stress_20bps folds",
+        "conditions": [
+            "each fold net_return > -1",
+            "each fold max_drawdown < 1",
+            "reconciled compounded net_return > -1",
+        ],
+        "folds": [
+            {
+                "fold_id": row.fold_id,
+                "net_return": row.metrics.net_return,
+                "max_drawdown": row.metrics.max_drawdown,
+            }
+            for row in rows if row.metrics is not None
+        ],
+        "compounded_net_return": compounded,
+        "stitched_path_risk_used": False,
+        "survived": survived,
+    }
+
+
 def _report_contents(
     report: ValidationReportInput,
     inputs: ValidationInputs,
@@ -929,6 +1043,7 @@ def _report_contents(
             )
         ],
         "non_reconciled_fields": list(_NON_RECONCILED_FIELDS),
+        "stress_survival_evidence": _stress_survival_evidence(report),
         "fold_failures": [
             {
                 "fold_id": row.fold_id,
@@ -954,7 +1069,7 @@ def _report_contents(
         "oos-equity.csv": _csv_bytes(_EQUITY_COLUMNS, (asdict(row) for row in equity_rows)),
         "validation-report.md": _markdown(
             inputs, decision, fold_rows, trial_rows, cost_rows,
-            regime_rows, benchmark_rows,
+            regime_rows, benchmark_rows, report.diagnostic_evidence,
         ).encode("utf-8"),
     }
 
@@ -979,6 +1094,7 @@ def _markdown(
     cost_rows: list[CostScenarioRow],
     regime_rows: list[RegimeMetricRow],
     benchmark_rows: list[BenchmarkComparisonRow],
+    diagnostic_evidence: ValidationDiagnosticEvidence,
 ) -> str:
     lines = [
         f"# Decision: {decision.status}",
@@ -1003,6 +1119,10 @@ def _markdown(
             f"- Maximum fold contribution: {_number(inputs.max_fold_profit_share)}",
             f"- IS/OOS Sharpe ratio: {_optional_number(inputs.train_test_sharpe_ratio)}",
             f"- 20 bps stress survival: {str(inputs.stress_survived).lower()}",
+            "- 20 bps stress source: canonical completed baseline/stress_20bps folds; "
+            "stitched stress path-risk fields are not used",
+            f"- Diagnostic evidence status: {diagnostic_evidence.status}",
+            f"- Diagnostic evidence error: {_markdown_cell(diagnostic_evidence.error)}",
             "", "## Cost scenarios — Gross return versus Net return", "",
             "| Cost | Fee | Slippage | Gross return | Net return | Fees | Slippage cost |",
             "|---|---:|---:|---:|---:|---:|---:|",
@@ -1036,6 +1156,9 @@ def _markdown(
         "", "## Diagnostic evidence", "",
         "Raw labeled CPCV paths, TRAIN Sharpe rows, and structured failures are retained in validation-summary.json.",
         "", "## Non-reconciled fields", "",
+        "The names below apply only to stitched cells. Canonical baseline/stress_20bps "
+        "fold net return and maximum drawdown are reconciled for stress survival.",
+        "",
         *(
             f"- `{name}` (disclosed but not used by validation policy)"
             for name in _NON_RECONCILED_FIELDS

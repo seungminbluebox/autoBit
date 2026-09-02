@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from autobit.backtest.analyzers import calculate_metrics
 from autobit.reporting import validation as validation_reporting
 from autobit.reporting.validation import (
     BenchmarkComparisonRow, CostScenarioRow, DiagnosticPathEvidence,
@@ -78,6 +79,41 @@ def _metrics(
             0.0 if zero else (0.01 if cost_id == "baseline" else 0.02)
         ) if total_slippage is None else total_slippage,
         cash_ratio=0.58,
+    )
+
+
+def _snapshot_from_task2(
+    closed_pnls: tuple[float, ...], equity_curve: tuple[float, ...]
+) -> MetricSnapshot:
+    """Adapt the real Task 2 analyzer result to the Task 4 report boundary."""
+    calculated = calculate_metrics(
+        closed_pnls=closed_pnls,
+        equity_curve=equity_curve,
+        holding_bars=(1.0,) * len(closed_pnls),
+    )
+    return MetricSnapshot(
+        gross_return=calculated.total_return,
+        net_return=calculated.total_return,
+        annualized_return=calculated.annualized_return,
+        sharpe=calculated.sharpe_ratio,
+        sortino=calculated.sortino_ratio,
+        calmar=calculated.calmar_ratio,
+        max_drawdown=calculated.max_drawdown,
+        max_drawdown_duration_bars=calculated.max_drawdown_duration_bars,
+        profit_factor=calculated.profit_factor,
+        expectancy=calculated.expectancy,
+        win_rate=calculated.win_rate,
+        average_win=calculated.average_win,
+        average_loss=calculated.average_loss,
+        average_win_loss_ratio=calculated.average_win_loss_ratio,
+        trade_count=calculated.trade_count,
+        mean_holding_bars=calculated.mean_holding_bars,
+        median_holding_bars=calculated.median_holding_bars,
+        exposure=calculated.exposure,
+        turnover=calculated.turnover,
+        total_fees=calculated.total_fees,
+        total_slippage=calculated.total_slippage,
+        cash_ratio=1.0 - calculated.exposure,
     )
 
 
@@ -293,7 +329,8 @@ def test_bundle_derives_policy_and_is_exact_hashed_deterministic_and_disclosed(t
     }]
     assert summary["incomplete_trial_cells"] == [{
         "trial_id": "ema_250", "cost_id": "stress_20bps",
-        "status": "INCOMPLETE", "error": "synthetic failure",
+        "status": "INCOMPLETE",
+        "error": "[OOS fold-001 ema_250/stress_20bps] synthetic failure",
     }]
     assert summary["run_failures"] == [{
         "phase": "OOS", "fold_id": "fold-001", "trial_id": "ema_250",
@@ -314,12 +351,21 @@ def test_bundle_derives_policy_and_is_exact_hashed_deterministic_and_disclosed(t
         {"fold_id": fold_id, "sharpe": 1.5} for fold_id in FOLD_IDS
     ]
     assert summary["non_reconciled_fields"] == [
-        "median_holding_bars", "exposure", "turnover", "cash_ratio",
-        "non_baseline.annualized_return", "non_baseline.sharpe",
-        "non_baseline.sortino", "non_baseline.calmar",
-        "non_baseline.max_drawdown",
-        "non_baseline.max_drawdown_duration_bars",
+        "all_stitched_trial_cost_cells.median_holding_bars",
+        "all_stitched_trial_cost_cells.exposure",
+        "all_stitched_trial_cost_cells.turnover",
+        "all_stitched_trial_cost_cells.cash_ratio",
+        "stitched_trial_cost_cells_except_baseline_default.annualized_return",
+        "stitched_trial_cost_cells_except_baseline_default.sharpe",
+        "stitched_trial_cost_cells_except_baseline_default.sortino",
+        "stitched_trial_cost_cells_except_baseline_default.calmar",
+        "stitched_trial_cost_cells_except_baseline_default.max_drawdown",
+        "stitched_trial_cost_cells_except_baseline_default.max_drawdown_duration_bars",
     ]
+    assert summary["stress_survival_evidence"]["source"] == (
+        "canonical completed baseline/stress_20bps folds"
+    )
+    assert summary["stress_survival_evidence"]["stitched_path_risk_used"] is False
     manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == "1.0"
     assert set(manifest["files"]) == EXPECTED_FILES - {"manifest.json"}
@@ -334,9 +380,54 @@ def test_bundle_derives_policy_and_is_exact_hashed_deterministic_and_disclosed(t
         "Maximum fold contribution", "IS/OOS Sharpe ratio",
         "20 bps stress survival", "Buy-and-hold", "Fold metrics",
         "Stitched OOS trial metrics", "Gross return", "Net return",
-        "ema_250", "synthetic failure",
+        "ema_250", "synthetic failure", "canonical completed baseline/stress_20bps",
+        "stitched stress path-risk fields are not used",
     ):
         assert required in markdown
+
+
+def test_stress_survival_uses_fold_evidence_not_stitched_stress_drawdown(
+    tmp_path: Path,
+) -> None:
+    report = _report()
+    stress_fold = next(
+        row for row in report.fold_metrics
+        if (row.fold_id, row.trial_id, row.cost_id)
+        == ("fold-000", "baseline", "stress_20bps")
+    )
+    failed_survival = _replace_fold_metric(
+        report, stress_fold.fold_id, stress_fold.trial_id, stress_fold.cost_id,
+        replace(stress_fold, metrics=replace(stress_fold.metrics, max_drawdown=1.0)),
+    )
+    failed_bundle = write_validation_bundle(tmp_path / "fold-failed", failed_survival)
+    assert failed_bundle.validation_inputs.stress_survived is False
+    assert failed_bundle.decision.status == "REVIEW"
+    assert "stress_survived" in failed_bundle.decision.reasons
+
+    stitched = next(
+        row for row in report.trial_metrics
+        if (row.trial_id, row.cost_id) == ("baseline", "stress_20bps")
+    )
+    forged_stitched = replace(
+        stitched, metrics=replace(stitched.metrics, max_drawdown=1.0)
+    )
+    benchmark = next(
+        row for row in report.benchmark_comparison if row.cost_id == "stress_20bps"
+    )
+    report = _replace_trial_metric(
+        report, stitched.trial_id, stitched.cost_id, forged_stitched
+    )
+    report = replace(
+        report,
+        benchmark_comparison=tuple(
+            replace(benchmark, strategy_max_drawdown=1.0)
+            if row.cost_id == "stress_20bps" else row
+            for row in report.benchmark_comparison
+        ),
+    )
+    forged_bundle = write_validation_bundle(tmp_path / "stitched-forged", report)
+    assert forged_bundle.validation_inputs.stress_survived is True
+    assert forged_bundle.decision.status == "PASS"
 
 
 def test_caller_cannot_supply_or_override_policy_inputs_or_decision() -> None:
@@ -534,6 +625,49 @@ def test_zero_implied_losses_require_zero_average_loss_and_ratio(tmp_path: Path)
 
 
 @pytest.mark.parametrize(
+    ("closed_pnls", "equity_curve"),
+    (
+        ((1.0, 2.0), (100.0, 101.0)),
+        ((-1.0, -2.0), (100.0, 99.0)),
+        ((0.0,), (100.0, 100.0)),
+        ((1e-8,), (100.0, 100.00000001)),
+        ((-1e-8,), (100.0, 99.99999999)),
+        ((1.0, -1e-8), (100.0, 100.99999999)),
+    ),
+)
+def test_task2_trade_metrics_preserve_exact_sign_for_tiny_pnl(
+    closed_pnls: tuple[float, ...], equity_curve: tuple[float, ...]
+) -> None:
+    snapshot = _snapshot_from_task2(closed_pnls, equity_curve)
+
+    validation_reporting._validate_metrics(snapshot, cost_id="zero")
+    if closed_pnls == (1.0, -1e-8):
+        assert snapshot.profit_factor == pytest.approx(1e8)
+        assert snapshot.average_win_loss_ratio == pytest.approx(1e8)
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    (
+        replace(
+            _snapshot_from_task2((), (100.0, 100.0)), average_loss=-1e-12
+        ),
+        replace(
+            _snapshot_from_task2((-1.0,), (100.0, 99.0)), average_win=1e-12
+        ),
+        replace(
+            _snapshot_from_task2((1.0,), (100.0, 101.0)), profit_factor=1e-12
+        ),
+    ),
+)
+def test_zero_trade_win_and_loss_conventions_require_exact_zero(
+    snapshot: MetricSnapshot,
+) -> None:
+    with pytest.raises(ValueError, match="zero-trade|zero wins|profit_factor"):
+        validation_reporting._validate_metrics(snapshot, cost_id="zero")
+
+
+@pytest.mark.parametrize(
     "field",
     (
         "trade_count", "expectancy", "win_rate", "average_win",
@@ -705,6 +839,12 @@ def test_sensitivity_failure_publishes_structured_incomplete_diagnostics_without
     assert summary["diagnostics"]["pbo"] is None
     assert summary["diagnostic_evidence"]["status"] == "INCOMPLETE"
     assert summary["diagnostic_evidence"]["paths"] == []
+    assert summary["diagnostic_evidence"]["error"] == (
+        "[OOS fold-001 ema_150/baseline] baseline-cost sensitivity failed"
+    )
+    assert "PBO unavailable: baseline trial failed" not in bundle.report_path.read_text(
+        encoding="utf-8"
+    )
     assert len(summary["run_failures"]) == 2
     assert "Unavailable" in bundle.report_path.read_text(encoding="utf-8")
 
@@ -800,8 +940,57 @@ def test_csv_utf8_quoting_and_failure_lists_match_rows(tmp_path: Path) -> None:
     error = "실패,원인\n상세"
     bundle = write_validation_bundle(tmp_path / "report", _report(failed_error=error))
     rows = list(csv.DictReader(bundle.trial_metrics_path.open(encoding="utf-8", newline="")))
-    assert next(row for row in rows if row["status"] == "INCOMPLETE")["error"] == error
+    assert next(row for row in rows if row["status"] == "INCOMPLETE")["error"] == (
+        f"[OOS fold-001 ema_250/stress_20bps] {error}"
+    )
     assert error.splitlines()[0] in bundle.report_path.read_text(encoding="utf-8")
+
+
+def test_stitched_failure_error_is_canonicalized_from_sorted_structured_failures(
+    tmp_path: Path,
+) -> None:
+    report = _report()
+    stitched = next(
+        row for row in report.trial_metrics
+        if (row.trial_id, row.cost_id) == ("ema_250", "stress_20bps")
+    )
+    report = _replace_trial_metric(
+        report, stitched.trial_id, stitched.cost_id,
+        replace(stitched, error="contradictory stitched error"),
+    )
+    report = replace(
+        report,
+        run_failures=(
+            *report.run_failures,
+            RunFailureEvidence(
+                phase="TRAIN", fold_id="fold-000", trial_id="ema_250",
+                cost_id="stress_20bps", error="train failure",
+            ),
+        ),
+    )
+    expected = (
+        "[TRAIN fold-000 ema_250/stress_20bps] train failure; "
+        "[OOS fold-001 ema_250/stress_20bps] synthetic failure"
+    )
+
+    bundle = write_validation_bundle(tmp_path / "report", report)
+    summary = json.loads(bundle.summary_path.read_text(encoding="utf-8"))
+    trial_rows = list(csv.DictReader(
+        bundle.trial_metrics_path.open(encoding="utf-8", newline="")
+    ))
+    incomplete = next(row for row in trial_rows if row["status"] == "INCOMPLETE")
+    markdown = bundle.report_path.read_text(encoding="utf-8")
+
+    assert summary["incomplete_trial_cells"][0]["error"] == expected
+    assert incomplete["error"] == expected
+    assert expected in markdown
+    assert "contradictory stitched error" not in json.dumps(
+        summary, ensure_ascii=False
+    )
+    assert "contradictory stitched error" not in bundle.trial_metrics_path.read_text(
+        encoding="utf-8"
+    )
+    assert "contradictory stitched error" not in markdown
 
 
 def test_existing_output_collision_is_never_merged_or_deleted(tmp_path: Path) -> None:
