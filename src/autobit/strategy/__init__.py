@@ -1,0 +1,1 @@
+"""Pure trading strategy decisions."""
