@@ -295,6 +295,63 @@ def _replace_fold_metric(
     ))
 
 
+def _report_with_baseline_profit_factor_spoof(
+    *, canonical_profit_factor: float, disclosed_profit_factor: float
+) -> ValidationReportInput:
+    report = _report()
+    wins_by_fold = {"fold-000": 20, "fold-001": 17, "fold-002": 17}
+    losses_by_fold = {"fold-000": 20, "fold-001": 18, "fold-002": 18}
+    average_win = 0.04
+    gross_wins = 54 * average_win
+    gross_losses = gross_wins / canonical_profit_factor
+    average_loss = -(gross_losses / 56)
+    folds = []
+    for row in report.fold_metrics:
+        if (row.trial_id, row.cost_id) == ("baseline", "baseline"):
+            wins = wins_by_fold[row.fold_id]
+            losses = losses_by_fold[row.fold_id]
+            count = wins + losses
+            fold_gross_wins = wins * average_win
+            fold_gross_losses = losses * abs(average_loss)
+            row = replace(
+                row,
+                metrics=replace(
+                    row.metrics,
+                    trade_count=count,
+                    win_rate=wins / count,
+                    average_win=average_win,
+                    average_loss=average_loss,
+                    expectancy=(fold_gross_wins - fold_gross_losses) / count,
+                    profit_factor=fold_gross_wins / fold_gross_losses,
+                    average_win_loss_ratio=average_win / abs(average_loss),
+                ),
+            )
+        folds.append(row)
+    stitched = next(
+        row for row in report.trial_metrics
+        if (row.trial_id, row.cost_id) == ("baseline", "baseline")
+    )
+    stitched = replace(
+        stitched,
+        metrics=replace(
+            stitched.metrics,
+            trade_count=110,
+            win_rate=54 / 110,
+            average_win=average_win,
+            average_loss=average_loss,
+            expectancy=(gross_wins - gross_losses) / 110,
+            profit_factor=disclosed_profit_factor,
+            average_win_loss_ratio=average_win / abs(average_loss),
+        ),
+    )
+    return _replace_trial_metric(
+        replace(report, fold_metrics=tuple(folds)),
+        "baseline",
+        "baseline",
+        stitched,
+    )
+
+
 def test_bundle_derives_policy_and_is_exact_hashed_deterministic_and_disclosed(tmp_path: Path) -> None:
     first = write_validation_bundle(tmp_path / "first", _report())
     second = write_validation_bundle(tmp_path / "second", _report())
@@ -777,6 +834,72 @@ def test_policy_and_csv_use_canonical_fold_expectancy_signs(
     assert float(baseline["expectancy"]) == pytest.approx(
         (gross_wins - gross_losses) / 110
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "canonical_profit_factor", "disclosed_profit_factor", "status",
+        "positive_fold_ratio",
+    ),
+    (
+        (1.49999995, 1.50000005, "REVIEW", 1.0),
+        (0.99999995, 1.00000005, "REJECT", 1 / 3),
+    ),
+)
+def test_policy_and_outputs_use_canonical_profit_factor_at_thresholds(
+    tmp_path: Path,
+    canonical_profit_factor: float,
+    disclosed_profit_factor: float,
+    status: str,
+    positive_fold_ratio: float,
+) -> None:
+    report = _report_with_baseline_profit_factor_spoof(
+        canonical_profit_factor=canonical_profit_factor,
+        disclosed_profit_factor=disclosed_profit_factor,
+    )
+
+    bundle = write_validation_bundle(tmp_path / "report", report)
+    summary = json.loads(bundle.summary_path.read_text(encoding="utf-8"))
+    rows = list(csv.DictReader(
+        bundle.trial_metrics_path.open(encoding="utf-8", newline="")
+    ))
+    baseline = next(
+        row for row in rows
+        if (row["trial_id"], row["cost_id"]) == ("baseline", "baseline")
+    )
+    inputs = bundle.validation_inputs
+
+    assert inputs.profit_factor == pytest.approx(
+        canonical_profit_factor, rel=0.0, abs=1e-12
+    )
+    assert bundle.decision.status == status
+    assert "profit_factor" in bundle.decision.reasons
+    assert float(baseline["profit_factor"]) == pytest.approx(
+        canonical_profit_factor, rel=0.0, abs=1e-12
+    )
+    assert summary["diagnostics"]["profit_factor"] == pytest.approx(
+        canonical_profit_factor, rel=0.0, abs=1e-12
+    )
+    assert f"- Profit factor: {repr(float(inputs.profit_factor))}" in (
+        bundle.report_path.read_text(encoding="utf-8")
+    )
+
+    # Audit every ValidationInputs source while the stitched PF is adversarial.
+    path = _path_statistics(_equity_values())
+    assert inputs.oos_net_return == pytest.approx(TARGETS["baseline"])
+    assert inputs.sharpe == pytest.approx(path["sharpe"])
+    assert inputs.max_drawdown == pytest.approx(path["max_drawdown"])
+    assert inputs.trade_count == 110
+    assert inputs.dsr == 1.0
+    assert inputs.pbo == 0.0
+    assert inputs.positive_expectancy_fold_ratio == pytest.approx(positive_fold_ratio)
+    fold_return = (1.0 + TARGETS["baseline"]) ** (1.0 / 3.0) - 1.0
+    expected_share = (1.0 + fold_return) ** 2 / (
+        1.0 + (1.0 + fold_return) + (1.0 + fold_return) ** 2
+    )
+    assert inputs.max_fold_profit_share == pytest.approx(expected_share)
+    assert inputs.train_test_sharpe_ratio == pytest.approx(1.5 / 1.1)
+    assert inputs.stress_survived is True
 
 
 def test_trade_ledger_canonicalizes_zero_and_same_sign_rounding() -> None:

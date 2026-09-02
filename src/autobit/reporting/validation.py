@@ -362,6 +362,7 @@ def _validate_report(
     if set(trial_map) != expected_trial_cells:
         raise ValueError("trial_metrics must disclose the exact 9 by 4 matrix")
 
+    stitched_ledgers: dict[tuple[str, str], _TradeLedger] = {}
     for trial_id, cost_id in sorted(expected_trial_cells):
         folds = [fold_map[(fold_id, trial_id, cost_id)] for fold_id in report.fold_ids]
         stitched = trial_map[(trial_id, cost_id)]
@@ -370,7 +371,7 @@ def _validate_report(
         if stitched.status == "COMPLETE":
             if any(row.metrics is None for row in folds):
                 raise ValueError("a COMPLETE stitched cell requires complete fold evidence")
-            _reconcile_stitched_metrics(
+            stitched_ledgers[(trial_id, cost_id)] = _reconcile_stitched_metrics(
                 tuple(row.metrics for row in folds if row.metrics is not None),
                 stitched.metrics,
             )
@@ -455,9 +456,11 @@ def _validate_report(
     inputs = ValidationInputs(
         oos_net_return=path_metrics.total_return,
         sharpe=path_metrics.sharpe,
-        profit_factor=baseline_metrics["baseline"].profit_factor,
+        profit_factor=_ledger_profit_factor(
+            stitched_ledgers[("baseline", "baseline")]
+        ),
         max_drawdown=path_metrics.max_drawdown,
-        trade_count=baseline_metrics["baseline"].trade_count,
+        trade_count=stitched_ledgers[("baseline", "baseline")].trade_count,
         dsr=deflated_sharpe_probability(equity_returns, num_trials=len(TRIAL_IDS)),
         pbo=pbo,
         positive_expectancy_fold_ratio=positive_expectancy_ratio,
@@ -471,7 +474,12 @@ def _validate_report(
         for row in report.fold_metrics
     )
     normalized_trials = tuple(
-        replace(row, metrics=_canonical_metrics(row.metrics))
+        replace(
+            row,
+            metrics=_canonical_metrics(
+                row.metrics, stitched_ledgers[(row.trial_id, row.cost_id)]
+            ),
+        )
         if row.status == "COMPLETE" and row.metrics is not None else replace(
             row, error=_canonical_failure_error(tuple(
                 failure for failure in failures
@@ -627,17 +635,46 @@ def _trade_ledger(metrics: MetricSnapshot) -> _TradeLedger:
     )
 
 
-def _canonical_metrics(metrics: MetricSnapshot) -> MetricSnapshot:
-    ledger = _trade_ledger(metrics)
-    canonical_expectancy = (
-        ledger.net_pnl / ledger.trade_count if ledger.trade_count else 0.0
+def _ledger_profit_factor(ledger: _TradeLedger) -> float:
+    return (
+        ledger.gross_wins / ledger.gross_losses
+        if ledger.gross_losses > 0.0 else 0.0
     )
-    return replace(metrics, expectancy=canonical_expectancy)
+
+
+def _canonical_metrics(
+    metrics: MetricSnapshot, ledger: _TradeLedger | None = None
+) -> MetricSnapshot:
+    canonical = _trade_ledger(metrics) if ledger is None else ledger
+    average_win = (
+        canonical.gross_wins / canonical.wins if canonical.wins else 0.0
+    )
+    average_loss = (
+        -canonical.gross_losses / canonical.losses if canonical.losses else 0.0
+    )
+    canonical_expectancy = (
+        canonical.net_pnl / canonical.trade_count if canonical.trade_count else 0.0
+    )
+    return replace(
+        metrics,
+        trade_count=canonical.trade_count,
+        win_rate=(
+            canonical.wins / canonical.trade_count
+            if canonical.trade_count else 0.0
+        ),
+        average_win=average_win,
+        average_loss=average_loss,
+        expectancy=canonical_expectancy,
+        profit_factor=_ledger_profit_factor(canonical),
+        average_win_loss_ratio=(
+            average_win / abs(average_loss) if average_loss < 0.0 else 0.0
+        ),
+    )
 
 
 def _reconcile_stitched_metrics(
     folds: tuple[MetricSnapshot, ...], stitched: MetricSnapshot
-) -> None:
+) -> _TradeLedger:
     if not _close(_compound_returns(tuple(row.gross_return for row in folds)), stitched.gross_return):
         raise ValueError("fold gross_return must compound to stitched gross_return")
     if not _close(_compound_returns(tuple(row.net_return for row in folds)), stitched.net_return):
@@ -674,6 +711,14 @@ def _reconcile_stitched_metrics(
     for name, value in expected.items():
         if not _close(getattr(stitched, name), value):
             raise ValueError(f"stitched {name} must be reconstructed from fold trades")
+    return _TradeLedger(
+        trade_count=trade_count,
+        wins=wins,
+        losses=losses,
+        gross_wins=gross_wins,
+        gross_losses=gross_losses,
+        net_pnl=net_pnl,
+    )
 
 
 def _validate_cost_scenarios(
