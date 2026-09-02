@@ -65,7 +65,6 @@ def test_fifteen_percent_drawdown_starts_a_72_hour_halt() -> None:
         (0.05, 0.005, 0.30),
         (0.049999, 0.01, 0.50),
         (0.000001, 0.01, 0.50),
-        (0.0, 0.02, 0.70),
     ],
 )
 def test_expired_drawdown_cooldown_uses_recovery_ladder(
@@ -83,6 +82,16 @@ def test_expired_drawdown_cooldown_uses_recovery_ladder(
     assert decision.exposure_cap == pytest.approx(exposure_cap)
     assert decision.halted_until is None
     assert decision.reasons == ("recovery",)
+
+
+def test_recovery_at_zero_drawdown_has_full_risk_and_no_restriction_reason() -> None:
+    decision = _evaluate(
+        now=NOW + timedelta(hours=72),
+        drawdown=0.0,
+        recovery_started_at=NOW,
+    )
+
+    assert decision == RiskDecision(0.02, 0.70, None, ())
 
 
 def test_drawdown_recovery_does_not_release_before_exact_expiry() -> None:
@@ -269,6 +278,33 @@ def test_simultaneous_halts_return_latest_finite_expiry_and_deterministic_reason
     )
 
 
+def test_indefinite_volatility_halt_overrides_daily_timed_expiry() -> None:
+    decision = _evaluate(daily_loss=0.04, volatility_ratio=3.000001)
+
+    assert decision == RiskDecision(
+        0.0,
+        0.0,
+        None,
+        ("daily_loss_halt", "volatility_halt"),
+    )
+
+
+def test_persistent_drawdown_halt_overrides_weekly_timed_expiry() -> None:
+    decision = _evaluate(
+        now=NOW + timedelta(hours=73),
+        drawdown=0.15,
+        weekly_loss=0.07,
+        recovery_started_at=NOW,
+    )
+
+    assert decision == RiskDecision(
+        0.0,
+        0.0,
+        None,
+        ("drawdown_halt", "weekly_loss_halt"),
+    )
+
+
 def test_system_unhealthy_has_precedence_over_every_rule_and_invalid_input() -> None:
     decision = _evaluate(
         now=datetime(2026, 1, 1),
@@ -299,6 +335,39 @@ def test_system_unhealthy_has_precedence_over_every_rule_and_invalid_input() -> 
 )
 def test_invalid_inputs_fail_closed(overrides: dict[str, object]) -> None:
     assert _evaluate(**overrides) == RiskDecision(0.0, 0.0, None, ("invalid_input",))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("base_risk_rate", 0.020001),
+        ("max_exposure", 0.700001),
+        ("hard_drawdown", 0.150001),
+        ("daily_loss_limit", 0.040001),
+        ("weekly_reduce_limit", 0.050001),
+        ("weekly_halt_limit", 0.070001),
+        ("base_risk_rate", math.nan),
+        ("max_exposure", math.nan),
+        ("hard_drawdown", math.nan),
+        ("daily_loss_limit", math.nan),
+        ("weekly_reduce_limit", math.nan),
+        ("weekly_halt_limit", math.nan),
+    ],
+)
+def test_modified_or_nonfinite_risk_config_fails_closed(field: str, value: float) -> None:
+    config_values = {
+        "base_risk_rate": 0.02,
+        "max_exposure": 0.70,
+        "hard_drawdown": 0.15,
+        "daily_loss_limit": 0.04,
+        "weekly_reduce_limit": 0.05,
+        "weekly_halt_limit": 0.07,
+    }
+    config_values[field] = value
+
+    decision = _evaluate(config=RiskConfig(**config_values))
+
+    assert decision == RiskDecision(0.0, 0.0, None, ("invalid_config",))
 
 
 def test_timezone_aware_non_utc_inputs_are_normalized_for_cooldowns() -> None:

@@ -80,17 +80,40 @@ def test_equal_fixed_and_volatility_candidates_bind_fixed_deterministically() ->
 
 
 @pytest.mark.parametrize(
+    ("override", "value", "binding_constraint"),
+    [
+        ("equity", 0.0, "fixed"),
+        ("equity", -0.0, "fixed"),
+        ("cash", 0.0, "cash"),
+        ("cash", -0.0, "cash"),
+        ("risk_rate", 0.0, "fixed"),
+        ("risk_rate", -0.0, "fixed"),
+        ("exposure_cap", 0.0, "exposure"),
+        ("exposure_cap", -0.0, "exposure"),
+    ],
+)
+def test_finite_zero_limits_use_the_exact_candidate_minimum(
+    override: str,
+    value: float,
+    binding_constraint: str,
+) -> None:
+    decision = _calculate(**{override: value})
+
+    assert decision == SizeDecision(0.0, binding_constraint, 0.0)
+
+
+@pytest.mark.parametrize(
     ("override", "value"),
     [
-        ("equity", 0.0),
+        ("equity", -0.000001),
         ("equity", math.nan),
-        ("cash", 0.0),
+        ("cash", -0.000001),
         ("entry", 0.0),
         ("stop", 0.0),
         ("stop", 100.0),
         ("current_atr_pct", 0.0),
         ("baseline_atr_pct", -0.01),
-        ("risk_rate", 0.0),
+        ("risk_rate", -0.000001),
         ("exposure_cap", -0.1),
     ],
 )

@@ -8,6 +8,22 @@ from numbers import Integral
 from autobit.config import RiskConfig
 
 
+_BASE_RISK_RATE = 0.02
+_MAX_EXPOSURE = 0.70
+_HARD_DRAWDOWN = 0.15
+_DAILY_LOSS_LIMIT = 0.04
+_WEEKLY_REDUCE_LIMIT = 0.05
+_WEEKLY_HALT_LIMIT = 0.07
+_APPROVED_CONFIG = (
+    _BASE_RISK_RATE,
+    _MAX_EXPOSURE,
+    _HARD_DRAWDOWN,
+    _DAILY_LOSS_LIMIT,
+    _WEEKLY_REDUCE_LIMIT,
+    _WEEKLY_HALT_LIMIT,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class RiskDecision:
     """The most restrictive risk state active for the supplied snapshot."""
@@ -39,7 +55,12 @@ def evaluate_risk(
     volatility_stable_bars: int = 0,
     profitable_trades_since_streak_halt: int = 0,
 ) -> RiskDecision:
-    """Evaluate all active rules and fail closed on an invalid snapshot."""
+    """Evaluate all active rules and fail closed on an invalid snapshot.
+
+    Persisted halt starts are event-scoped. Callers must store each start once
+    while that event remains active, then clear it when the trigger ends before
+    a later event. Aggregate loss/streak inputs cannot distinguish two events.
+    """
     if system_healthy is False:
         return RiskDecision(0.0, 0.0, None, ("system_unhealthy",))
     if system_healthy is not True or not isinstance(volatility_halted, bool):
@@ -85,14 +106,14 @@ def evaluate_risk(
     ):
         return _invalid_decision()
     if not _valid_config(config):
-        return _invalid_decision()
+        return _invalid_config_decision()
 
     reasons: list[str] = []
     halts: list[datetime | None] = []
 
-    risk_rate, exposure_cap = _drawdown_ladder(drawdown_value, config)
+    risk_rate, exposure_cap = _drawdown_ladder(drawdown_value)
     if recovery_start is None:
-        if drawdown_value >= config.hard_drawdown:
+        if drawdown_value >= _HARD_DRAWDOWN:
             reasons.append("drawdown_halt")
             halts.append(now_utc + timedelta(hours=72))
     else:
@@ -100,12 +121,13 @@ def evaluate_risk(
         if now_utc < recovery_expiry:
             reasons.append("drawdown_halt")
             halts.append(recovery_expiry)
-        elif drawdown_value >= config.hard_drawdown:
+        elif drawdown_value >= _HARD_DRAWDOWN:
             reasons.append("drawdown_halt")
             halts.append(None)
         else:
-            risk_rate, exposure_cap = _recovery_ladder(drawdown_value, config)
-            reasons.append("recovery")
+            risk_rate, exposure_cap = _recovery_ladder(drawdown_value)
+            if drawdown_value > 0.0:
+                reasons.append("recovery")
 
     reduced_risk_rate = risk_rate / 2.0
     reduced_exposure_cap = exposure_cap / 2.0
@@ -114,10 +136,10 @@ def evaluate_risk(
     if daily_expiry is not None and now_utc < daily_expiry:
         reasons.append("daily_loss_halt")
         halts.append(daily_expiry)
-    elif daily_start is None and daily_loss_value >= config.daily_loss_limit:
+    elif daily_start is None and daily_loss_value >= _DAILY_LOSS_LIMIT:
         reasons.append("daily_loss_halt")
         halts.append(now_utc + timedelta(hours=24))
-    elif daily_start is not None and daily_loss_value >= config.daily_loss_limit:
+    elif daily_start is not None and daily_loss_value >= _DAILY_LOSS_LIMIT:
         risk_rate = min(risk_rate, reduced_risk_rate)
         exposure_cap = min(exposure_cap, reduced_exposure_cap)
         reasons.append("daily_loss_reduced")
@@ -126,10 +148,10 @@ def evaluate_risk(
     if weekly_expiry is not None and now_utc < weekly_expiry:
         reasons.append("weekly_loss_halt")
         halts.append(weekly_expiry)
-    elif weekly_start is None and weekly_loss_value >= config.weekly_halt_limit:
+    elif weekly_start is None and weekly_loss_value >= _WEEKLY_HALT_LIMIT:
         reasons.append("weekly_loss_halt")
         halts.append(now_utc + timedelta(hours=48))
-    elif weekly_loss_value >= config.weekly_reduce_limit:
+    elif weekly_loss_value >= _WEEKLY_REDUCE_LIMIT:
         risk_rate = min(risk_rate, reduced_risk_rate)
         exposure_cap = min(exposure_cap, reduced_exposure_cap)
         reasons.append("weekly_loss_reduced")
@@ -164,27 +186,27 @@ def evaluate_risk(
 
     if halts:
         finite_halts = [halt for halt in halts if halt is not None]
-        halted_until = max(finite_halts) if finite_halts else None
+        halted_until = None if len(finite_halts) != len(halts) else max(finite_halts)
         return RiskDecision(0.0, 0.0, halted_until, tuple(reasons))
     return RiskDecision(risk_rate, exposure_cap, None, tuple(reasons))
 
 
-def _drawdown_ladder(drawdown: float, config: RiskConfig) -> tuple[float, float]:
+def _drawdown_ladder(drawdown: float) -> tuple[float, float]:
     if drawdown >= 0.10:
         return 0.005, 0.30
     if drawdown >= 0.05:
         return 0.01, 0.50
-    return config.base_risk_rate, config.max_exposure
+    return _BASE_RISK_RATE, _MAX_EXPOSURE
 
 
-def _recovery_ladder(drawdown: float, config: RiskConfig) -> tuple[float, float]:
+def _recovery_ladder(drawdown: float) -> tuple[float, float]:
     if drawdown >= 0.10:
         return 0.0025, 0.15
     if drawdown >= 0.05:
         return 0.005, 0.30
     if drawdown > 0.0:
         return 0.01, 0.50
-    return config.base_risk_rate, config.max_exposure
+    return _BASE_RISK_RATE, _MAX_EXPOSURE
 
 
 def _finite_nonnegative_values(*values: object) -> tuple[float, ...] | None:
@@ -229,12 +251,15 @@ def _valid_config(config: object) -> bool:
         )
     except AttributeError:
         return False
-    return (
-        values is not None
-        and all(0.0 < value <= 1.0 for value in values)
-        and config.weekly_reduce_limit < config.weekly_halt_limit
+    return values is not None and all(
+        math.isclose(actual, approved, rel_tol=0.0, abs_tol=1e-12)
+        for actual, approved in zip(values, _APPROVED_CONFIG, strict=True)
     )
 
 
 def _invalid_decision() -> RiskDecision:
     return RiskDecision(0.0, 0.0, None, ("invalid_input",))
+
+
+def _invalid_config_decision() -> RiskDecision:
+    return RiskDecision(0.0, 0.0, None, ("invalid_config",))

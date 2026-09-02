@@ -50,7 +50,14 @@ def calculate_size(
         risk_rate_value,
         exposure_cap_value,
     ) = values
-    if any(value <= 0.0 for value in values) or stop_value >= entry_value:
+    if (
+        any(value < 0.0 for value in (equity_value, cash_value, risk_rate_value, exposure_cap_value))
+        or any(
+            value <= 0.0
+            for value in (entry_value, stop_value, current_atr_value, baseline_atr_value)
+        )
+        or stop_value >= entry_value
+    ):
         return _invalid_decision()
 
     try:
@@ -84,13 +91,16 @@ def calculate_size(
         ("exposure", exposure),
         ("cash", cash_limit),
     )
-    if any(not math.isfinite(quantity) or quantity <= 0.0 for _, quantity in candidates):
+    if any(not math.isfinite(quantity) or quantity < 0.0 for _, quantity in candidates):
         return _invalid_decision()
 
     binding_constraint, quantity = min(candidates, key=lambda candidate: candidate[1])
     estimated_loss = quantity * effective_loss
     if not math.isfinite(estimated_loss):
         return _invalid_decision()
+    if quantity == 0.0:
+        quantity = 0.0
+        estimated_loss = 0.0
     return SizeDecision(quantity, binding_constraint, estimated_loss)
 
 
