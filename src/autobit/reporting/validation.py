@@ -425,7 +425,10 @@ def _validate_report(
         row.metrics.net_return for row in baseline_default_folds if row.metrics
     )
     positive_expectancy_ratio = (
-        sum(row.metrics.expectancy > 0.0 for row in baseline_default_folds if row.metrics)
+        sum(
+            _trade_ledger(row.metrics).net_pnl > 0.0
+            for row in baseline_default_folds if row.metrics
+        )
         / len(baseline_default_folds)
     )
     max_fold_profit_share = _max_positive_fold_contribution_share(fold_returns)
@@ -462,19 +465,25 @@ def _validate_report(
         train_test_sharpe_ratio=train_test_ratio,
         stress_survived=stress_survived,
     )
+    normalized_folds = tuple(
+        replace(row, metrics=_canonical_metrics(row.metrics))
+        if row.status == "COMPLETED" and row.metrics is not None else row
+        for row in report.fold_metrics
+    )
     normalized_trials = tuple(
-        row if row.status == "COMPLETE" else replace(
-            row,
-            error=_canonical_failure_error(tuple(
+        replace(row, metrics=_canonical_metrics(row.metrics))
+        if row.status == "COMPLETE" and row.metrics is not None else replace(
+            row, error=_canonical_failure_error(tuple(
                 failure for failure in failures
                 if (failure.trial_id, failure.cost_id) == (row.trial_id, row.cost_id)
-            )),
+            ))
         )
         for row in report.trial_metrics
     )
     normalized_report = replace(
         report,
         diagnostic_evidence=evidence,
+        fold_metrics=normalized_folds,
         trial_metrics=normalized_trials,
         run_failures=failures,
     )
@@ -560,7 +569,7 @@ def _trade_ledger(metrics: MetricSnapshot) -> _TradeLedger:
     elif metrics.average_win <= 0.0:
         raise ValueError("positive wins require positive average_win")
     gross_wins = wins * metrics.average_win
-    net_pnl = metrics.expectancy * count
+    disclosed_net_pnl = metrics.expectancy * count
 
     if metrics.average_loss == 0.0:
         losses = 0
@@ -579,14 +588,14 @@ def _trade_ledger(metrics: MetricSnapshot) -> _TradeLedger:
     else:
         if metrics.profit_factor != 0.0:
             raise ValueError("zero wins require profit_factor=0")
-        disclosed_gross_losses = -net_pnl
+        disclosed_gross_losses = -disclosed_net_pnl
         losses_value = disclosed_gross_losses / abs(metrics.average_loss)
         losses = round(losses_value)
         if losses <= 0 or wins + losses > count or not _close(losses_value, losses):
             raise ValueError("trade loss count implied by expectancy must be integer-like")
         gross_losses = losses * abs(metrics.average_loss)
     expected_net_pnl = gross_wins - gross_losses
-    if not _close(expected_net_pnl, net_pnl):
+    if not _close(expected_net_pnl, disclosed_net_pnl):
         raise ValueError("expectancy is inconsistent with win and loss evidence")
     expected_profit_factor = gross_wins / gross_losses if gross_losses > 0.0 else 0.0
     expected_ratio = (
@@ -614,8 +623,16 @@ def _trade_ledger(metrics: MetricSnapshot) -> _TradeLedger:
         losses=losses,
         gross_wins=gross_wins,
         gross_losses=gross_losses,
-        net_pnl=net_pnl,
+        net_pnl=expected_net_pnl,
     )
+
+
+def _canonical_metrics(metrics: MetricSnapshot) -> MetricSnapshot:
+    ledger = _trade_ledger(metrics)
+    canonical_expectancy = (
+        ledger.net_pnl / ledger.trade_count if ledger.trade_count else 0.0
+    )
+    return replace(metrics, expectancy=canonical_expectancy)
 
 
 def _reconcile_stitched_metrics(

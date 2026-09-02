@@ -692,6 +692,111 @@ def test_bundle_accepts_cancellation_prone_task2_trade_metrics(
     assert bundle.trial_metrics_path.exists()
 
 
+def test_policy_and_csv_use_canonical_fold_expectancy_signs(
+    tmp_path: Path,
+) -> None:
+    report = _report()
+    settings = {
+        "fold-000": (40, 20, 20, 0.15, -0.05, 0.05),
+        # Canonical expectancy is -2.5e-10; only this caller field flips sign.
+        "fold-001": (35, 17, 18, 2.5e-10, -(13e-9 / 18), 2.5e-10),
+        "fold-002": (35, 17, 18, 2.5e-10, -(13e-9 / 18), -2.5e-10),
+    }
+    fold_rows = []
+    for row in report.fold_metrics:
+        if (row.trial_id, row.cost_id) == ("baseline", "baseline"):
+            count, wins, losses, average_win, average_loss, expectancy = settings[row.fold_id]
+            gross_wins = wins * average_win
+            gross_losses = losses * abs(average_loss)
+            row = replace(
+                row,
+                metrics=replace(
+                    row.metrics,
+                    trade_count=count,
+                    win_rate=wins / count,
+                    average_win=average_win,
+                    average_loss=average_loss,
+                    expectancy=expectancy,
+                    profit_factor=gross_wins / gross_losses,
+                    average_win_loss_ratio=average_win / abs(average_loss),
+                ),
+            )
+        fold_rows.append(row)
+
+    stitched = next(
+        row for row in report.trial_metrics
+        if (row.trial_id, row.cost_id) == ("baseline", "baseline")
+    )
+    gross_wins = 3.0000000085
+    gross_losses = 1.000000026
+    stitched = replace(
+        stitched,
+        metrics=replace(
+            stitched.metrics,
+            trade_count=110,
+            win_rate=54 / 110,
+            average_win=gross_wins / 54,
+            average_loss=-gross_losses / 56,
+            # Sum of the three caller-supplied fold expectancy ledgers.
+            expectancy=2.0 / 110,
+            profit_factor=gross_wins / gross_losses,
+            average_win_loss_ratio=(gross_wins / 54) / (gross_losses / 56),
+        ),
+    )
+    report = _replace_trial_metric(
+        replace(report, fold_metrics=tuple(fold_rows)),
+        "baseline",
+        "baseline",
+        stitched,
+    )
+
+    bundle = write_validation_bundle(tmp_path / "report", report)
+    summary = json.loads(bundle.summary_path.read_text(encoding="utf-8"))
+    fold_csv = list(csv.DictReader(
+        bundle.fold_metrics_path.open(encoding="utf-8", newline="")
+    ))
+    trial_csv = list(csv.DictReader(
+        bundle.trial_metrics_path.open(encoding="utf-8", newline="")
+    ))
+    flipped = next(
+        row for row in fold_csv
+        if (row["fold_id"], row["trial_id"], row["cost_id"])
+        == ("fold-001", "baseline", "baseline")
+    )
+    baseline = next(
+        row for row in trial_csv
+        if (row["trial_id"], row["cost_id"]) == ("baseline", "baseline")
+    )
+
+    assert bundle.validation_inputs.positive_expectancy_fold_ratio == pytest.approx(1 / 3)
+    assert bundle.decision.status == "REVIEW"
+    assert "positive_expectancy_fold_ratio" in bundle.decision.reasons
+    assert summary["diagnostics"]["positive_expectancy_fold_ratio"] == pytest.approx(1 / 3)
+    assert float(flipped["expectancy"]) < 0.0
+    assert float(flipped["expectancy"]) == pytest.approx(-2.5e-10)
+    assert float(baseline["expectancy"]) == pytest.approx(
+        (gross_wins - gross_losses) / 110
+    )
+
+
+def test_trade_ledger_canonicalizes_zero_and_same_sign_rounding() -> None:
+    exact_zero = replace(
+        _snapshot_from_task2((1.0, -1.0), (100.0, 100.0)),
+        expectancy=-0.0,
+    )
+    same_sign = replace(
+        _snapshot_from_task2((2.5e-10, -7.5e-10), (100.0, 99.9999999995)),
+        expectancy=-2.5000001e-10,
+    )
+
+    zero_ledger = validation_reporting._trade_ledger(exact_zero)
+    rounded_ledger = validation_reporting._trade_ledger(same_sign)
+
+    assert zero_ledger.net_pnl == 0.0
+    assert math.copysign(1.0, zero_ledger.net_pnl) == 1.0
+    assert rounded_ledger.net_pnl == 2.5e-10 - 7.5e-10
+
+
 @pytest.mark.parametrize(
     "snapshot",
     (
