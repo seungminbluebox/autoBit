@@ -186,6 +186,12 @@ class _ReplayResult:
     snapshot_timestamps: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _DdlToken:
+    kind: str
+    value: str
+
+
 class _RestrictedCursor:
     """Cursor results without a route back to the owned SQLite connection."""
 
@@ -342,6 +348,12 @@ class SQLiteStore:
             "event type must be non-empty",
         )
         occurred_at_utc, occurred_datetime = _canonical_timestamp(occurred_at)
+        if isinstance(payload, Mapping):
+            _validate_known_state_payload(
+                normalized_event_type,
+                payload,
+                corruption=False,
+            )
         payload_json, normalized_payload = _canonical_payload(payload)
         _validate_known_state_payload(
             normalized_event_type,
@@ -914,22 +926,7 @@ class SQLiteStore:
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
         ).fetchone()
         events_sql = str(events_sql_row["sql"]) if events_sql_row is not None else ""
-        events_sql_without_comments = re.sub(
-            r"/\*.*?\*/|--[^\r\n]*",
-            " ",
-            events_sql,
-            flags=re.DOTALL,
-        )
-        if re.search(
-            r"\bsequence\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b",
-            events_sql_without_comments,
-            flags=re.IGNORECASE,
-        ) is None:
-            raise StoreCorruptionError("schema constraint AUTOINCREMENT is missing for events")
-        sqlite_sequence = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'",
-        ).fetchone()
-        if sqlite_sequence is None:
+        if not _events_sequence_uses_autoincrement(events_sql):
             raise StoreCorruptionError("schema constraint AUTOINCREMENT is missing for events")
 
         event_unique = self._unique_index_columns(connection, "events")
@@ -1570,23 +1567,24 @@ def _validate_known_state_payload(
                 raise error_type(f"{key} must be a non-negative integer")
     if "reasons" in payload:
         reasons = payload["reasons"]
-        if not isinstance(reasons, list):
-            raise error_type("reasons must be a list")
+        accepted_sequence_types = (list,) if corruption else (list, tuple)
+        if not isinstance(reasons, accepted_sequence_types):
+            raise error_type("reasons must be a list or tuple")
         for reason in reasons:
             if not isinstance(reason, str) or _REASON_PATTERN.fullmatch(reason) is None:
                 raise error_type("reason must be a non-empty known-format string")
         if len(set(reasons)) != len(reasons):
             raise error_type("reasons must not contain duplicates")
     if "fill_deviation" in payload:
-        try:
-            deviation = _finite_number(
-                payload["fill_deviation"],
-                "fill_deviation must be a finite non-negative number",
+        deviation = payload["fill_deviation"]
+        if (
+            type(deviation) not in (int, float)
+            or (type(deviation) is float and not math.isfinite(deviation))
+            or deviation < 0
+        ):
+            raise error_type(
+                "fill_deviation must be an int or float, finite, and non-negative",
             )
-        except ValueError as error:
-            raise error_type(str(error)) from error
-        if deviation < 0:
-            raise error_type("fill_deviation must be a finite non-negative number")
     for key in ("last_success_at_utc", "last_failure_at_utc"):
         if key in payload and payload[key] is not None:
             try:
@@ -1595,6 +1593,160 @@ def _validate_known_state_payload(
                 raise error_type(f"{key} must be strict UTC") from error
             if canonical != payload[key]:
                 raise error_type(f"{key} must be canonical UTC")
+
+
+def _events_sequence_uses_autoincrement(sql: str) -> bool:
+    """Verify AUTOINCREMENT belongs to the actual events.sequence definition."""
+    tokens = _tokenize_sqlite_ddl(sql)
+    opening = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if token.kind == "SYMBOL" and token.value == "("
+        ),
+        None,
+    )
+    if opening is None or not _valid_events_create_table_header(tokens[:opening]):
+        return False
+
+    definitions: list[tuple[_DdlToken, ...]] = []
+    current: list[_DdlToken] = []
+    depth = 0
+    closing: int | None = None
+    for index in range(opening + 1, len(tokens)):
+        token = tokens[index]
+        if token.kind == "SYMBOL" and token.value == "(":
+            depth += 1
+            current.append(token)
+        elif token.kind == "SYMBOL" and token.value == ")":
+            if depth == 0:
+                if current:
+                    definitions.append(tuple(current))
+                closing = index
+                break
+            depth -= 1
+            current.append(token)
+        elif token.kind == "SYMBOL" and token.value == "," and depth == 0:
+            if not current:
+                return False
+            definitions.append(tuple(current))
+            current = []
+        else:
+            current.append(token)
+    if closing is None or depth != 0 or not definitions:
+        return False
+    if any(
+        token.kind != "SYMBOL" or token.value != ";"
+        for token in tokens[closing + 1 :]
+    ):
+        return False
+
+    sequence_definitions = [
+        definition
+        for definition in definitions
+        if definition
+        and definition[0].kind in {"WORD", "IDENT"}
+        and definition[0].value.casefold() == "sequence"
+    ]
+    if len(sequence_definitions) != 1:
+        return False
+    sequence_definition = sequence_definitions[0]
+    if len(sequence_definition) != 5:
+        return False
+    expected_keywords = ("INTEGER", "PRIMARY", "KEY", "AUTOINCREMENT")
+    if any(
+        token.kind != "WORD" or token.value.upper() != expected
+        for token, expected in zip(
+            sequence_definition[1:],
+            expected_keywords,
+            strict=True,
+        )
+    ):
+        return False
+    autoincrements = [
+        token
+        for definition in definitions
+        for token in definition
+        if token.kind == "WORD" and token.value.upper() == "AUTOINCREMENT"
+    ]
+    return len(autoincrements) == 1
+
+
+def _valid_events_create_table_header(tokens: Sequence[_DdlToken]) -> bool:
+    if len(tokens) != 3:
+        return False
+    return (
+        tokens[0].kind == "WORD"
+        and tokens[0].value.upper() == "CREATE"
+        and tokens[1].kind == "WORD"
+        and tokens[1].value.upper() == "TABLE"
+        and tokens[2].kind in {"WORD", "IDENT"}
+        and tokens[2].value.casefold() == "events"
+    )
+
+
+def _tokenize_sqlite_ddl(sql: str) -> tuple[_DdlToken, ...]:
+    if not isinstance(sql, str) or not sql.strip():
+        raise StoreCorruptionError("events table DDL is missing")
+    tokens: list[_DdlToken] = []
+    index = 0
+    while index < len(sql):
+        character = sql[index]
+        if character.isspace():
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            index = len(sql) if newline < 0 else newline + 1
+            continue
+        if sql.startswith("/*", index):
+            comment_end = sql.find("*/", index + 2)
+            if comment_end < 0:
+                raise StoreCorruptionError("events table DDL has an unterminated comment")
+            index = comment_end + 2
+            continue
+        if character in {"'", '"', "`", "["}:
+            token, index = _consume_quoted_ddl_token(sql, index)
+            tokens.append(token)
+            continue
+        if character in {"(", ")", ",", ";"}:
+            tokens.append(_DdlToken("SYMBOL", character))
+            index += 1
+            continue
+        start = index
+        while index < len(sql):
+            if sql[index].isspace() or sql[index] in "'\"`[](),;":
+                break
+            if sql.startswith("--", index) or sql.startswith("/*", index):
+                break
+            index += 1
+        if start == index:
+            tokens.append(_DdlToken("SYMBOL", character))
+            index += 1
+            continue
+        value = sql[start:index]
+        kind = "WORD" if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", value) else "SYMBOL"
+        tokens.append(_DdlToken(kind, value))
+    return tuple(tokens)
+
+
+def _consume_quoted_ddl_token(sql: str, start: int) -> tuple[_DdlToken, int]:
+    opening = sql[start]
+    closing = "]" if opening == "[" else opening
+    kind = "STRING" if opening == "'" else "IDENT"
+    value: list[str] = []
+    index = start + 1
+    while index < len(sql):
+        character = sql[index]
+        if character == closing:
+            if opening != "[" and index + 1 < len(sql) and sql[index + 1] == closing:
+                value.append(closing)
+                index += 2
+                continue
+            return _DdlToken(kind, "".join(value)), index + 1
+        value.append(character)
+        index += 1
+    raise StoreCorruptionError("events table DDL has unterminated quoting")
 
 
 def _reject_transaction_control_sql(sql: object) -> None:

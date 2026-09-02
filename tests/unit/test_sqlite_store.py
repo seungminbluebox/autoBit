@@ -4,6 +4,7 @@ import json
 import math
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -686,6 +687,11 @@ def test_sub_tolerance_historical_snapshot_mutation_is_still_corruption(
         "comment_only_autoincrement",
         "missing_not_null",
         "hidden_generated_column",
+        "autoincrement_string_single",
+        "autoincrement_identifier_double",
+        "autoincrement_identifier_backtick",
+        "autoincrement_identifier_bracket",
+        "moved_autoincrement_lookalike",
     ],
 )
 def test_constraint_light_lookalike_schema_is_rejected(
@@ -720,6 +726,113 @@ def test_positive_btc_dust_is_never_reclassified_or_destroyed(tmp_path: Path) ->
     assert after_partial_sell.position_state is PositionState.LONG
     assert after_partial_sell.btc_quantity == 4e-11
     assert after_partial_sell.btc_cost_basis == 4e-11
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        "0.05",
+        Decimal("0.05"),
+        True,
+        None,
+        [0.05],
+        {"value": 0.05},
+        -1,
+        -0.01,
+        math.nan,
+        math.inf,
+    ],
+)
+def test_fill_deviation_rejects_every_non_exact_numeric_runtime_type(
+    tmp_path: Path,
+    invalid_value: object,
+) -> None:
+    store = _open_store(tmp_path / (sha256_text(repr(invalid_value)) + ".sqlite3"))
+
+    with pytest.raises(ValueError, match="fill_deviation.*int or float"):
+        store.append_event(
+            "health",
+            "HEALTH_STATE",
+            UTC_0,
+            {"fill_deviation": invalid_value},
+        )
+
+    assert store.replay_state().last_sequence == 0
+
+
+@pytest.mark.parametrize("numeric_value", [0, 1, 0.0, 0.05])
+def test_fill_deviation_preserves_valid_canonical_numeric_values(
+    tmp_path: Path,
+    numeric_value: int | float,
+) -> None:
+    store = _open_store(tmp_path / (sha256_text(repr(numeric_value)) + ".sqlite3"))
+
+    store.append_event(
+        "health",
+        "HEALTH_STATE",
+        UTC_0,
+        {"fill_deviation": numeric_value},
+    )
+
+    stored = store.replay_state().health_state["fill_deviation"]
+    assert type(stored) is type(numeric_value)
+    assert stored == numeric_value
+
+
+@pytest.mark.parametrize(
+    "tampered_payload",
+    [
+        '{"fill_deviation":"0.05"}',
+        '{"fill_deviation":true}',
+        '{"fill_deviation":[]}',
+    ],
+)
+def test_fill_deviation_type_tampering_fails_replay_on_known_field_type(
+    tmp_path: Path,
+    tampered_payload: str,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.append_event(
+        "health",
+        "HEALTH_STATE",
+        UTC_0,
+        {"fill_deviation": 0.05},
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE event_id = 'health'",
+            (tampered_payload,),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="fill_deviation.*int or float"):
+        store.replay_state()
+
+
+def test_malformed_quoted_events_ddl_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.close()
+    with sqlite3.connect(path) as connection:
+        schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute(
+            """
+            UPDATE sqlite_master
+            SET sql = replace(
+                sql,
+                'sequence INTEGER PRIMARY KEY AUTOINCREMENT',
+                'sequence INTEGER PRIMARY KEY CHECK (''unterminated)'
+            )
+            WHERE type = 'table' AND name = 'events'
+            """,
+        )
+        connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+        connection.execute("PRAGMA writable_schema=OFF")
+
+    reopened = SQLiteStore(path)
+    with pytest.raises(StoreCorruptionError, match="schema|DDL"):
+        reopened.initialize()
 
 
 @pytest.mark.parametrize(
@@ -884,6 +997,7 @@ def _create_counterfeit_schema(
     event_type = "event_type TEXT NOT NULL"
     idempotency = "idempotency_key TEXT NOT NULL UNIQUE"
     snapshot_extra = ""
+    event_table_constraint = ""
     if weakness == "missing_unique":
         event_id = "event_id TEXT NOT NULL"
         idempotency = "idempotency_key TEXT NOT NULL"
@@ -900,9 +1014,43 @@ def _create_counterfeit_schema(
         event_type = "event_type TEXT"
     elif weakness == "hidden_generated_column":
         snapshot_extra = ", hidden TEXT GENERATED ALWAYS AS ('x') VIRTUAL"
+    elif weakness == "autoincrement_string_single":
+        event_sequence = (
+            "sequence INTEGER PRIMARY KEY "
+            "CHECK ('sequence INTEGER PRIMARY KEY AUTOINCREMENT' <> '')"
+        )
+    elif weakness == "autoincrement_identifier_double":
+        event_sequence = "sequence INTEGER PRIMARY KEY"
+        event_table_constraint = (
+            ', CONSTRAINT "sequence INTEGER PRIMARY KEY AUTOINCREMENT" CHECK (1)'
+        )
+    elif weakness == "autoincrement_identifier_backtick":
+        event_sequence = "sequence INTEGER PRIMARY KEY"
+        event_table_constraint = (
+            ", CONSTRAINT `sequence INTEGER PRIMARY KEY AUTOINCREMENT` CHECK (1)"
+        )
+    elif weakness == "autoincrement_identifier_bracket":
+        event_sequence = "sequence INTEGER PRIMARY KEY"
+        event_table_constraint = (
+            ", CONSTRAINT [sequence INTEGER PRIMARY KEY AUTOINCREMENT] CHECK (1)"
+        )
+    elif weakness == "moved_autoincrement_lookalike":
+        event_sequence = "sequence INTEGER PRIMARY KEY"
+        event_type = (
+            "event_type TEXT NOT NULL "
+            "CHECK (event_type <> 'sequence INTEGER PRIMARY KEY AUTOINCREMENT')"
+        )
 
     with sqlite3.connect(path) as connection:
-        if weakness in {"missing_autoincrement", "comment_only_autoincrement"}:
+        if weakness in {
+            "missing_autoincrement",
+            "comment_only_autoincrement",
+            "autoincrement_string_single",
+            "autoincrement_identifier_double",
+            "autoincrement_identifier_backtick",
+            "autoincrement_identifier_bracket",
+            "moved_autoincrement_lookalike",
+        }:
             connection.execute(
                 "CREATE TABLE seed_sequence (sequence INTEGER PRIMARY KEY AUTOINCREMENT)",
             )
@@ -914,6 +1062,7 @@ def _create_counterfeit_schema(
             CREATE TABLE events (
                 {event_sequence}, {event_id}, {event_type},
                 occurred_at_utc TEXT NOT NULL, payload_json TEXT NOT NULL
+                {event_table_constraint}
             )
             """,
         )
