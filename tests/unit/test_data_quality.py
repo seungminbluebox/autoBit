@@ -129,6 +129,41 @@ def test_off_grid_timestamp_is_rejected_without_rounding_or_dropping() -> None:
     assert "2026-01-01T02:00:00+00:00" in str(error.value)
 
 
+@pytest.mark.parametrize(
+    ("unit", "offset"),
+    [
+        ("s", pd.Timedelta(seconds=1)),
+        ("ms", pd.Timedelta(milliseconds=1)),
+        ("us", pd.Timedelta(microseconds=1)),
+        ("ns", pd.Timedelta(nanoseconds=1)),
+    ],
+)
+def test_four_hour_grid_validation_uses_nanoseconds_for_every_stored_unit(
+    unit: str, offset: pd.Timedelta
+) -> None:
+    """Valid and invalid boundaries have the same result for s/ms/us/ns indexes."""
+    boundary = pd.Timestamp("2026-01-01T00:00:00Z")
+    exact = make_frame([boundary.isoformat()])
+    exact.index = pd.DatetimeIndex([boundary]).as_unit(unit)
+
+    result = canonicalize_ohlcv(exact, datetime(2026, 1, 2, tzinfo=timezone.utc))
+
+    assert result.frame.index.dtype.unit == "ns"
+    off_grid = make_frame([(boundary + offset).isoformat()])
+    off_grid.index = pd.DatetimeIndex([boundary + offset]).as_unit(unit)
+    with pytest.raises(ValueError, match="4-hour boundary"):
+        canonicalize_ohlcv(off_grid, datetime(2026, 1, 2, tzinfo=timezone.utc))
+
+
+def test_timestamp_conversion_outside_nanosecond_range_fails_closed() -> None:
+    """A coarser-resolution timestamp must not be silently rounded into range."""
+    raw = make_frame(["2026-01-01T00:00:00Z"])
+    raw.index = pd.DatetimeIndex(["2500-01-01T00:00:00Z"], dtype="datetime64[us, UTC]")
+
+    with pytest.raises(ValueError, match="nanosecond"):
+        canonicalize_ohlcv(raw, datetime(2501, 1, 1, tzinfo=timezone.utc))
+
+
 @pytest.mark.parametrize("nanoseconds", [1, 999])
 def test_submicrosecond_offset_is_rejected_without_rounding(nanoseconds: int) -> None:
     """Integer-nanosecond grid validation must not rely on microseconds."""

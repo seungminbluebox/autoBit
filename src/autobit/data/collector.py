@@ -8,6 +8,7 @@ import pandas as pd
 from autobit.config import DataConfig
 from autobit.data.storage import (
     CollectionEvidence,
+    load_completed_collection_evidence,
     load_collection_evidence,
     load_raw_pages,
     persist_raw_page,
@@ -21,6 +22,13 @@ class CollectionResult:
 
     frame: pd.DataFrame
     evidence: CollectionEvidence
+
+
+def load_completed_evidence_frame(evidence_root: Path) -> pd.DataFrame:
+    """Derive the canonical raw view from a completed, validated evidence chain."""
+    evidence = load_completed_collection_evidence(evidence_root)
+    start, end = _validated_range(evidence.start_utc, evidence.end_utc)
+    return _frame_from_pages(load_raw_pages(evidence), start, end)
 
 
 def collect_range(
@@ -38,8 +46,6 @@ def collect_range(
     advances.
     """
     if evidence_root is not None:
-        if config is None:
-            raise ValueError("config is required when evidence_root is supplied")
         return collect_evidence_range(
             client,
             start_utc,
@@ -56,9 +62,12 @@ def collect_evidence_range(
     end_utc: str,
     *,
     evidence_root: Path,
-    config: DataConfig,
+    config: DataConfig | None = None,
 ) -> CollectionResult:
     """Resume or complete a range, preserving each exact page before progress."""
+    client_config = client.collection_config
+    if config is not None and config != client_config:
+        raise ValueError("explicit configuration does not match client configuration")
     start, end = _validated_range(start_utc, end_utc)
     start_text = _format_utc(start)
     end_text = _format_utc(end)
@@ -67,7 +76,7 @@ def collect_evidence_range(
         source_url=client.source_url,
         start_utc=start_text,
         end_utc=end_text,
-        config=config,
+        config=client_config,
     )
     if evidence.complete:
         return CollectionResult(

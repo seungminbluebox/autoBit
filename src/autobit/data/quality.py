@@ -62,7 +62,12 @@ def _as_utc_index(index: pd.Index) -> pd.DatetimeIndex:
     timestamps = pd.to_datetime(index, utc=True, errors="raise")
     if timestamps.isna().any():
         raise ValueError("OHLCV index contains missing timestamps")
-    return pd.DatetimeIndex(timestamps)
+    try:
+        return pd.DatetimeIndex(timestamps).as_unit("ns")
+    except (OverflowError, ValueError) as error:
+        raise ValueError(
+            "OHLCV timestamps must be representable at nanosecond resolution"
+        ) from error
 
 
 def _validate_four_hour_boundaries(timestamps: pd.DatetimeIndex) -> None:

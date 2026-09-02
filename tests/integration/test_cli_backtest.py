@@ -251,7 +251,20 @@ def test_data_download_uses_public_client_writes_evidence_and_closes_http(
                     }
                 ],
             )
-        return httpx.Response(200, json=[])
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "market": "KRW-BTC",
+                    "candle_date_time_utc": "2018-12-31T20:00:00Z",
+                    "opening_price": 90.0,
+                    "high_price": 91.0,
+                    "low_price": 89.0,
+                    "trade_price": 90.0,
+                    "candle_acc_trade_volume": 2.0,
+                }
+            ],
+        )
 
     http_client = httpx.Client(transport=httpx.MockTransport(handler))
     monkeypatch.setattr("autobit.cli.httpx.Client", lambda: http_client)
@@ -289,11 +302,11 @@ def test_data_download_uses_public_client_writes_evidence_and_closes_http(
     } == {
         *(path.name for path in pages),
         *(path.name for path in snapshots),
-        "collection-manifest.json",
         "checkpoint.json",
         "exchange-rules.json",
         "manifest.json",
     }
+    assert not (output / "collection-manifest.json").exists()
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["schema_version"] == "1.0"
     assert manifest["years"] == 7
@@ -305,6 +318,15 @@ def test_data_download_uses_public_client_writes_evidence_and_closes_http(
     )
     assert len(manifest["collection_snapshot_sha256"]) == 64
     assert len(manifest["exchange_rules_sha256"]) == 64
+
+    quality_output = tmp_path / "quality"
+    assert main(
+        ["data-quality", "--input", str(output), "--output", str(quality_output)]
+    ) == 0
+    assert {path.name for path in quality_output.iterdir()} == {
+        "processed.csv",
+        "quality.json",
+    }
 
 
 def test_data_quality_reads_csv_and_writes_canonical_csv_plus_quality(tmp_path: Path) -> None:

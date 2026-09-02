@@ -14,7 +14,6 @@ from autobit.data.upbit_public import PUBLIC_CANDLE_URL
 
 
 _CHECKPOINT_FILENAME: Final = "checkpoint.json"
-_COLLECTION_MANIFEST_FILENAME: Final = "collection-manifest.json"
 _COLLECTION_SNAPSHOT_PREFIX: Final = "collection-"
 
 
@@ -38,6 +37,7 @@ class CollectionEvidence:
     market: str
     candle_unit_minutes: int
     page_size: int
+    years: int
     start_utc: str
     end_utc: str
     config_sha256: str
@@ -122,16 +122,7 @@ def load_collection_evidence(
     )
     checkpoint_path = root / _CHECKPOINT_FILENAME
     if not checkpoint_path.exists():
-        return CollectionEvidence(
-            root=root,
-            pages=(),
-            next_to_utc=end_utc,
-            previous_oldest_utc=None,
-            complete=False,
-            collection_snapshot_path=None,
-            collection_snapshot_sha256=None,
-            **identity,
-        )
+        return _recover_uncheckpointed_evidence(root, identity)
 
     checkpoint = _read_json(checkpoint_path, "collection evidence checkpoint")
     if not isinstance(checkpoint, dict):
@@ -163,27 +154,39 @@ def load_collection_evidence(
     state_payload = _collection_state_payload(checkpoint)
     if snapshot != state_payload:
         raise ValueError("collection snapshot evidence does not match its checkpoint")
-    manifest = _read_json(root / _COLLECTION_MANIFEST_FILENAME, "collection manifest evidence")
-    if manifest != snapshot:
-        raise ValueError("collection manifest evidence does not match its snapshot")
-
-    pages = _parse_page_evidence(root, checkpoint["pages"])
-    next_to_utc = checkpoint["next_to_utc"]
-    previous_oldest_utc = checkpoint["previous_oldest_utc"]
-    complete = checkpoint["complete"]
-    if not isinstance(next_to_utc, str) or not isinstance(previous_oldest_utc, (str, type(None))) or not isinstance(complete, bool):
-        raise ValueError("collection evidence checkpoint has invalid pagination state")
-    evidence = CollectionEvidence(
-        root=root,
-        pages=pages,
-        next_to_utc=next_to_utc,
-        previous_oldest_utc=previous_oldest_utc,
-        complete=complete,
-        collection_snapshot_path=snapshot_path,
-        collection_snapshot_sha256=snapshot_hash,
-        **identity,
+    return _evidence_from_state_payload(
+        root,
+        snapshot,
+        identity,
+        snapshot_path=snapshot_path,
+        snapshot_hash=snapshot_hash,
+        label="collection evidence checkpoint",
     )
-    load_raw_pages(evidence)
+
+
+def load_completed_collection_evidence(root: Path) -> CollectionEvidence:
+    """Load a completed evidence chain without needing a live public client."""
+    checkpoint_path = root / _CHECKPOINT_FILENAME
+    if not root.is_dir() or not checkpoint_path.exists():
+        raise ValueError("completed collection evidence requires a checkpoint")
+    checkpoint = _read_json(checkpoint_path, "collection evidence checkpoint")
+    if not isinstance(checkpoint, dict):
+        raise ValueError("collection evidence checkpoint is malformed")
+    config = _config_from_evidence(checkpoint.get("config"))
+    source_url = checkpoint.get("source_url")
+    start_utc = checkpoint.get("start_utc")
+    end_utc = checkpoint.get("end_utc")
+    if not all(isinstance(value, str) for value in (source_url, start_utc, end_utc)):
+        raise ValueError("collection evidence checkpoint has an invalid identity")
+    evidence = load_collection_evidence(
+        root,
+        source_url=source_url,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        config=config,
+    )
+    if not evidence.complete:
+        raise ValueError("incomplete collection evidence cannot be used for data quality")
     return evidence
 
 
@@ -229,7 +232,6 @@ def persist_raw_page(
     snapshot_hash = hashlib.sha256(snapshot_bytes).hexdigest()
     snapshot_path = evidence.root / f"{_COLLECTION_SNAPSHOT_PREFIX}{snapshot_hash}.json"
     _write_content_addressed(snapshot_path, snapshot_bytes)
-    _atomic_write(evidence.root / _COLLECTION_MANIFEST_FILENAME, snapshot_bytes)
     checkpoint = {
         **snapshot_payload,
         "collection_snapshot": snapshot_path.name,
@@ -241,6 +243,177 @@ def persist_raw_page(
         collection_snapshot_path=snapshot_path,
         collection_snapshot_sha256=snapshot_hash,
     )
+
+
+def _recover_uncheckpointed_evidence(
+    root: Path, identity: dict[str, object]
+) -> CollectionEvidence:
+    """Recover only the tip of one valid, non-conflicting snapshot chain."""
+    candidates: list[CollectionEvidence] = []
+    for snapshot_path in root.glob(f"{_COLLECTION_SNAPSHOT_PREFIX}*.json"):
+        snapshot_hash = _snapshot_hash_from_name(snapshot_path.name)
+        if snapshot_hash is None:
+            continue
+        try:
+            snapshot = _read_hashed_json(
+                snapshot_path, snapshot_hash, "orphan collection snapshot evidence"
+            )
+            if not isinstance(snapshot, dict):
+                continue
+            candidates.append(
+                _evidence_from_state_payload(
+                    root,
+                    snapshot,
+                    identity,
+                    snapshot_path=snapshot_path,
+                    snapshot_hash=snapshot_hash,
+                    label="orphan collection snapshot evidence",
+                )
+            )
+        except ValueError:
+            continue
+
+    if not candidates:
+        return _new_collection_evidence(root, identity)
+
+    tip = max(candidates, key=lambda evidence: len(evidence.pages))
+    for candidate in candidates:
+        if not _is_snapshot_prefix(candidate, tip):
+            raise ValueError("collection evidence has ambiguous snapshot chains")
+    return tip
+
+
+def _new_collection_evidence(
+    root: Path, identity: dict[str, object]
+) -> CollectionEvidence:
+    return CollectionEvidence(
+        root=root,
+        pages=(),
+        next_to_utc=str(identity["end_utc"]),
+        previous_oldest_utc=None,
+        complete=False,
+        collection_snapshot_path=None,
+        collection_snapshot_sha256=None,
+        **_evidence_identity(identity),
+    )
+
+
+def _evidence_from_state_payload(
+    root: Path,
+    state: dict[str, object],
+    identity: dict[str, object],
+    *,
+    snapshot_path: Path,
+    snapshot_hash: str,
+    label: str,
+) -> CollectionEvidence:
+    required = set(identity) | {
+        "pages",
+        "next_to_utc",
+        "previous_oldest_utc",
+        "complete",
+    }
+    if set(state) != required:
+        raise ValueError(f"{label} has an invalid schema")
+    if any(state[name] != value for name, value in identity.items()):
+        raise ValueError(f"{label} does not match requested collection")
+    pages = _parse_page_evidence(root, state["pages"])
+    next_to_utc = state["next_to_utc"]
+    previous_oldest_utc = state["previous_oldest_utc"]
+    complete = state["complete"]
+    if (
+        not isinstance(next_to_utc, str)
+        or not isinstance(previous_oldest_utc, (str, type(None)))
+        or not isinstance(complete, bool)
+    ):
+        raise ValueError(f"{label} has invalid pagination state")
+    _validate_pagination_state(
+        pages,
+        next_to_utc=next_to_utc,
+        previous_oldest_utc=previous_oldest_utc,
+        complete=complete,
+        start_utc=str(identity["start_utc"]),
+        end_utc=str(identity["end_utc"]),
+        label=label,
+    )
+    evidence = CollectionEvidence(
+        root=root,
+        pages=pages,
+        next_to_utc=next_to_utc,
+        previous_oldest_utc=previous_oldest_utc,
+        complete=complete,
+        collection_snapshot_path=snapshot_path,
+        collection_snapshot_sha256=snapshot_hash,
+        **_evidence_identity(identity),
+    )
+    load_raw_pages(evidence)
+    return evidence
+
+
+def _snapshot_hash_from_name(name: str) -> str | None:
+    if not name.startswith(_COLLECTION_SNAPSHOT_PREFIX) or not name.endswith(".json"):
+        return None
+    candidate = name[len(_COLLECTION_SNAPSHOT_PREFIX) : -len(".json")]
+    if len(candidate) != 64 or any(character not in "0123456789abcdef" for character in candidate):
+        return None
+    return candidate
+
+
+def _is_snapshot_prefix(
+    candidate: CollectionEvidence, tip: CollectionEvidence
+) -> bool:
+    if len(candidate.pages) > len(tip.pages):
+        return False
+    if candidate.pages != tip.pages[: len(candidate.pages)]:
+        return False
+    if len(candidate.pages) == len(tip.pages):
+        return (
+            candidate.next_to_utc == tip.next_to_utc
+            and candidate.previous_oldest_utc == tip.previous_oldest_utc
+            and candidate.complete == tip.complete
+        )
+    if candidate.complete:
+        return False
+    return candidate.next_to_utc == tip.pages[len(candidate.pages)].request_to_utc
+
+
+def _validate_pagination_state(
+    pages: tuple[RawPageEvidence, ...],
+    *,
+    next_to_utc: str,
+    previous_oldest_utc: str | None,
+    complete: bool,
+    start_utc: str,
+    end_utc: str,
+    label: str,
+) -> None:
+    """Ensure page order and pagination boundaries describe one backward walk."""
+    expected_request_to = end_utc
+    for position, page in enumerate(pages):
+        if page.request_to_utc != expected_request_to:
+            raise ValueError(f"{label} has invalid pagination boundaries")
+        if page.row_count == 0:
+            if (
+                page.oldest_timestamp_utc is not None
+                or position != len(pages) - 1
+                or not complete
+            ):
+                raise ValueError(f"{label} has invalid pagination boundaries")
+            expected_request_to = page.request_to_utc
+            continue
+        if page.oldest_timestamp_utc is None:
+            raise ValueError(f"{label} has invalid pagination boundaries")
+        expected_request_to = page.oldest_timestamp_utc
+
+    if next_to_utc != expected_request_to:
+        raise ValueError(f"{label} has invalid pagination boundaries")
+    expected_previous = pages[-1].oldest_timestamp_utc if pages else None
+    if previous_oldest_utc != expected_previous:
+        raise ValueError(f"{label} has invalid pagination boundaries")
+    if complete and pages and pages[-1].row_count > 0:
+        oldest = pages[-1].oldest_timestamp_utc
+        if oldest is None or oldest >= start_utc:
+            raise ValueError(f"{label} claims completion before the requested start")
 
 
 def load_raw_pages(evidence: CollectionEvidence) -> tuple[list[dict[str, object]], ...]:
@@ -270,7 +443,19 @@ def _collection_identity(
         "page_size": config.page_size,
         "start_utc": start_utc,
         "end_utc": end_utc,
+        "config": asdict(config),
         "config_sha256": hashlib.sha256(_canonical_json_bytes(asdict(config))).hexdigest(),
+    }
+
+
+def _evidence_identity(identity: dict[str, object]) -> dict[str, object]:
+    """Keep serialized config immutable in state while exposing scalar fields."""
+    config = identity["config"]
+    if not isinstance(config, dict) or not isinstance(config.get("years"), int):
+        raise ValueError("collection evidence has an invalid configuration")
+    return {
+        **{name: value for name, value in identity.items() if name != "config"},
+        "years": config["years"],
     }
 
 
@@ -288,6 +473,12 @@ def _collection_state_payload_from_evidence(evidence: CollectionEvidence) -> dic
         "market": evidence.market,
         "candle_unit_minutes": evidence.candle_unit_minutes,
         "page_size": evidence.page_size,
+        "config": {
+            "market": evidence.market,
+            "candle_unit_minutes": evidence.candle_unit_minutes,
+            "page_size": evidence.page_size,
+            "years": evidence.years,
+        },
         "start_utc": evidence.start_utc,
         "end_utc": evidence.end_utc,
         "config_sha256": evidence.config_sha256,
@@ -305,6 +496,31 @@ def _collection_state_payload_from_evidence(evidence: CollectionEvidence) -> dic
         "previous_oldest_utc": evidence.previous_oldest_utc,
         "complete": evidence.complete,
     }
+
+
+def _config_from_evidence(value: object) -> DataConfig:
+    expected = {"market", "candle_unit_minutes", "page_size", "years"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("collection evidence checkpoint has an invalid configuration")
+    market = value["market"]
+    candle_unit_minutes = value["candle_unit_minutes"]
+    page_size = value["page_size"]
+    years = value["years"]
+    if (
+        not isinstance(market, str)
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in (candle_unit_minutes, page_size, years))
+        or market != "KRW-BTC"
+        or candle_unit_minutes != 240
+        or not 1 <= page_size <= 200
+        or years < 1
+    ):
+        raise ValueError("collection evidence checkpoint has an invalid configuration")
+    return DataConfig(
+        market=market,
+        candle_unit_minutes=candle_unit_minutes,
+        page_size=page_size,
+        years=years,
+    )
 
 
 def _parse_page_evidence(root: Path, value: object) -> tuple[RawPageEvidence, ...]:

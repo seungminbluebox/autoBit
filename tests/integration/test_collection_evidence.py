@@ -1,12 +1,16 @@
 import json
+import hashlib
 from pathlib import Path
+import shutil
 
 import pandas as pd
 import pytest
 
 from autobit.config import DataConfig
 from autobit.data.collector import collect_evidence_range
+from autobit.data import storage
 from autobit.data.upbit_public import PUBLIC_CANDLE_URL, PublicDataUnavailable
+from autobit.cli import main
 
 
 def _candle(timestamp: str, price: float = 100.0) -> dict[str, object]:
@@ -24,8 +28,14 @@ def _candle(timestamp: str, price: float = 100.0) -> dict[str, object]:
 class _ScriptedPublicClient:
     source_url = PUBLIC_CANDLE_URL
 
-    def __init__(self, outcomes: list[list[dict[str, object]] | BaseException]) -> None:
+    def __init__(
+        self,
+        outcomes: list[list[dict[str, object]] | BaseException],
+        *,
+        config: DataConfig = DataConfig(page_size=2),
+    ) -> None:
         self._outcomes = iter(outcomes)
+        self.collection_config = config
         self.calls: list[str] = []
 
     def fetch_page(self, to_utc: str) -> list[dict[str, object]]:
@@ -73,6 +83,7 @@ def test_interrupted_collection_resumes_from_saved_page_without_refetching_it(
         "page_size",
         "start_utc",
         "end_utc",
+        "config",
         "config_sha256",
         "pages",
         "next_to_utc",
@@ -80,6 +91,12 @@ def test_interrupted_collection_resumes_from_saved_page_without_refetching_it(
         "complete",
         "collection_snapshot",
         "collection_snapshot_sha256",
+    }
+    assert checkpoint["config"] == {
+        "market": "KRW-BTC",
+        "candle_unit_minutes": 240,
+        "page_size": 2,
+        "years": 7,
     }
     page_path = tmp_path / checkpoint["pages"][0]["path"]
     assert json.loads(page_path.read_text(encoding="utf-8")) == first_page
@@ -115,8 +132,10 @@ def test_completed_evidence_rerun_loads_pages_without_network_calls(tmp_path: Pa
 
     assert rerun_client.calls == []
     pd.testing.assert_frame_equal(rerun.frame, initial.frame)
-    manifest = json.loads((tmp_path / "collection-manifest.json").read_text(encoding="utf-8"))
-    assert [page["sha256"] for page in manifest["pages"]] == [
+    assert not (tmp_path / "collection-manifest.json").exists()
+    assert rerun.evidence.collection_snapshot_path is not None
+    snapshot = json.loads(rerun.evidence.collection_snapshot_path.read_text(encoding="utf-8"))
+    assert [page["sha256"] for page in snapshot["pages"]] == [
         page.sha256 for page in rerun.evidence.pages
     ]
 
@@ -142,10 +161,15 @@ def test_corrupted_or_mismatched_evidence_fails_closed_before_network(
         mismatch_root,
         _ScriptedPublicClient([[_candle("2026-01-01T04:00:00Z"), _candle("2025-12-31T20:00:00Z")]]),
     )
-    mismatched_client = _ScriptedPublicClient([])
+    mismatched_client = _ScriptedPublicClient([], config=DataConfig(page_size=3))
 
     with pytest.raises(ValueError, match="checkpoint"):
-        _collect(mismatch_root, mismatched_client, config=DataConfig(page_size=3))
+        collect_evidence_range(
+            mismatched_client,
+            start_utc="2026-01-01T00:00:00Z",
+            end_utc="2026-01-01T12:00:00Z",
+            evidence_root=mismatch_root,
+        )
 
     assert mismatched_client.calls == []
     checkpoint_path = mismatch_root / "checkpoint.json"
@@ -158,3 +182,349 @@ def test_corrupted_or_mismatched_evidence_fails_closed_before_network(
         _collect(mismatch_root, checkpoint_client)
 
     assert checkpoint_client.calls == []
+
+
+def test_evidence_collection_uses_client_config_or_rejects_an_explicit_mismatch(
+    tmp_path: Path,
+) -> None:
+    """The evidence identity cannot describe a different request than the client sends."""
+    evidence_root = tmp_path / "evidence"
+    mismatched_client = _ScriptedPublicClient([], config=DataConfig(page_size=2))
+
+    with pytest.raises(ValueError, match="client configuration"):
+        collect_evidence_range(
+            mismatched_client,
+            start_utc="2026-01-01T00:00:00Z",
+            end_utc="2026-01-01T12:00:00Z",
+            evidence_root=evidence_root,
+            config=DataConfig(page_size=3),
+        )
+
+    assert mismatched_client.calls == []
+    assert not evidence_root.exists()
+
+    configured_client = _ScriptedPublicClient(
+        [[_candle("2026-01-01T04:00:00Z"), _candle("2025-12-31T20:00:00Z")]],
+        config=DataConfig(page_size=2),
+    )
+    result = collect_evidence_range(
+        configured_client,
+        start_utc="2026-01-01T00:00:00Z",
+        end_utc="2026-01-01T12:00:00Z",
+        evidence_root=evidence_root,
+    )
+
+    assert result.evidence.page_size == 2
+    assert result.evidence.candle_unit_minutes == 240
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_resume_calls"),
+    [
+        ("page", ["2026-01-01T12:00:00Z", "2026-01-01T04:00:00Z"]),
+        ("snapshot", ["2026-01-01T12:00:00Z", "2026-01-01T04:00:00Z"]),
+        ("checkpoint", ["2026-01-01T04:00:00Z"]),
+    ],
+)
+def test_persistence_failure_leaves_a_recoverable_collection_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    expected_resume_calls: list[str],
+) -> None:
+    """A crash at any persistence boundary leaves only harmless orphan evidence."""
+    first_page = [_candle("2026-01-01T08:00:00Z", 108), _candle("2026-01-01T04:00:00Z", 104)]
+    second_page = [
+        _candle("2026-01-01T04:00:00Z", 104),
+        _candle("2026-01-01T00:00:00Z", 100),
+        _candle("2025-12-31T20:00:00Z", 96),
+    ]
+    original_write = storage._atomic_write
+
+    def fail_at_stage(destination: Path, contents: bytes) -> None:
+        is_page = destination.name.startswith("page-")
+        is_snapshot = destination.name.startswith("collection-") and destination.name != "collection-manifest.json"
+        is_checkpoint = destination.name == "checkpoint.json"
+        if (failure_stage == "page" and is_page) or (
+            failure_stage == "snapshot" and is_snapshot
+        ) or (failure_stage == "checkpoint" and is_checkpoint):
+            raise OSError(f"injected {failure_stage} write failure")
+        original_write(destination, contents)
+
+    with monkeypatch.context() as injected:
+        injected.setattr(storage, "_atomic_write", fail_at_stage)
+        with pytest.raises(OSError, match=failure_stage):
+            _collect(tmp_path, _ScriptedPublicClient([first_page]))
+
+    recovery_client = _ScriptedPublicClient(
+        [second_page] if failure_stage == "checkpoint" else [first_page, second_page]
+    )
+    recovered = _collect(tmp_path, recovery_client)
+
+    assert recovery_client.calls == expected_resume_calls
+    assert recovered.frame["candle_date_time_utc"].tolist() == [
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T04:00:00Z",
+        "2026-01-01T08:00:00Z",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_resume_calls"),
+    [
+        ("page", ["2026-01-01T12:00:00Z", "2026-01-01T04:00:00Z"]),
+        ("snapshot", ["2026-01-01T04:00:00Z"]),
+        ("checkpoint", ["2026-01-01T04:00:00Z"]),
+    ],
+)
+def test_post_persistence_failure_keeps_prior_or_recovered_state_usable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    expected_resume_calls: list[str],
+) -> None:
+    """An exception after fsync/replace leaves an old or fully valid new state."""
+    first_page = [_candle("2026-01-01T08:00:00Z", 108), _candle("2026-01-01T04:00:00Z", 104)]
+    second_page = [
+        _candle("2026-01-01T04:00:00Z", 104),
+        _candle("2026-01-01T00:00:00Z", 100),
+        _candle("2025-12-31T20:00:00Z", 96),
+    ]
+    original_write = storage._atomic_write
+
+    def fail_after_stage(destination: Path, contents: bytes) -> None:
+        original_write(destination, contents)
+        if (
+            (failure_stage == "page" and destination.name.startswith("page-"))
+            or (failure_stage == "snapshot" and destination.name.startswith("collection-"))
+            or (failure_stage == "checkpoint" and destination.name == "checkpoint.json")
+        ):
+            raise OSError(f"injected post-{failure_stage} write failure")
+
+    with monkeypatch.context() as injected:
+        injected.setattr(storage, "_atomic_write", fail_after_stage)
+        with pytest.raises(OSError, match=f"post-{failure_stage}"):
+            _collect(tmp_path, _ScriptedPublicClient([first_page]))
+
+    recovery_client = _ScriptedPublicClient(
+        [first_page, second_page] if failure_stage == "page" else [second_page]
+    )
+    recovered = _collect(tmp_path, recovery_client)
+
+    assert recovery_client.calls == expected_resume_calls
+    assert recovered.evidence.complete
+
+
+def test_resume_uses_checkpoint_snapshot_without_a_mutable_manifest_alias(
+    tmp_path: Path,
+) -> None:
+    """The checkpoint and its immutable snapshot are sufficient resume authority."""
+    _collect(
+        tmp_path,
+        _ScriptedPublicClient([[_candle("2026-01-01T04:00:00Z"), _candle("2025-12-31T20:00:00Z")]]),
+    )
+    assert not (tmp_path / "collection-manifest.json").exists()
+    rerun_client = _ScriptedPublicClient([])
+
+    rerun = _collect(tmp_path, rerun_client)
+
+    assert rerun.evidence.complete
+    assert rerun_client.calls == []
+
+
+def test_no_checkpoint_recovers_the_tip_of_one_unambiguous_snapshot_chain(
+    tmp_path: Path,
+) -> None:
+    """A durable snapshot after a checkpoint-write crash avoids refetching its page."""
+    _collect(
+        tmp_path,
+        _ScriptedPublicClient(
+            [
+                [_candle("2026-01-01T08:00:00Z", 108), _candle("2026-01-01T04:00:00Z", 104)],
+                [_candle("2026-01-01T04:00:00Z", 104), _candle("2026-01-01T00:00:00Z", 100), _candle("2025-12-31T20:00:00Z", 96)],
+            ]
+        ),
+    )
+    (tmp_path / "checkpoint.json").unlink()
+    assert not (tmp_path / "collection-manifest.json").exists()
+    recovery_client = _ScriptedPublicClient([])
+
+    recovered = _collect(tmp_path, recovery_client)
+
+    assert recovered.evidence.complete
+    assert recovery_client.calls == []
+    assert len(recovered.evidence.pages) == 2
+
+
+def test_no_checkpoint_rejects_conflicting_snapshot_chains_but_checkpoint_ignores_orphans(
+    tmp_path: Path,
+) -> None:
+    """Only an unambiguous snapshot tip may replace a missing checkpoint authority."""
+    primary = tmp_path / "primary"
+    alternate = tmp_path / "alternate"
+    _collect(
+        primary,
+        _ScriptedPublicClient([[_candle("2026-01-01T04:00:00Z", 100), _candle("2025-12-31T20:00:00Z", 96)]]),
+    )
+    _collect(
+        alternate,
+        _ScriptedPublicClient([[_candle("2026-01-01T04:00:00Z", 200), _candle("2025-12-31T20:00:00Z", 196)]]),
+    )
+    for source in [*alternate.glob("page-*.json"), *alternate.glob("collection-*.json")]:
+        if source.name != "collection-manifest.json":
+            shutil.copy2(source, primary / source.name)
+
+    checkpoint_client = _ScriptedPublicClient([])
+    checked = _collect(primary, checkpoint_client)
+    assert checked.evidence.complete
+    assert checkpoint_client.calls == []
+
+    (primary / "checkpoint.json").unlink()
+    assert not (primary / "collection-manifest.json").exists()
+    ambiguous_client = _ScriptedPublicClient([])
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        _collect(primary, ambiguous_client)
+
+    assert ambiguous_client.calls == []
+
+
+def test_no_checkpoint_ignores_a_nonsequential_orphan_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A malformed orphan does not break recovery from the valid snapshot chain."""
+    _collect(
+        tmp_path,
+        _ScriptedPublicClient([[_candle("2026-01-01T04:00:00Z"), _candle("2025-12-31T20:00:00Z")]]),
+    )
+    checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    conflicting = {
+        key: value
+        for key, value in checkpoint.items()
+        if key not in {"collection_snapshot", "collection_snapshot_sha256"}
+    }
+    conflicting["next_to_utc"] = "2026-01-01T12:00:00Z"
+    conflicting["complete"] = False
+    contents = storage._canonical_json_bytes(conflicting)
+    digest = hashlib.sha256(contents).hexdigest()
+    (tmp_path / f"collection-{digest}.json").write_bytes(contents)
+    (tmp_path / "checkpoint.json").unlink()
+    recovery_client = _ScriptedPublicClient([])
+
+    recovered = _collect(tmp_path, recovery_client)
+
+    assert recovery_client.calls == []
+    assert recovered.evidence.complete
+
+
+def test_checkpoint_with_a_nonsequential_request_boundary_fails_before_network(
+    tmp_path: Path,
+) -> None:
+    """A hash-valid checkpoint must still bind every page to the prior boundary."""
+    with pytest.raises(PublicDataUnavailable):
+        _collect(
+            tmp_path,
+            _ScriptedPublicClient(
+                [
+                    [_candle("2026-01-01T08:00:00Z"), _candle("2026-01-01T04:00:00Z")],
+                    PublicDataUnavailable("temporary outage"),
+                ]
+            ),
+        )
+    checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    state = {
+        key: value
+        for key, value in checkpoint.items()
+        if key not in {"collection_snapshot", "collection_snapshot_sha256"}
+    }
+    state["next_to_utc"] = "2026-01-01T12:00:00Z"
+    contents = storage._canonical_json_bytes(state)
+    digest = hashlib.sha256(contents).hexdigest()
+    (tmp_path / f"collection-{digest}.json").write_bytes(contents)
+    checkpoint = {
+        **state,
+        "collection_snapshot": f"collection-{digest}.json",
+        "collection_snapshot_sha256": digest,
+    }
+    (tmp_path / "checkpoint.json").write_bytes(storage._canonical_json_bytes(checkpoint))
+    recovery_client = _ScriptedPublicClient([])
+
+    with pytest.raises(ValueError, match="pagination"):
+        _collect(tmp_path, recovery_client)
+
+    assert recovery_client.calls == []
+
+
+def test_data_quality_accepts_completed_evidence_chain_offline(tmp_path: Path) -> None:
+    """Quality derives the raw frame from completed evidence without HTTP."""
+    evidence_root = tmp_path / "evidence"
+    _collect(
+        evidence_root,
+        _ScriptedPublicClient(
+            [
+                [
+                    _candle("2026-01-01T08:00:00Z", 108),
+                    _candle("2026-01-01T04:00:00Z", 104),
+                ],
+                [
+                    _candle("2026-01-01T04:00:00Z", 104),
+                    _candle("2026-01-01T00:00:00Z", 100),
+                    _candle("2025-12-31T20:00:00Z", 96),
+                ],
+            ]
+        ),
+    )
+    output = tmp_path / "quality"
+
+    assert main(["data-quality", "--input", str(evidence_root), "--output", str(output)]) == 0
+
+    processed = pd.read_csv(output / "processed.csv")
+    assert processed["timestamp"].tolist() == [
+        "2026-01-01 00:00:00+00:00",
+        "2026-01-01 04:00:00+00:00",
+        "2026-01-01 08:00:00+00:00",
+    ]
+
+
+def test_data_quality_rejects_incomplete_or_corrupted_evidence_before_writing(
+    tmp_path: Path,
+) -> None:
+    """Evidence handoff validates completion and every immutable page first."""
+    incomplete_root = tmp_path / "incomplete"
+    first_page = [_candle("2026-01-01T08:00:00Z"), _candle("2026-01-01T04:00:00Z")]
+    with pytest.raises(PublicDataUnavailable):
+        _collect(
+            incomplete_root,
+            _ScriptedPublicClient([first_page, PublicDataUnavailable("temporary outage")]),
+        )
+
+    with pytest.raises(ValueError, match="incomplete collection evidence"):
+        main(
+            [
+                "data-quality",
+                "--input",
+                str(incomplete_root),
+                "--output",
+                str(tmp_path / "incomplete-quality"),
+            ]
+        )
+    assert not (tmp_path / "incomplete-quality").exists()
+
+    corrupted_root = tmp_path / "corrupted"
+    completed = _collect(
+        corrupted_root,
+        _ScriptedPublicClient([[_candle("2026-01-01T04:00:00Z"), _candle("2025-12-31T20:00:00Z")]]),
+    )
+    completed.evidence.pages[0].path.write_bytes(b"corrupt")
+
+    with pytest.raises(ValueError, match="raw page evidence"):
+        main(
+            [
+                "data-quality",
+                "--input",
+                str(corrupted_root),
+                "--output",
+                str(tmp_path / "corrupted-quality"),
+            ]
+        )
+    assert not (tmp_path / "corrupted-quality").exists()

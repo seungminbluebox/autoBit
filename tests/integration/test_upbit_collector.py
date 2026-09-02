@@ -96,6 +96,25 @@ def test_client_refuses_any_market_other_than_krw_btc() -> None:
         )
 
 
+@pytest.mark.parametrize("candle_unit_minutes", [1, 60, 200])
+def test_client_refuses_any_candle_unit_other_than_four_hours_before_network(
+    candle_unit_minutes: int,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    with pytest.raises(ValueError, match="candle_unit_minutes"):
+        UpbitPublicClient(
+            httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: seen.append(request) or httpx.Response(200, json=[])
+                )
+            ),
+            DataConfig(candle_unit_minutes=candle_unit_minutes),
+        )
+
+    assert seen == []
+
+
 @pytest.mark.parametrize("page_size", [0, 201])
 def test_client_refuses_out_of_range_page_sizes_before_sending_a_request(page_size: int) -> None:
     seen: list[httpx.Request] = []
@@ -111,6 +130,19 @@ def test_client_refuses_out_of_range_page_sizes_before_sending_a_request(page_si
         )
 
     assert seen == []
+
+
+def test_client_exposes_the_immutable_validated_request_config() -> None:
+    config = DataConfig(page_size=17)
+    client = UpbitPublicClient(
+        httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=[]))),
+        config,
+    )
+
+    assert client.collection_config is config
+    assert client.collection_config.market == "KRW-BTC"
+    assert client.collection_config.candle_unit_minutes == 240
+    assert client.collection_config.page_size == 17
 
 
 def test_remaining_request_header_throttles_next_request_without_sleeping_tests() -> None:

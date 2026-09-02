@@ -15,7 +15,7 @@ from autobit.backtest.analyzers import calculate_metrics
 from autobit.backtest.benchmark import run_buy_and_hold
 from autobit.backtest.engine import BacktestConfig, run_backtest
 from autobit.config import CostConfig, DataConfig, ExchangeRulesConfig
-from autobit.data.collector import collect_evidence_range
+from autobit.data.collector import collect_evidence_range, load_completed_evidence_frame
 from autobit.data.quality import QualityReport, canonicalize_ohlcv
 from autobit.data.storage import _atomic_write, _canonical_json_bytes
 from autobit.data.upbit_public import UpbitPublicClient
@@ -34,7 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     download.set_defaults(handler=_run_data_download)
 
     quality = commands.add_parser("data-quality", help="Validate public candles")
-    quality.add_argument("--input", type=Path, required=True, help="JSON or CSV source")
+    quality.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="JSON, CSV, or completed evidence directory",
+    )
     quality.add_argument("--output", type=Path, required=True, help="Result directory")
     quality.set_defaults(handler=_run_data_quality)
 
@@ -163,13 +168,14 @@ def _run_backtest(arguments: argparse.Namespace) -> int:
 
 
 def _read_ohlcv(path: Path) -> pd.DataFrame:
-    suffix = path.suffix.lower()
-    if suffix == ".json":
+    if path.is_dir():
+        frame = load_completed_evidence_frame(path)
+    elif path.suffix.lower() == ".json":
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
             raise ValueError("JSON input must be a list of candle objects")
         frame = pd.DataFrame(payload)
-    elif suffix == ".csv":
+    elif path.suffix.lower() == ".csv":
         frame = pd.read_csv(path)
     else:
         raise ValueError("input must be JSON or CSV")

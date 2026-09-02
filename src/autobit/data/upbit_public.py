@@ -59,6 +59,8 @@ class UpbitPublicClient:
     ) -> None:
         if config.market != "KRW-BTC":
             raise ValueError("public collector supports only the KRW-BTC market")
+        if config.candle_unit_minutes != 240:
+            raise ValueError("public collector requires candle_unit_minutes=240")
         if isinstance(config.page_size, bool) or not isinstance(config.page_size, int) or not 1 <= config.page_size <= 200:
             raise ValueError("page_size must be an integer from 1 through 200")
         self._http_client = http_client
@@ -69,6 +71,11 @@ class UpbitPublicClient:
     @property
     def source_url(self) -> str:
         return PUBLIC_CANDLE_URL
+
+    @property
+    def collection_config(self) -> DataConfig:
+        """The frozen, validated configuration that determines every request."""
+        return self._config
 
     def fetch_page(self, to_utc: str) -> list[dict[str, object]]:
         """Fetch one page, retrying only transient public-endpoint failures."""
