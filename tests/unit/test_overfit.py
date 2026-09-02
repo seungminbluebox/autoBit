@@ -3,6 +3,7 @@
 import math
 
 import numpy as np
+import pandas as pd
 import pytest
 from scipy.special import ndtri_exp
 from scipy.stats import kurtosis, norm, skew
@@ -189,6 +190,35 @@ def test_dsr_materializes_a_one_shot_generator_exactly_once() -> None:
 @pytest.mark.parametrize(
     "returns",
     [
+        {0.010: "first", -0.009: "second", 0.008: "third"},
+        {0.010, -0.009, 0.008},
+        frozenset((0.010, -0.009, 0.008)),
+        {0.010: None, -0.009: None, 0.008: None}.keys(),
+    ],
+)
+def test_dsr_rejects_mapping_and_unordered_set_iterables(returns: object) -> None:
+    """Mapping keys and unordered iteration must never become return evidence."""
+    with pytest.raises(ValueError, match="ordered"):
+        deflated_sharpe_probability(returns, num_trials=9)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "returns",
+    [
+        pd.Series([0.010, -0.009, 0.008, -0.007] * 250),
+        pd.Index([0.010, -0.009, 0.008, -0.007] * 250),
+    ],
+)
+def test_dsr_keeps_ordered_pandas_series_and_index_inputs(returns: object) -> None:
+    """Rejecting sets must not reject ordered third-party one-dimensional inputs."""
+    assert deflated_sharpe_probability(
+        returns, num_trials=9  # type: ignore[arg-type]
+    ) == pytest.approx(0.6273299115522453, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    "returns",
+    [
         np.array([], dtype=float),
         np.array([0.01], dtype=float),
         np.array([0.01, -0.01], dtype=float),
@@ -336,6 +366,71 @@ def test_pbo_materializes_outer_and_row_generators_exactly_once() -> None:
     assert probability == 1.0
     assert consumed_is == [(row, column) for row in range(3) for column in range(3)]
     assert consumed_oos == [(row, column) for row in range(3) for column in range(3)]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {
+            (3.0, 2.0, 1.0): "first",
+            (1.0, 3.0, 2.0): "second",
+            (2.0, 1.0, 3.0): "third",
+        },
+        {(3.0, 2.0, 1.0), (1.0, 3.0, 2.0), (2.0, 1.0, 3.0)},
+        frozenset(((3.0, 2.0, 1.0), (1.0, 3.0, 2.0), (2.0, 1.0, 3.0))),
+        {
+            (3.0, 2.0, 1.0): None,
+            (1.0, 3.0, 2.0): None,
+            (2.0, 1.0, 3.0): None,
+        }.keys(),
+    ],
+)
+def test_pbo_rejects_outer_mapping_and_unordered_set_iterables(
+    malformed: object,
+) -> None:
+    """Tuple keys or unordered rows must not impersonate a score matrix."""
+    valid = np.array([[3.0, 2.0, 1.0], [1.0, 3.0, 2.0], [2.0, 1.0, 3.0]])
+
+    with pytest.raises(ValueError, match="ordered"):
+        probability_of_backtest_overfitting(malformed, valid)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ordered"):
+        probability_of_backtest_overfitting(valid, malformed)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "row_factory",
+    [
+        lambda row: {value: index for index, value in enumerate(row)},
+        lambda row: set(row),
+        lambda row: frozenset(row),
+        lambda row: {value: None for value in row}.keys(),
+    ],
+)
+def test_pbo_rejects_nested_mapping_and_unordered_set_rows(row_factory) -> None:
+    """Numeric mapping or set rows must be rejected at their nested depth."""
+    rows = ((3.0, 2.0, 1.0), (1.0, 3.0, 2.0), (2.0, 1.0, 3.0))
+    malformed = [row_factory(row) for row in rows]
+    valid = np.array(rows)
+
+    with pytest.raises(ValueError, match="ordered"):
+        probability_of_backtest_overfitting(malformed, valid)
+    with pytest.raises(ValueError, match="ordered"):
+        probability_of_backtest_overfitting(valid, malformed)
+
+
+@pytest.mark.parametrize("row_type", [pd.Series, pd.Index])
+def test_pbo_keeps_ordered_pandas_row_iterables(row_type) -> None:
+    """Nested ordered pandas rows must remain valid score evidence."""
+    in_sample = [
+        row_type(row)
+        for row in ((3.0, 2.0, 1.0), (1.0, 3.0, 2.0), (2.0, 1.0, 3.0))
+    ]
+    out_of_sample = [
+        row_type(row)
+        for row in ((1.0, 2.0, 3.0), (3.0, 1.0, 2.0), (2.0, 3.0, 1.0))
+    ]
+
+    assert probability_of_backtest_overfitting(in_sample, out_of_sample) == 1.0
 
 
 def test_seeded_random_dsr_and_pbo_properties_are_bounded_and_finite() -> None:

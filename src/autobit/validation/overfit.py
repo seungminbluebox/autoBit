@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Set
 from itertools import combinations
 import math
 
@@ -186,8 +186,9 @@ def _require_positive_integer(value: object, name: str) -> None:
 
 
 def _finite_real_array(values: object, *, name: str, dimensions: int) -> np.ndarray:
+    materialized = _materialize_nested_iterable(values, depth=dimensions)
     try:
-        array = np.asarray(_materialize_nested_iterable(values, depth=dimensions))
+        array = np.asarray(materialized)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{name} must be a rectangular real numeric array") from error
     if array.ndim != dimensions:
@@ -204,6 +205,10 @@ def _finite_real_array(values: object, *, name: str, dimensions: int) -> np.ndar
 
 
 def _materialize_nested_iterable(values: object, *, depth: int) -> object:
+    if isinstance(values, (Mapping, Set)):
+        raise ValueError(
+            "statistical evidence requires ordered iterables, not mappings or sets"
+        )
     if isinstance(values, np.ndarray):
         return values
     if isinstance(values, (str, bytes, bytearray)) or not isinstance(values, Iterable):
