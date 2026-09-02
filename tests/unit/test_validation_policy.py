@@ -136,3 +136,32 @@ def test_numpy_real_and_integer_inputs_are_canonicalized_to_builtins() -> None:
     assert type(values.oos_net_return) is float
     assert type(values.sharpe) is float
     assert type(values.trade_count) is int
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    (
+        ({"pbo": None}, "pbo_unavailable"),
+        (
+            {"train_test_sharpe_ratio": None},
+            "train_test_sharpe_ratio_unavailable",
+        ),
+    ),
+)
+def test_unavailable_diagnostics_force_review_with_stable_reason(
+    changes: dict[str, object], reason: str
+) -> None:
+    decision = classify_validation(replace(passing_inputs(), **changes))
+    assert decision.status == "REVIEW"
+    assert reason in decision.reasons
+
+
+def test_hard_reject_and_insufficient_statistics_keep_precedence_when_diagnostics_unavailable() -> None:
+    rejected = classify_validation(
+        replace(passing_inputs(), sharpe=0.0, pbo=None, train_test_sharpe_ratio=None)
+    )
+    insufficient = classify_validation(
+        replace(passing_inputs(), trade_count=99, pbo=None, train_test_sharpe_ratio=None)
+    )
+    assert rejected.status == "REJECT"
+    assert insufficient.status == "INSUFFICIENT_STATISTICS"

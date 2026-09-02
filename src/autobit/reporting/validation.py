@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 import hashlib
 import io
+from itertools import combinations
 import json
 import math
 from numbers import Integral, Real
@@ -34,6 +35,18 @@ COST_IDS: Final = tuple(cost.cost_id for cost in registered_cost_scenarios())
 REGIME_IDS: Final = ("rising", "falling", "sideways")
 _RECONCILIATION_TOLERANCE: Final = 1e-7
 _FINITE_RATIO_SENTINEL: Final = 1e12
+_NON_RECONCILED_FIELDS: Final = (
+    "median_holding_bars",
+    "exposure",
+    "turnover",
+    "cash_ratio",
+    "non_baseline.annualized_return",
+    "non_baseline.sharpe",
+    "non_baseline.sortino",
+    "non_baseline.calmar",
+    "non_baseline.max_drawdown",
+    "non_baseline.max_drawdown_duration_bars",
+)
 REPORT_FILENAMES: Final = (
     "validation-summary.json",
     "fold-metrics.csv",
@@ -140,12 +153,35 @@ class FoldTrainingSharpe:
 
 
 @dataclass(frozen=True, slots=True)
+class DiagnosticPathEvidence:
+    """One labeled CPCV path with scores aligned to canonical trial IDs."""
+
+    path_id: str
+    test_group_ids: tuple[int, int]
+    in_sample_scores: tuple[float, ...]
+    out_of_sample_scores: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ValidationDiagnosticEvidence:
     """Raw, pre-registered evidence from which DSR, PBO, and IS/OOS are derived."""
 
-    pbo_in_sample_scores: tuple[tuple[float, ...], ...]
-    pbo_out_of_sample_scores: tuple[tuple[float, ...], ...]
+    status: Literal["COMPLETE", "INCOMPLETE"]
+    error: str | None
+    trial_ids: tuple[str, ...]
+    paths: tuple[DiagnosticPathEvidence, ...]
     train_fold_sharpes: tuple[FoldTrainingSharpe, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RunFailureEvidence:
+    """One deterministic TRAIN or OOS cell failure retained for audit."""
+
+    phase: Literal["TRAIN", "OOS"]
+    fold_id: str
+    trial_id: str
+    cost_id: str
+    error: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +196,7 @@ class ValidationReportInput:
     regime_metrics: tuple[RegimeMetricRow, ...]
     benchmark_comparison: tuple[BenchmarkComparisonRow, ...]
     oos_equity: tuple[OOSEquityRow, ...]
+    run_failures: tuple[RunFailureEvidence, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +226,27 @@ _COST_COLUMNS: Final = tuple(field.name for field in fields(CostScenarioRow))
 _REGIME_COLUMNS: Final = tuple(field.name for field in fields(RegimeMetricRow))
 _BENCHMARK_COLUMNS: Final = tuple(field.name for field in fields(BenchmarkComparisonRow))
 _EQUITY_COLUMNS: Final = tuple(field.name for field in fields(OOSEquityRow))
+
+
+@dataclass(frozen=True, slots=True)
+class _TradeLedger:
+    trade_count: int
+    wins: int
+    losses: int
+    gross_wins: float
+    gross_losses: float
+    net_pnl: float
+
+
+@dataclass(frozen=True, slots=True)
+class _PathMetrics:
+    total_return: float
+    annualized_return: float
+    sharpe: float
+    sortino: float
+    max_drawdown: float
+    max_drawdown_duration_bars: int
+    calmar: float
 
 
 def write_validation_bundle(
@@ -256,7 +314,7 @@ def _validate_report(
         raise ValueError("fold_ids must be unique, contiguous, and canonical")
     for name in (
         "fold_metrics", "trial_metrics", "cost_scenarios", "regime_metrics",
-        "benchmark_comparison", "oos_equity",
+        "benchmark_comparison", "oos_equity", "run_failures",
     ):
         _require_tuple(getattr(report, name), name)
 
@@ -307,11 +365,14 @@ def _validate_report(
         if stitched.status == "COMPLETE":
             if any(row.metrics is None for row in folds):
                 raise ValueError("a COMPLETE stitched cell requires complete fold evidence")
-            compounded = _compound_returns(
-                tuple(row.metrics.net_return for row in folds if row.metrics is not None)
+            _reconcile_stitched_metrics(
+                tuple(row.metrics for row in folds if row.metrics is not None),
+                stitched.metrics,
             )
-            if not _close(compounded, stitched.metrics.net_return):
-                raise ValueError("completed fold returns must compound to stitched net return")
+
+    failures = _validate_run_failures(
+        report.run_failures, fold_map, trial_map, report.fold_ids
+    )
 
     baseline_metrics: dict[str, MetricSnapshot] = {}
     for cost_id in COST_IDS:
@@ -329,21 +390,31 @@ def _validate_report(
     )
     if any(row.status != "COMPLETED" or row.metrics is None for row in baseline_default_folds):
         raise ValueError("baseline/default OOS fold evidence must be complete")
-    equity_returns, _ = _validate_equity(
+    equity_returns, path_metrics = _validate_equity(
         report.oos_equity, baseline_metrics["baseline"]
     )
-    evidence = _validate_diagnostics(report.diagnostic_evidence, report.fold_ids)
+    evidence = _validate_diagnostics(
+        report.diagnostic_evidence, report.fold_ids, trial_map, failures
+    )
 
     oos_sharpes = tuple(row.metrics.sharpe for row in baseline_default_folds if row.metrics)
-    train_sharpes = tuple(item.sharpe for item in evidence.train_fold_sharpes)
-    train_mean = math.fsum(train_sharpes) / len(train_sharpes)
-    oos_mean = math.fsum(oos_sharpes) / len(oos_sharpes)
-    if train_mean <= 0.0:
-        train_test_ratio = 0.0
-    elif oos_mean <= 0.0:
-        train_test_ratio = _FINITE_RATIO_SENTINEL
+    if evidence.status == "INCOMPLETE":
+        train_test_ratio: float | None = None
+        pbo: float | None = None
     else:
-        train_test_ratio = min(_FINITE_RATIO_SENTINEL, train_mean / oos_mean)
+        train_sharpes = tuple(item.sharpe for item in evidence.train_fold_sharpes)
+        train_mean = math.fsum(train_sharpes) / len(train_sharpes)
+        oos_mean = math.fsum(oos_sharpes) / len(oos_sharpes)
+        if train_mean <= 0.0:
+            train_test_ratio = 0.0
+        elif oos_mean <= 0.0:
+            train_test_ratio = _FINITE_RATIO_SENTINEL
+        else:
+            train_test_ratio = min(_FINITE_RATIO_SENTINEL, train_mean / oos_mean)
+        pbo = probability_of_backtest_overfitting(
+            tuple(path.in_sample_scores for path in evidence.paths),
+            tuple(path.out_of_sample_scores for path in evidence.paths),
+        )
 
     fold_returns = tuple(
         row.metrics.net_return for row in baseline_default_folds if row.metrics
@@ -357,15 +428,13 @@ def _validate_report(
     stress_survived = stress.net_return > -1.0 and stress.max_drawdown < 1.0
 
     inputs = ValidationInputs(
-        oos_net_return=baseline_metrics["baseline"].net_return,
-        sharpe=baseline_metrics["baseline"].sharpe,
+        oos_net_return=path_metrics.total_return,
+        sharpe=path_metrics.sharpe,
         profit_factor=baseline_metrics["baseline"].profit_factor,
-        max_drawdown=baseline_metrics["baseline"].max_drawdown,
+        max_drawdown=path_metrics.max_drawdown,
         trade_count=baseline_metrics["baseline"].trade_count,
         dsr=deflated_sharpe_probability(equity_returns, num_trials=len(TRIAL_IDS)),
-        pbo=probability_of_backtest_overfitting(
-            evidence.pbo_in_sample_scores, evidence.pbo_out_of_sample_scores
-        ),
+        pbo=pbo,
         positive_expectancy_fold_ratio=positive_expectancy_ratio,
         max_fold_profit_share=max_fold_profit_share,
         train_test_sharpe_ratio=train_test_ratio,
@@ -415,6 +484,7 @@ def _validate_metrics(metrics: MetricSnapshot, *, cost_id: str) -> None:
         _ratio(getattr(metrics, name), f"metrics.{name}")
     _nonnegative_integer(metrics.max_drawdown_duration_bars, "metrics.max_drawdown_duration_bars")
     _nonnegative_integer(metrics.trade_count, "metrics.trade_count")
+    _trade_ledger(metrics)
     if metrics.net_return > metrics.gross_return + _RECONCILIATION_TOLERANCE:
         raise ValueError("metrics net return cannot exceed gross return")
     if cost_id == "zero" and (
@@ -423,6 +493,103 @@ def _validate_metrics(metrics: MetricSnapshot, *, cost_id: str) -> None:
         or not _close(metrics.gross_return, metrics.net_return)
     ):
         raise ValueError("zero cost metrics require zero costs and gross equal to net")
+
+
+def _trade_ledger(metrics: MetricSnapshot) -> _TradeLedger:
+    count = int(metrics.trade_count)
+    if count == 0:
+        for name in (
+            "expectancy", "win_rate", "average_win", "average_loss",
+            "profit_factor", "average_win_loss_ratio", "mean_holding_bars",
+        ):
+            if not _close(getattr(metrics, name), 0.0):
+                raise ValueError(f"zero-trade metrics require {name}=0")
+        return _TradeLedger(0, 0, 0, 0.0, 0.0, 0.0)
+
+    wins_value = metrics.win_rate * count
+    wins = round(wins_value)
+    if wins < 0 or wins > count or not _close(wins_value, wins):
+        raise ValueError("trade win count implied by win_rate must be integer-like")
+    if wins == 0:
+        if not _close(metrics.average_win, 0.0):
+            raise ValueError("zero wins require average_win=0")
+    elif metrics.average_win <= 0.0:
+        raise ValueError("positive wins require positive average_win")
+    gross_wins = wins * metrics.average_win
+    net_pnl = metrics.expectancy * count
+
+    if _close(metrics.average_loss, 0.0):
+        losses = 0
+        gross_losses = 0.0
+        if not _close(net_pnl, gross_wins):
+            raise ValueError("expectancy is inconsistent with win and loss evidence")
+    else:
+        losses_value = (net_pnl - gross_wins) / metrics.average_loss
+        losses = round(losses_value)
+        if losses < 0 or wins + losses > count or not _close(losses_value, losses):
+            raise ValueError("trade loss count implied by expectancy must be integer-like")
+        if losses == 0:
+            raise ValueError("zero losses require average_loss=0")
+        gross_losses = abs(losses * metrics.average_loss)
+    expected_profit_factor = gross_wins / gross_losses if gross_losses > 0.0 else 0.0
+    expected_ratio = (
+        metrics.average_win / abs(metrics.average_loss)
+        if metrics.average_loss < 0.0
+        else 0.0
+    )
+    if not _close(metrics.profit_factor, expected_profit_factor):
+        raise ValueError("profit_factor is inconsistent with trade algebra")
+    if not _close(metrics.average_win_loss_ratio, expected_ratio):
+        raise ValueError("average_win_loss_ratio is inconsistent with trade algebra")
+    return _TradeLedger(
+        trade_count=count,
+        wins=wins,
+        losses=losses,
+        gross_wins=gross_wins,
+        gross_losses=gross_losses,
+        net_pnl=net_pnl,
+    )
+
+
+def _reconcile_stitched_metrics(
+    folds: tuple[MetricSnapshot, ...], stitched: MetricSnapshot
+) -> None:
+    if not _close(_compound_returns(tuple(row.gross_return for row in folds)), stitched.gross_return):
+        raise ValueError("fold gross_return must compound to stitched gross_return")
+    if not _close(_compound_returns(tuple(row.net_return for row in folds)), stitched.net_return):
+        raise ValueError("fold net_return must compound to stitched net_return")
+    for name in ("total_fees", "total_slippage"):
+        if not _close(math.fsum(getattr(row, name) for row in folds), getattr(stitched, name)):
+            raise ValueError(f"fold {name} must sum to stitched {name}")
+
+    ledgers = tuple(_trade_ledger(row) for row in folds)
+    trade_count = sum(item.trade_count for item in ledgers)
+    wins = sum(item.wins for item in ledgers)
+    losses = sum(item.losses for item in ledgers)
+    gross_wins = math.fsum(item.gross_wins for item in ledgers)
+    gross_losses = math.fsum(item.gross_losses for item in ledgers)
+    net_pnl = math.fsum(item.net_pnl for item in ledgers)
+    expected: dict[str, float | int] = {
+        "trade_count": trade_count,
+        "expectancy": net_pnl / trade_count if trade_count else 0.0,
+        "win_rate": wins / trade_count if trade_count else 0.0,
+        "average_win": gross_wins / wins if wins else 0.0,
+        "average_loss": -gross_losses / losses if losses else 0.0,
+        "profit_factor": gross_wins / gross_losses if gross_losses else 0.0,
+        "average_win_loss_ratio": (
+            (gross_wins / wins) / (gross_losses / losses)
+            if wins and losses and gross_losses
+            else 0.0
+        ),
+        "mean_holding_bars": (
+            math.fsum(row.mean_holding_bars * row.trade_count for row in folds)
+            / trade_count
+            if trade_count else 0.0
+        ),
+    }
+    for name, value in expected.items():
+        if not _close(getattr(stitched, name), value):
+            raise ValueError(f"stitched {name} must be reconstructed from fold trades")
 
 
 def _validate_cost_scenarios(
@@ -499,7 +666,7 @@ def _validate_benchmarks(
 
 def _validate_equity(
     rows: tuple[OOSEquityRow, ...], baseline: MetricSnapshot
-) -> tuple[tuple[float, ...], tuple[float, ...]]:
+) -> tuple[tuple[float, ...], _PathMetrics]:
     if not rows:
         raise ValueError("oos_equity must not be empty")
     values: list[float] = []
@@ -523,32 +690,138 @@ def _validate_equity(
         previous_timestamp = timestamp
     if not _close(values[0], 100.0):
         raise ValueError("oos_equity must start at 100")
-    net_return = values[-1] / 100.0 - 1.0
-    if not _close(net_return, baseline.net_return):
-        raise ValueError("oos_equity final return must match baseline stitched metrics")
-    if not _close(_maximum_drawdown(values), baseline.max_drawdown):
-        raise ValueError("oos_equity drawdown must match baseline stitched metrics")
     returns = tuple(
         0.0 if previous == 0.0 else current / previous - 1.0
         for previous, current in zip(values, values[1:])
     )
-    return returns, tuple(values)
+    path = _calculate_path_metrics(values, returns)
+    comparisons: tuple[tuple[str, float | int, float | int], ...] = (
+        ("net_return", path.total_return, baseline.net_return),
+        ("annualized_return", path.annualized_return, baseline.annualized_return),
+        ("sharpe", path.sharpe, baseline.sharpe),
+        ("sortino", path.sortino, baseline.sortino),
+        ("max_drawdown", path.max_drawdown, baseline.max_drawdown),
+        (
+            "max_drawdown_duration_bars",
+            path.max_drawdown_duration_bars,
+            baseline.max_drawdown_duration_bars,
+        ),
+        ("calmar", path.calmar, baseline.calmar),
+    )
+    for name, derived, disclosed in comparisons:
+        if not _close(derived, disclosed):
+            raise ValueError(f"baseline stitched {name} must match OOS equity")
+    return returns, path
+
+
+def _calculate_path_metrics(
+    equity: list[float], returns: tuple[float, ...]
+) -> _PathMetrics:
+    total_return = equity[-1] / equity[0] - 1.0
+    if not returns or total_return == 0.0:
+        annualized = 0.0
+    elif total_return <= -1.0:
+        annualized = -1.0
+    else:
+        annualized = (1.0 + total_return) ** (2190 / len(returns)) - 1.0
+    mean = math.fsum(returns) / len(returns) if returns else 0.0
+    variance = (
+        math.fsum((value - mean) ** 2 for value in returns) / len(returns)
+        if returns else 0.0
+    )
+    deviation = math.sqrt(max(0.0, variance))
+    sharpe = mean / deviation * math.sqrt(2190) if deviation > 0.0 else 0.0
+    downside = (
+        math.sqrt(math.fsum(min(value, 0.0) ** 2 for value in returns) / len(returns))
+        if returns else 0.0
+    )
+    sortino = mean / downside * math.sqrt(2190) if downside > 0.0 else 0.0
+    peak = equity[0]
+    maximum_drawdown = 0.0
+    duration = 0
+    maximum_duration = 0
+    for value in equity[1:]:
+        if value >= peak:
+            peak = value
+            duration = 0
+        else:
+            duration += 1
+            maximum_duration = max(maximum_duration, duration)
+            maximum_drawdown = max(maximum_drawdown, (peak - value) / peak)
+    calmar = annualized / maximum_drawdown if maximum_drawdown > 0.0 else 0.0
+    return _PathMetrics(
+        total_return=total_return,
+        annualized_return=annualized,
+        sharpe=sharpe,
+        sortino=sortino,
+        max_drawdown=maximum_drawdown,
+        max_drawdown_duration_bars=maximum_duration,
+        calmar=calmar,
+    )
+
+
+def _validate_run_failures(
+    failures: tuple[RunFailureEvidence, ...],
+    fold_map: dict[tuple[str, str, str], FoldMetricRow],
+    trial_map: dict[tuple[str, str], TrialMetricRow],
+    fold_ids: tuple[str, ...],
+) -> tuple[RunFailureEvidence, ...]:
+    seen: dict[tuple[str, str, str, str], RunFailureEvidence] = {}
+    for failure in failures:
+        if not isinstance(failure, RunFailureEvidence):
+            raise ValueError("run_failures must contain RunFailureEvidence values")
+        if failure.phase not in {"TRAIN", "OOS"}:
+            raise ValueError("failure phase must be TRAIN or OOS")
+        if failure.fold_id not in fold_ids or failure.trial_id not in TRIAL_IDS or failure.cost_id not in COST_IDS:
+            raise ValueError("failure must map to a canonical run cell")
+        if not isinstance(failure.error, str) or not failure.error:
+            raise ValueError("failure error must be nonempty")
+        key = (failure.phase, failure.fold_id, failure.trial_id, failure.cost_id)
+        if key in seen:
+            raise ValueError("run failures must be unique")
+        seen[key] = failure
+
+    expected_oos = {
+        (row.fold_id, row.trial_id, row.cost_id): row.error
+        for row in fold_map.values()
+        if row.status == "FAILED"
+    }
+    actual_oos = {
+        (item.fold_id, item.trial_id, item.cost_id): item.error
+        for item in failures
+        if item.phase == "OOS"
+    }
+    if actual_oos != expected_oos:
+        raise ValueError("OOS failure evidence must match FAILED fold rows exactly")
+
+    for (trial_id, cost_id), stitched in trial_map.items():
+        related = tuple(
+            item for item in failures
+            if (item.trial_id, item.cost_id) == (trial_id, cost_id)
+        )
+        if stitched.status == "COMPLETE" and related:
+            raise ValueError("COMPLETE stitched cells cannot have a run failure")
+        if stitched.status == "INCOMPLETE" and not related:
+            raise ValueError("INCOMPLETE stitched cells require structured failure evidence")
+    return tuple(sorted(
+        failures,
+        key=lambda item: (
+            _fold_ordinal(item.fold_id), _trial_ordinal(item.trial_id),
+            _cost_ordinal(item.cost_id), 0 if item.phase == "TRAIN" else 1,
+        ),
+    ))
 
 
 def _validate_diagnostics(
-    evidence: object, fold_ids: tuple[str, ...]
+    evidence: object,
+    fold_ids: tuple[str, ...],
+    trial_map: dict[tuple[str, str], TrialMetricRow],
+    failures: tuple[RunFailureEvidence, ...],
 ) -> ValidationDiagnosticEvidence:
     if not isinstance(evidence, ValidationDiagnosticEvidence):
         raise ValueError("diagnostic_evidence must be ValidationDiagnosticEvidence")
-    for name in ("pbo_in_sample_scores", "pbo_out_of_sample_scores"):
-        matrix = getattr(evidence, name)
-        if not isinstance(matrix, tuple) or len(matrix) != 45:
-            raise ValueError(f"{name} must contain exactly 45 paths")
-        for row in matrix:
-            if not isinstance(row, tuple) or len(row) != len(TRIAL_IDS):
-                raise ValueError(f"{name} must contain exactly nine trials per path")
-            for value in row:
-                _finite_real(value, name)
+    if evidence.trial_ids != TRIAL_IDS:
+        raise ValueError("diagnostic trial_ids must exactly match canonical trial order")
     if not isinstance(evidence.train_fold_sharpes, tuple):
         raise ValueError("train_fold_sharpes must be an immutable tuple")
     seen: dict[str, FoldTrainingSharpe] = {}
@@ -559,6 +832,36 @@ def _validate_diagnostics(
         seen[item.fold_id] = item
     if tuple(item.fold_id for item in evidence.train_fold_sharpes) != fold_ids:
         raise ValueError("train_fold_sharpes must exactly cover canonical fold order")
+
+    baseline_cost_incomplete = any(
+        trial_map[(trial_id, "baseline")].status == "INCOMPLETE"
+        for trial_id in TRIAL_IDS
+    ) or any(failure.cost_id == "baseline" for failure in failures)
+    expected_status = "INCOMPLETE" if baseline_cost_incomplete else "COMPLETE"
+    if evidence.status != expected_status:
+        raise ValueError("diagnostic status must follow baseline-cost trial completeness")
+    if evidence.status == "INCOMPLETE":
+        if not isinstance(evidence.error, str) or not evidence.error:
+            raise ValueError("incomplete diagnostics require an error")
+        if evidence.paths != ():
+            raise ValueError("incomplete diagnostics cannot contain fabricated PBO paths")
+        return evidence
+    if evidence.error is not None:
+        raise ValueError("complete diagnostics cannot carry an error")
+    if not isinstance(evidence.paths, tuple) or len(evidence.paths) != 45:
+        raise ValueError("complete diagnostics require exactly 45 labeled paths")
+    expected_groups = tuple(combinations(range(10), 2))
+    for index, (path, test_groups) in enumerate(zip(evidence.paths, expected_groups, strict=True)):
+        if not isinstance(path, DiagnosticPathEvidence):
+            raise ValueError("diagnostic paths must be typed")
+        if path.path_id != f"path-{index:03d}" or path.test_group_ids != test_groups:
+            raise ValueError("diagnostic path labels must match canonical CPCV order")
+        for name in ("in_sample_scores", "out_of_sample_scores"):
+            scores = getattr(path, name)
+            if not isinstance(scores, tuple) or len(scores) != len(TRIAL_IDS):
+                raise ValueError("diagnostic path scores must align to all nine trials")
+            for value in scores:
+                _finite_real(value, f"diagnostic path {name}")
     return evidence
 
 
@@ -580,15 +883,6 @@ def _max_positive_fold_contribution_share(returns: tuple[float, ...]) -> float:
         capital *= 1.0 + value
     total = math.fsum(positive)
     return max(positive) / total if total > 0.0 else 1.0
-
-
-def _maximum_drawdown(equity: list[float]) -> float:
-    peak = equity[0]
-    maximum = 0.0
-    for value in equity[1:]:
-        peak = max(peak, value)
-        maximum = max(maximum, (peak - value) / peak)
-    return maximum
 
 
 def _close(left: Real, right: Real) -> bool:
@@ -622,6 +916,19 @@ def _report_contents(
         "fold_ids": list(report.fold_ids),
         "trial_ids": list(TRIAL_IDS),
         "cost_ids": list(COST_IDS),
+        "diagnostic_evidence": asdict(report.diagnostic_evidence),
+        "run_failures": [
+            asdict(item)
+            for item in sorted(
+                report.run_failures,
+                key=lambda item: (
+                    _fold_ordinal(item.fold_id), _trial_ordinal(item.trial_id),
+                    _cost_ordinal(item.cost_id),
+                    0 if item.phase == "TRAIN" else 1,
+                ),
+            )
+        ],
+        "non_reconciled_fields": list(_NON_RECONCILED_FIELDS),
         "fold_failures": [
             {
                 "fold_id": row.fold_id,
@@ -690,11 +997,11 @@ def _markdown(
             f"- Profit factor: {_number(inputs.profit_factor)}",
             f"- Maximum drawdown: {_number(inputs.max_drawdown)}",
             f"- DSR: {_number(inputs.dsr)}",
-            f"- PBO: {_number(inputs.pbo)}",
+            f"- PBO: {_optional_number(inputs.pbo)}",
             f"- OOS trade count: {inputs.trade_count}",
             f"- Positive-expectancy fold ratio: {_number(inputs.positive_expectancy_fold_ratio)}",
             f"- Maximum fold contribution: {_number(inputs.max_fold_profit_share)}",
-            f"- IS/OOS Sharpe ratio: {_number(inputs.train_test_sharpe_ratio)}",
+            f"- IS/OOS Sharpe ratio: {_optional_number(inputs.train_test_sharpe_ratio)}",
             f"- 20 bps stress survival: {str(inputs.stress_survived).lower()}",
             "", "## Cost scenarios — Gross return versus Net return", "",
             "| Cost | Fee | Slippage | Gross return | Net return | Fees | Slippage cost |",
@@ -725,7 +1032,18 @@ def _markdown(
         f"| {row.cost_id} | {_number(row.strategy_net_return)} | {_number(row.buy_and_hold_net_return)} | {_number(row.strategy_max_drawdown)} | {_number(row.buy_and_hold_max_drawdown)} |"
         for row in benchmark_rows
     )
-    lines.extend(["", "The fold table is isolated from the stitched OOS table. Gross-to-net differences disclose fees and slippage; cash ratio and exposure are retained in the CSV evidence.", ""])
+    lines.extend([
+        "", "## Diagnostic evidence", "",
+        "Raw labeled CPCV paths, TRAIN Sharpe rows, and structured failures are retained in validation-summary.json.",
+        "", "## Non-reconciled fields", "",
+        *(
+            f"- `{name}` (disclosed but not used by validation policy)"
+            for name in _NON_RECONCILED_FIELDS
+        ),
+        "",
+        "The fold table is isolated from the stitched OOS table. Gross-to-net differences disclose fees and slippage.",
+        "",
+    ])
     return "\n".join(lines)
 
 
@@ -882,6 +1200,10 @@ def _cost_ordinal(cost_id: str) -> int:
 
 def _number(value: Real) -> str:
     return repr(float(value))
+
+
+def _optional_number(value: Real | None) -> str:
+    return "Unavailable" if value is None else _number(value)
 
 
 def _markdown_cell(value: str | None) -> str:

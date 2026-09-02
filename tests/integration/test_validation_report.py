@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import csv
 import hashlib
+from itertools import combinations
 import json
 import math
 from pathlib import Path
@@ -11,9 +12,11 @@ import pytest
 
 from autobit.reporting import validation as validation_reporting
 from autobit.reporting.validation import (
-    BenchmarkComparisonRow, CostScenarioRow, FoldMetricRow, FoldTrainingSharpe,
-    MetricSnapshot, OOSEquityRow, RegimeMetricRow, TrialMetricRow,
-    ValidationDiagnosticEvidence, ValidationReportInput, write_validation_bundle,
+    BenchmarkComparisonRow, CostScenarioRow, DiagnosticPathEvidence,
+    FoldMetricRow, FoldTrainingSharpe, MetricSnapshot, OOSEquityRow,
+    RegimeMetricRow, RunFailureEvidence, TrialMetricRow,
+    ValidationDiagnosticEvidence, ValidationReportInput,
+    write_validation_bundle,
 )
 from autobit.validation.policy import ValidationInputs, classify_validation
 
@@ -38,41 +41,72 @@ TARGETS = {
 
 
 def _metrics(
-    *, net_return: float, cost_id: str, sharpe: float = 1.1,
+    *, net_return: float, cost_id: str, gross_return: float | None = None,
+    sharpe: float = 1.1,
     max_drawdown: float = 0.10, profit_factor: float = 1.6,
-    trade_count: int = 110, expectancy: float = 0.01,
+    trade_count: int = 110, wins: int = 54, losses: int = 56,
+    total_fees: float | None = None, total_slippage: float | None = None,
+    annualized_return: float | None = None, sortino: float = 1.3,
+    calmar: float = 0.6, max_drawdown_duration_bars: int = 20,
 ) -> MetricSnapshot:
     zero = cost_id == "zero"
+    average_win = 0.04 if wins else 0.0
+    average_loss = -0.02 if losses else 0.0
+    gross_wins = wins * average_win
+    gross_losses = abs(losses * average_loss)
+    net_pnl = gross_wins - gross_losses
+    calculated_profit_factor = gross_wins / gross_losses if gross_losses else 0.0
+    if profit_factor != 1.6:
+        calculated_profit_factor = profit_factor
     return MetricSnapshot(
-        gross_return=net_return if zero else net_return + 0.02,
-        net_return=net_return, annualized_return=net_return / 3.0,
-        sharpe=sharpe, sortino=1.3, calmar=0.6,
-        max_drawdown=max_drawdown, max_drawdown_duration_bars=20,
-        profit_factor=profit_factor, expectancy=expectancy, win_rate=0.55,
-        average_win=0.03, average_loss=-0.02, average_win_loss_ratio=1.5,
+        gross_return=(net_return if zero else net_return + 0.02)
+        if gross_return is None else gross_return,
+        net_return=net_return,
+        annualized_return=net_return / 3.0 if annualized_return is None else annualized_return,
+        sharpe=sharpe, sortino=sortino, calmar=calmar,
+        max_drawdown=max_drawdown,
+        max_drawdown_duration_bars=max_drawdown_duration_bars,
+        profit_factor=calculated_profit_factor,
+        expectancy=net_pnl / trade_count if trade_count else 0.0,
+        win_rate=wins / trade_count if trade_count else 0.0,
+        average_win=average_win, average_loss=average_loss,
+        average_win_loss_ratio=average_win / abs(average_loss) if losses else 0.0,
         trade_count=trade_count, mean_holding_bars=18.0,
         median_holding_bars=12.0, exposure=0.42, turnover=2.1,
-        total_fees=0.0 if zero else 0.01,
-        total_slippage=0.0 if zero else (0.01 if cost_id == "baseline" else 0.02),
+        total_fees=(0.0 if zero else 0.01) if total_fees is None else total_fees,
+        total_slippage=(
+            0.0 if zero else (0.01 if cost_id == "baseline" else 0.02)
+        ) if total_slippage is None else total_slippage,
         cash_ratio=0.58,
     )
 
 
 def _diagnostics() -> ValidationDiagnosticEvidence:
-    scores = tuple(tuple(float(9 - column) for column in range(9)) for _ in range(45))
+    scores = tuple(float(9 - column) for column in range(9))
+    paths = tuple(
+        DiagnosticPathEvidence(
+            path_id=f"path-{index:03d}", test_group_ids=test_groups,
+            in_sample_scores=scores, out_of_sample_scores=scores,
+        )
+        for index, test_groups in enumerate(combinations(range(10), 2))
+    )
     return ValidationDiagnosticEvidence(
-        pbo_in_sample_scores=scores,
-        pbo_out_of_sample_scores=scores,
+        status="COMPLETE", error=None, trial_ids=TRIAL_IDS, paths=paths,
         train_fold_sharpes=tuple(
             FoldTrainingSharpe(fold_id=fold_id, sharpe=1.5) for fold_id in FOLD_IDS
         ),
     )
 
 
-def _equity() -> tuple[OOSEquityRow, ...]:
+def _equity_values() -> tuple[float, ...]:
     values = [100.0]
     for value in [0.002, 0.001, 0.003, 0.0015] * 30:
         values.append(values[-1] * (1.0 + value))
+    return tuple(values)
+
+
+def _equity() -> tuple[OOSEquityRow, ...]:
+    values = _equity_values()
     start = datetime(2025, 1, 1, tzinfo=timezone.utc)
     return tuple(
         OOSEquityRow(
@@ -83,32 +117,80 @@ def _equity() -> tuple[OOSEquityRow, ...]:
     )
 
 
+def _path_statistics(values: tuple[float, ...]) -> dict[str, float | int]:
+    returns = tuple(current / previous - 1.0 for previous, current in zip(values, values[1:]))
+    total_return = values[-1] / values[0] - 1.0
+    mean = sum(returns) / len(returns)
+    variance = sum((value - mean) ** 2 for value in returns) / len(returns)
+    sharpe = mean / math.sqrt(variance) * math.sqrt(2190)
+    downside = math.sqrt(sum(min(value, 0.0) ** 2 for value in returns) / len(returns))
+    sortino = mean / downside * math.sqrt(2190) if downside else 0.0
+    annualized = (1.0 + total_return) ** (2190 / len(returns)) - 1.0
+    peak = values[0]
+    max_drawdown = 0.0
+    duration = 0
+    max_duration = 0
+    for value in values[1:]:
+        if value >= peak:
+            peak = value
+            duration = 0
+        else:
+            duration += 1
+            max_duration = max(max_duration, duration)
+            max_drawdown = max(max_drawdown, (peak - value) / peak)
+    return {
+        "annualized_return": annualized,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "max_drawdown": max_drawdown,
+        "max_drawdown_duration_bars": max_duration,
+        "calmar": annualized / max_drawdown if max_drawdown else 0.0,
+    }
+
+
 def _report(*, failed_error: str = "synthetic failure") -> ValidationReportInput:
     fold_rows: list[FoldMetricRow] = []
     trial_rows: list[TrialMetricRow] = []
-    for fold_id in FOLD_IDS:
+    fold_counts = ((40, 20, 20), (35, 17, 18), (35, 17, 18))
+    for fold_index, fold_id in enumerate(FOLD_IDS):
         for trial_index, trial_id in enumerate(TRIAL_IDS):
             for cost_id in COST_IDS:
                 target = TARGETS[cost_id] - trial_index * 0.005
                 fold_return = (1.0 + target) ** (1.0 / len(FOLD_IDS)) - 1.0
+                gross_target = target if cost_id == "zero" else target + 0.02
+                fold_gross = (1.0 + gross_target) ** (1.0 / len(FOLD_IDS)) - 1.0
+                total_fees = 0.0 if cost_id == "zero" else 0.01
+                total_slippage = 0.0 if cost_id == "zero" else (
+                    0.01 if cost_id == "baseline" else 0.02
+                )
+                trades, wins, losses = fold_counts[fold_index]
                 failed = fold_id == "fold-001" and trial_id == "ema_250" and cost_id == "stress_20bps"
                 fold_rows.append(FoldMetricRow(
                     fold_id=fold_id, trial_id=trial_id, cost_id=cost_id,
                     status="FAILED" if failed else "COMPLETED",
                     error=failed_error if failed else None,
-                    metrics=None if failed else _metrics(net_return=fold_return, cost_id=cost_id),
+                    metrics=None if failed else _metrics(
+                        net_return=fold_return, gross_return=fold_gross,
+                        cost_id=cost_id, trade_count=trades, wins=wins,
+                        losses=losses, total_fees=total_fees / len(FOLD_IDS),
+                        total_slippage=total_slippage / len(FOLD_IDS),
+                    ),
                 ))
     for trial_index, trial_id in enumerate(TRIAL_IDS):
         for cost_id in COST_IDS:
             target = TARGETS[cost_id] - trial_index * 0.005
             incomplete = trial_id == "ema_250" and cost_id == "stress_20bps"
-            max_drawdown = 0.0 if trial_id == "baseline" and cost_id == "baseline" else 0.10
+            path_fields = (
+                _path_statistics(_equity_values())
+                if trial_id == "baseline" and cost_id == "baseline"
+                else {"max_drawdown": 0.10}
+            )
             trial_rows.append(TrialMetricRow(
                 trial_id=trial_id, cost_id=cost_id,
                 status="INCOMPLETE" if incomplete else "COMPLETE",
                 error=failed_error if incomplete else None,
                 metrics=None if incomplete else _metrics(
-                    net_return=target, cost_id=cost_id, max_drawdown=max_drawdown,
+                    net_return=target, cost_id=cost_id, **path_fields,
                 ),
             ))
     baseline_by_cost = {
@@ -146,6 +228,12 @@ def _report(*, failed_error: str = "synthetic failure") -> ValidationReportInput
         fold_metrics=tuple(fold_rows), trial_metrics=tuple(trial_rows),
         cost_scenarios=costs, regime_metrics=regimes,
         benchmark_comparison=benchmarks, oos_equity=_equity(),
+        run_failures=(
+            RunFailureEvidence(
+                phase="OOS", fold_id="fold-001", trial_id="ema_250",
+                cost_id="stress_20bps", error=failed_error,
+            ),
+        ),
     )
 
 
@@ -156,6 +244,18 @@ def _replace_trial_metric(
     return replace(report, trial_metrics=tuple(
         replacement if (row.trial_id, row.cost_id) == (trial_id, cost_id) else row
         for row in report.trial_metrics
+    ))
+
+
+def _replace_fold_metric(
+    report: ValidationReportInput, fold_id: str, trial_id: str, cost_id: str,
+    replacement: FoldMetricRow,
+) -> ValidationReportInput:
+    return replace(report, fold_metrics=tuple(
+        replacement
+        if (row.fold_id, row.trial_id, row.cost_id) == (fold_id, trial_id, cost_id)
+        else row
+        for row in report.fold_metrics
     ))
 
 
@@ -195,6 +295,31 @@ def test_bundle_derives_policy_and_is_exact_hashed_deterministic_and_disclosed(t
         "trial_id": "ema_250", "cost_id": "stress_20bps",
         "status": "INCOMPLETE", "error": "synthetic failure",
     }]
+    assert summary["run_failures"] == [{
+        "phase": "OOS", "fold_id": "fold-001", "trial_id": "ema_250",
+        "cost_id": "stress_20bps", "error": "synthetic failure",
+    }]
+    audit = summary["diagnostic_evidence"]
+    assert audit["status"] == "COMPLETE"
+    assert audit["error"] is None
+    assert audit["trial_ids"] == list(TRIAL_IDS)
+    assert len(audit["paths"]) == 45
+    assert audit["paths"][0] == {
+        "path_id": "path-000", "test_group_ids": [0, 1],
+        "in_sample_scores": [float(9 - index) for index in range(9)],
+        "out_of_sample_scores": [float(9 - index) for index in range(9)],
+    }
+    assert audit["paths"][-1]["test_group_ids"] == [8, 9]
+    assert audit["train_fold_sharpes"] == [
+        {"fold_id": fold_id, "sharpe": 1.5} for fold_id in FOLD_IDS
+    ]
+    assert summary["non_reconciled_fields"] == [
+        "median_holding_bars", "exposure", "turnover", "cash_ratio",
+        "non_baseline.annualized_return", "non_baseline.sharpe",
+        "non_baseline.sortino", "non_baseline.calmar",
+        "non_baseline.max_drawdown",
+        "non_baseline.max_drawdown_duration_bars",
+    ]
     manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == "1.0"
     assert set(manifest["files"]) == EXPECTED_FILES - {"manifest.json"}
@@ -228,7 +353,9 @@ def test_caller_cannot_supply_or_override_policy_inputs_or_decision() -> None:
         replace(report, decision=classify_validation(fake))
 
 
-def test_decision_is_derived_from_disclosed_baseline_metrics(tmp_path: Path) -> None:
+def test_forged_bad_baseline_metrics_are_rejected_before_policy_classification(
+    tmp_path: Path,
+) -> None:
     report = _report()
     baseline = next(row for row in report.trial_metrics
                     if (row.trial_id, row.cost_id) == ("baseline", "baseline"))
@@ -236,15 +363,11 @@ def test_decision_is_derived_from_disclosed_baseline_metrics(tmp_path: Path) -> 
         baseline,
         metrics=replace(baseline.metrics, sharpe=-9.0, profit_factor=0.0, trade_count=0),
     )
-    bundle = write_validation_bundle(
-        tmp_path / "report",
-        _replace_trial_metric(report, "baseline", "baseline", rejected),
-    )
-    assert bundle.validation_inputs.sharpe == -9.0
-    assert bundle.validation_inputs.profit_factor == 0.0
-    assert bundle.validation_inputs.trade_count == 0
-    assert bundle.decision.status == "REJECT"
-    assert {"sharpe", "profit_factor", "trade_count"} <= set(bundle.decision.reasons)
+    with pytest.raises(ValueError, match="zero-trade|equity"):
+        write_validation_bundle(
+            tmp_path / "report",
+            _replace_trial_metric(report, "baseline", "baseline", rejected),
+        )
 
 
 def test_failed_fold_requires_incomplete_stitched_cell(tmp_path: Path) -> None:
@@ -313,6 +436,157 @@ def test_completed_fold_returns_must_compound_to_stitched_net_return(tmp_path: P
         )
 
 
+def test_zero_trade_folds_cannot_support_a_110_trade_stitched_ledger(tmp_path: Path) -> None:
+    report = _report()
+    rows = []
+    for row in report.fold_metrics:
+        if (row.trial_id, row.cost_id) == ("baseline", "baseline"):
+            metrics = replace(
+                row.metrics, trade_count=0, expectancy=0.0, win_rate=0.0,
+                average_win=0.0, average_loss=0.0,
+                profit_factor=0.0, average_win_loss_ratio=0.0,
+                mean_holding_bars=0.0,
+            )
+            row = replace(row, metrics=metrics)
+        rows.append(row)
+    with pytest.raises(ValueError, match="trade_count"):
+        write_validation_bundle(
+            tmp_path / "report", replace(report, fold_metrics=tuple(rows))
+        )
+
+
+@pytest.mark.parametrize("field", ("total_fees", "total_slippage"))
+def test_fold_cost_totals_must_sum_to_stitched_costs(tmp_path: Path, field: str) -> None:
+    report = _report()
+    row = next(
+        item for item in report.fold_metrics
+        if (item.fold_id, item.trial_id, item.cost_id)
+        == ("fold-000", "baseline", "baseline")
+    )
+    forged = replace(row, metrics=replace(
+        row.metrics, **{field: getattr(row.metrics, field) + 0.02}
+    ))
+    with pytest.raises(ValueError, match=field):
+        write_validation_bundle(
+            tmp_path / "report",
+            _replace_fold_metric(report, row.fold_id, row.trial_id, row.cost_id, forged),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("profit_factor", 99.0),
+        ("win_rate", 0.333),
+        ("expectancy", 9.0),
+        ("average_win_loss_ratio", 99.0),
+    ),
+)
+def test_each_fold_trade_metric_algebra_is_self_consistent(
+    tmp_path: Path, field: str, value: float
+) -> None:
+    report = _report()
+    row = report.fold_metrics[0]
+    forged = replace(row, metrics=replace(row.metrics, **{field: value}))
+    with pytest.raises(ValueError, match="trade|win|profit|expectancy"):
+        write_validation_bundle(
+            tmp_path / "report",
+            _replace_fold_metric(report, row.fold_id, row.trial_id, row.cost_id, forged),
+        )
+
+
+def test_zero_implied_losses_require_zero_average_loss_and_ratio(tmp_path: Path) -> None:
+    report = _report()
+    rebuilt_folds = []
+    wins_by_fold = {"fold-000": 20, "fold-001": 17, "fold-002": 17}
+    for row in report.fold_metrics:
+        if (row.trial_id, row.cost_id) == ("entry_40", "zero"):
+            wins = wins_by_fold[row.fold_id]
+            metrics = replace(
+                row.metrics,
+                expectancy=wins * 0.04 / row.metrics.trade_count,
+                average_loss=-0.02,
+                profit_factor=0.0,
+                average_win_loss_ratio=2.0,
+            )
+            row = replace(row, metrics=metrics)
+        rebuilt_folds.append(row)
+    stitched = next(
+        row for row in report.trial_metrics
+        if (row.trial_id, row.cost_id) == ("entry_40", "zero")
+    )
+    stitched = replace(
+        stitched,
+        metrics=replace(
+            stitched.metrics,
+            expectancy=54 * 0.04 / 110,
+            average_loss=0.0,
+            profit_factor=0.0,
+            average_win_loss_ratio=0.0,
+        ),
+    )
+    forged = _replace_trial_metric(
+        replace(report, fold_metrics=tuple(rebuilt_folds)),
+        "entry_40", "zero", stitched,
+    )
+    with pytest.raises(ValueError, match="zero losses|average_loss"):
+        write_validation_bundle(tmp_path / "report", forged)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "trade_count", "expectancy", "win_rate", "average_win",
+        "average_loss", "profit_factor", "average_win_loss_ratio",
+        "mean_holding_bars",
+    ),
+)
+def test_stitched_trade_statistics_are_reconstructed_from_folds(
+    tmp_path: Path, field: str
+) -> None:
+    report = _report()
+    stitched = next(
+        row for row in report.trial_metrics
+        if (row.trial_id, row.cost_id) == ("baseline", "baseline")
+    )
+    current = getattr(stitched.metrics, field)
+    forged_value = current + (1 if field == "trade_count" else 0.01)
+    forged = replace(stitched, metrics=replace(stitched.metrics, **{field: forged_value}))
+    with pytest.raises(
+        ValueError,
+        match="trade|win|loss|profit|expectancy|holding",
+    ):
+        write_validation_bundle(
+            tmp_path / "report",
+            _replace_trial_metric(report, "baseline", "baseline", forged),
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "annualized_return", "sharpe", "sortino", "max_drawdown_duration_bars",
+        "calmar",
+    ),
+)
+def test_baseline_path_statistics_are_recomputed_from_equity(
+    tmp_path: Path, field: str
+) -> None:
+    report = _report()
+    stitched = next(
+        row for row in report.trial_metrics
+        if (row.trial_id, row.cost_id) == ("baseline", "baseline")
+    )
+    current = getattr(stitched.metrics, field)
+    forged_value = current + (1 if field == "max_drawdown_duration_bars" else 0.01)
+    forged = replace(stitched, metrics=replace(stitched.metrics, **{field: forged_value}))
+    with pytest.raises(ValueError, match=field):
+        write_validation_bundle(
+            tmp_path / "report",
+            _replace_trial_metric(report, "baseline", "baseline", forged),
+        )
+
+
 @pytest.mark.parametrize("kind", ("wrong_key", "start_50", "final_mismatch", "drawdown_mismatch", "zero_recovery"))
 def test_oos_equity_must_be_the_canonical_reconciled_baseline_series(tmp_path: Path, kind: str) -> None:
     report = _report()
@@ -332,18 +606,44 @@ def test_oos_equity_must_be_the_canonical_reconciled_baseline_series(tmp_path: P
         write_validation_bundle(tmp_path / "report", replace(report, oos_equity=tuple(equity)))
 
 
-@pytest.mark.parametrize("kind", ("short_paths", "short_trials", "nonfinite", "missing_fold", "duplicate_fold"))
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "short_paths", "trial_permutation", "bad_path_id", "bad_groups",
+        "short_trials", "nonfinite", "missing_fold", "duplicate_fold",
+    ),
+)
 def test_raw_diagnostic_evidence_has_exact_finite_shapes_and_fold_coverage(tmp_path: Path, kind: str) -> None:
     report = _report()
     evidence = report.diagnostic_evidence
     if kind == "short_paths":
-        evidence = replace(evidence, pbo_in_sample_scores=evidence.pbo_in_sample_scores[:-1])
+        evidence = replace(evidence, paths=evidence.paths[:-1])
+    elif kind == "trial_permutation":
+        evidence = replace(evidence, trial_ids=tuple(reversed(evidence.trial_ids)))
+    elif kind == "bad_path_id":
+        evidence = replace(
+            evidence,
+            paths=(replace(evidence.paths[0], path_id="path-999"), *evidence.paths[1:]),
+        )
+    elif kind == "bad_groups":
+        evidence = replace(
+            evidence,
+            paths=(replace(evidence.paths[0], test_group_ids=(0, 2)), *evidence.paths[1:]),
+        )
     elif kind == "short_trials":
-        evidence = replace(evidence, pbo_out_of_sample_scores=tuple(
-            row[:-1] for row in evidence.pbo_out_of_sample_scores))
+        evidence = replace(
+            evidence,
+            paths=(
+                replace(evidence.paths[0], out_of_sample_scores=evidence.paths[0].out_of_sample_scores[:-1]),
+                *evidence.paths[1:],
+            ),
+        )
     elif kind == "nonfinite":
-        first = (float("nan"), *evidence.pbo_in_sample_scores[0][1:])
-        evidence = replace(evidence, pbo_in_sample_scores=(first, *evidence.pbo_in_sample_scores[1:]))
+        first = (float("nan"), *evidence.paths[0].in_sample_scores[1:])
+        evidence = replace(
+            evidence,
+            paths=(replace(evidence.paths[0], in_sample_scores=first), *evidence.paths[1:]),
+        )
     elif kind == "missing_fold":
         evidence = replace(evidence, train_fold_sharpes=evidence.train_fold_sharpes[:-1])
     else:
@@ -351,6 +651,129 @@ def test_raw_diagnostic_evidence_has_exact_finite_shapes_and_fold_coverage(tmp_p
             *evidence.train_fold_sharpes[:-1], evidence.train_fold_sharpes[0]))
     with pytest.raises(ValueError):
         write_validation_bundle(tmp_path / "report", replace(report, diagnostic_evidence=evidence))
+
+
+def _report_with_baseline_sensitivity_failure() -> ValidationReportInput:
+    report = _report()
+    error = "baseline-cost sensitivity failed"
+    fold = next(
+        row for row in report.fold_metrics
+        if (row.fold_id, row.trial_id, row.cost_id)
+        == ("fold-001", "ema_150", "baseline")
+    )
+    report = _replace_fold_metric(
+        report, fold.fold_id, fold.trial_id, fold.cost_id,
+        replace(fold, status="FAILED", error=error, metrics=None),
+    )
+    stitched = next(
+        row for row in report.trial_metrics
+        if (row.trial_id, row.cost_id) == ("ema_150", "baseline")
+    )
+    report = _replace_trial_metric(
+        report, stitched.trial_id, stitched.cost_id,
+        replace(stitched, status="INCOMPLETE", error=error, metrics=None),
+    )
+    return replace(
+        report,
+        run_failures=(
+            *report.run_failures,
+            RunFailureEvidence(
+                phase="OOS", fold_id="fold-001", trial_id="ema_150",
+                cost_id="baseline", error=error,
+            ),
+        ),
+        diagnostic_evidence=replace(
+            report.diagnostic_evidence,
+            status="INCOMPLETE", error="PBO unavailable: baseline trial failed",
+            paths=(),
+        ),
+    )
+
+
+def test_sensitivity_failure_publishes_structured_incomplete_diagnostics_without_fake_pbo(
+    tmp_path: Path,
+) -> None:
+    bundle = write_validation_bundle(
+        tmp_path / "report", _report_with_baseline_sensitivity_failure()
+    )
+    assert bundle.validation_inputs.pbo is None
+    assert bundle.validation_inputs.train_test_sharpe_ratio is None
+    assert bundle.decision.status == "REVIEW"
+    assert "pbo_unavailable" in bundle.decision.reasons
+    assert "train_test_sharpe_ratio_unavailable" in bundle.decision.reasons
+    summary = json.loads(bundle.summary_path.read_text(encoding="utf-8"))
+    assert summary["diagnostics"]["pbo"] is None
+    assert summary["diagnostic_evidence"]["status"] == "INCOMPLETE"
+    assert summary["diagnostic_evidence"]["paths"] == []
+    assert len(summary["run_failures"]) == 2
+    assert "Unavailable" in bundle.report_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "kind", ("missing_oos", "wrong_error", "unexplained_incomplete", "failure_with_complete")
+)
+def test_structured_failures_reconcile_with_fold_and_stitched_statuses(
+    tmp_path: Path, kind: str
+) -> None:
+    report = _report()
+    if kind == "missing_oos":
+        report = replace(report, run_failures=())
+    elif kind == "wrong_error":
+        report = replace(
+            report,
+            run_failures=(replace(report.run_failures[0], error="different"),),
+        )
+    elif kind == "unexplained_incomplete":
+        report = replace(
+            report,
+            run_failures=(),
+            fold_metrics=tuple(
+                replace(row, status="COMPLETED", error=None,
+                        metrics=_metrics(
+                            net_return=(1.0 + (TARGETS["stress_20bps"] - 0.01)) ** (1.0 / 3.0) - 1.0,
+                            gross_return=(1.0 + (TARGETS["stress_20bps"] + 0.01)) ** (1.0 / 3.0) - 1.0,
+                            cost_id="stress_20bps", trade_count=35, wins=17, losses=18,
+                            total_fees=0.01 / 3.0, total_slippage=0.02 / 3.0,
+                        ))
+                if (row.fold_id, row.trial_id, row.cost_id)
+                == ("fold-001", "ema_250", "stress_20bps") else row
+                for row in report.fold_metrics
+            ),
+        )
+    else:
+        report = replace(
+            report,
+            run_failures=(
+                *report.run_failures,
+                RunFailureEvidence(
+                    phase="TRAIN", fold_id="fold-000", trial_id="baseline",
+                    cost_id="baseline", error="train failed",
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="failure|FAILED|INCOMPLETE|COMPLETE"):
+        write_validation_bundle(tmp_path / "report", report)
+
+
+def test_diagnostic_status_must_follow_baseline_cost_trial_completeness(tmp_path: Path) -> None:
+    incomplete = _report_with_baseline_sensitivity_failure()
+    forged_complete = replace(
+        incomplete,
+        diagnostic_evidence=_diagnostics(),
+    )
+    with pytest.raises(ValueError, match="diagnostic"):
+        write_validation_bundle(tmp_path / "incomplete", forged_complete)
+
+    complete = _report()
+    forged_incomplete = replace(
+        complete,
+        diagnostic_evidence=replace(
+            complete.diagnostic_evidence,
+            status="INCOMPLETE", error="forged", paths=(),
+        ),
+    )
+    with pytest.raises(ValueError, match="diagnostic"):
+        write_validation_bundle(tmp_path / "complete", forged_incomplete)
 
 
 def test_numpy_scalars_serialize_as_strict_builtin_numbers(tmp_path: Path) -> None:

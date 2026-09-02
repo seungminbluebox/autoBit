@@ -19,10 +19,10 @@ class ValidationInputs:
     max_drawdown: float
     trade_count: int
     dsr: float
-    pbo: float
+    pbo: float | None
     positive_expectancy_fold_ratio: float
     max_fold_profit_share: float
-    train_test_sharpe_ratio: float
+    train_test_sharpe_ratio: float | None
     stress_survived: bool
 
     def __post_init__(self) -> None:
@@ -30,20 +30,29 @@ class ValidationInputs:
         if oos_net_return < -1.0:
             raise ValueError("oos_net_return must be at least -1")
         _require_finite_real(self.sharpe, "sharpe")
-        for name in ("profit_factor", "train_test_sharpe_ratio"):
+        for name in ("profit_factor",):
             value = _require_finite_real(getattr(self, name), name)
             if value < 0.0:
                 raise ValueError(f"{name} must be nonnegative")
+        if self.train_test_sharpe_ratio is not None:
+            value = _require_finite_real(
+                self.train_test_sharpe_ratio, "train_test_sharpe_ratio"
+            )
+            if value < 0.0:
+                raise ValueError("train_test_sharpe_ratio must be nonnegative")
         for name in (
             "max_drawdown",
             "dsr",
-            "pbo",
             "positive_expectancy_fold_ratio",
             "max_fold_profit_share",
         ):
             value = _require_finite_real(getattr(self, name), name)
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
+        if self.pbo is not None:
+            pbo = _require_finite_real(self.pbo, "pbo")
+            if not 0.0 <= pbo <= 1.0:
+                raise ValueError("pbo must be in [0, 1]")
         if isinstance(self.trade_count, bool) or not isinstance(self.trade_count, Integral):
             raise ValueError("trade_count must be a nonnegative integer")
         if self.trade_count < 0:
@@ -56,12 +65,16 @@ class ValidationInputs:
             "profit_factor",
             "max_drawdown",
             "dsr",
-            "pbo",
             "positive_expectancy_fold_ratio",
             "max_fold_profit_share",
-            "train_test_sharpe_ratio",
         ):
             object.__setattr__(self, name, float(getattr(self, name)))
+        if self.pbo is not None:
+            object.__setattr__(self, "pbo", float(self.pbo))
+        if self.train_test_sharpe_ratio is not None:
+            object.__setattr__(
+                self, "train_test_sharpe_ratio", float(self.train_test_sharpe_ratio)
+            )
         object.__setattr__(self, "trade_count", int(self.trade_count))
 
 
@@ -90,6 +103,16 @@ def classify_validation(values: ValidationInputs) -> ValidationDecision:
     if not isinstance(values, ValidationInputs):
         raise ValueError("values must be ValidationInputs")
 
+    pbo_failure = (
+        ("pbo_unavailable", True)
+        if values.pbo is None
+        else ("pbo", values.pbo >= 0.30)
+    )
+    ratio_failure = (
+        ("train_test_sharpe_ratio_unavailable", True)
+        if values.train_test_sharpe_ratio is None
+        else ("train_test_sharpe_ratio", values.train_test_sharpe_ratio >= 2.0)
+    )
     failures = (
         ("oos_net_return", values.oos_net_return < 0.0),
         ("sharpe", values.sharpe <= 1.0),
@@ -97,13 +120,13 @@ def classify_validation(values: ValidationInputs) -> ValidationDecision:
         ("max_drawdown", values.max_drawdown > 0.15),
         ("trade_count", values.trade_count < 100),
         ("dsr", values.dsr < 0.95),
-        ("pbo", values.pbo >= 0.30),
+        pbo_failure,
         (
             "positive_expectancy_fold_ratio",
             values.positive_expectancy_fold_ratio < 0.60,
         ),
         ("max_fold_profit_share", values.max_fold_profit_share >= 0.50),
-        ("train_test_sharpe_ratio", values.train_test_sharpe_ratio >= 2.0),
+        ratio_failure,
         ("stress_survived", not values.stress_survived),
     )
     reasons = tuple(name for name, failed in failures if failed)
@@ -113,7 +136,7 @@ def classify_validation(values: ValidationInputs) -> ValidationDecision:
         or values.profit_factor <= 1.0
         or values.max_drawdown > 0.15
         or values.dsr < 0.50
-        or values.pbo >= 0.50
+        or (values.pbo is not None and values.pbo >= 0.50)
     )
     if hard_reject:
         status: ValidationStatus = "REJECT"
