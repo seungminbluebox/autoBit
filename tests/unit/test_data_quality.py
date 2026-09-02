@@ -117,3 +117,82 @@ def test_single_gap_normalization_emits_no_pandas_future_warnings() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error", FutureWarning)
         canonicalize_ohlcv(raw, datetime(2026, 1, 2, tzinfo=timezone.utc))
+
+
+def test_off_grid_timestamp_is_rejected_without_rounding_or_dropping() -> None:
+    """An observed candle at 02:00 UTC is not a canonical four-hour candle."""
+    raw = make_frame(["2026-01-01T02:00:00Z"])
+
+    with pytest.raises(ValueError, match="4-hour boundary") as error:
+        canonicalize_ohlcv(raw, datetime(2026, 1, 2, tzinfo=timezone.utc))
+
+    assert "2026-01-01T02:00:00+00:00" in str(error.value)
+
+
+def test_consistently_shifted_series_is_rejected_with_all_off_grid_timestamps() -> None:
+    """A complete-looking 02:00/06:00 series must not establish a shifted cadence."""
+    raw = make_frame(["2026-01-01T02:00:00Z", "2026-01-01T06:00:00Z"])
+
+    with pytest.raises(ValueError, match="4-hour boundary") as error:
+        canonicalize_ohlcv(raw, datetime(2026, 1, 2, tzinfo=timezone.utc))
+
+    assert "2026-01-01T02:00:00+00:00" in str(error.value)
+    assert "2026-01-01T06:00:00+00:00" in str(error.value)
+
+
+def test_explicit_spike_threshold_controls_flags_count_and_entry_eligibility() -> None:
+    """Research can make an 11.9% range a spike by supplying a 10% threshold."""
+    raw = make_frame(["2026-01-01T00:00:00Z"])
+    raw.loc[:, "high"] = 111.0
+
+    result = canonicalize_ohlcv(
+        raw,
+        datetime(2026, 1, 2, tzinfo=timezone.utc),
+        spike_range_ratio=0.10,
+    )
+
+    assert bool(result.frame.iloc[0]["anomaly_spike"])
+    assert result.report.spike_flags == 1
+    assert not bool(result.frame.iloc[0]["entry_data_valid"])
+
+
+def test_flat_anomaly_is_counted_and_contaminates_the_following_row() -> None:
+    """An unfilled zero-range candle is an anomaly and blocks the next entry row."""
+    raw = make_frame(["2026-01-01T00:00:00Z", "2026-01-01T04:00:00Z"])
+    raw.iloc[0, raw.columns.get_indexer(["open", "high", "low", "close"])] = 101.0
+
+    result = canonicalize_ohlcv(
+        raw,
+        datetime(2026, 1, 2, tzinfo=timezone.utc),
+        spike_range_ratio=0.10,
+    )
+
+    assert bool(result.frame.iloc[0]["anomaly_flat"])
+    assert int(result.frame["anomaly_flat"].sum()) == 1
+    assert not bool(result.frame.iloc[0]["entry_data_valid"])
+    assert not bool(result.frame.iloc[1]["entry_data_valid"])
+
+
+def test_anomaly_invalidates_current_and_next_199_rows_but_not_200th_following_row() -> None:
+    """The inclusive 200-row window expires exactly after 199 clean followers."""
+    times = pd.date_range("2026-01-01T00:00:00Z", periods=202, freq="4h")
+    raw = make_frame([timestamp.isoformat() for timestamp in times])
+    raw.iloc[0, raw.columns.get_loc("high")] = 111.0
+
+    result = canonicalize_ohlcv(
+        raw,
+        datetime(2026, 2, 15, tzinfo=timezone.utc),
+        spike_range_ratio=0.10,
+    )
+
+    assert not bool(result.frame.iloc[199]["entry_data_valid"])
+    assert bool(result.frame.iloc[200]["entry_data_valid"])
+
+
+@pytest.mark.parametrize("threshold", [0.0, -0.1, float("inf"), float("nan")])
+def test_spike_threshold_must_be_positive_and_finite(threshold: float) -> None:
+    """Invalid thresholds cannot silently alter research eligibility."""
+    raw = make_frame(["2026-01-01T00:00:00Z"])
+
+    with pytest.raises(ValueError, match="spike_range_ratio"):
+        canonicalize_ohlcv(raw, datetime(2026, 1, 2, tzinfo=timezone.utc), spike_range_ratio=threshold)

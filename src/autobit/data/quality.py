@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 
 import pandas as pd
 
@@ -9,7 +10,7 @@ import pandas as pd
 _OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 _FREQUENCY = pd.Timedelta(hours=4)
 _ENTRY_LOOKBACK = 200
-_SPIKE_RANGE_RATIO = 0.50
+_DEFAULT_SPIKE_RANGE_RATIO = 0.50
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,11 +34,18 @@ class QualityResult:
     report: QualityReport
 
 
-def canonicalize_ohlcv(raw: pd.DataFrame, now_utc: datetime) -> QualityResult:
+def canonicalize_ohlcv(
+    raw: pd.DataFrame,
+    now_utc: datetime,
+    *,
+    spike_range_ratio: float = _DEFAULT_SPIKE_RANGE_RATIO,
+) -> QualityResult:
     """Return a time-ordered, UTC, completed-candle frame and its quality report."""
+    spike_range_ratio = _validate_spike_range_ratio(spike_range_ratio)
     frame = raw.copy()
     frame.columns = frame.columns.str.lower().str.strip()
     frame.index = _as_utc_index(frame.index)
+    _validate_four_hour_boundaries(frame.index)
     _require_ohlcv_schema(frame)
     frame = frame.loc[:, _OHLCV_COLUMNS].sort_index()
     frame = _deduplicate_or_raise(frame)
@@ -45,7 +53,7 @@ def canonicalize_ohlcv(raw: pd.DataFrame, now_utc: datetime) -> QualityResult:
     frame = _quarantine_invalid_values(frame)
     frame = _drop_unclosed_last_bar(frame, now_utc, _FREQUENCY)
     frame = _reindex_and_fill_single_gaps(frame, _FREQUENCY)
-    frame = _flag_spikes_and_flat_bars(frame)
+    frame = _flag_spikes_and_flat_bars(frame, spike_range_ratio)
     report = _build_quality_report(frame)
     return QualityResult(frame=frame, report=report)
 
@@ -55,6 +63,28 @@ def _as_utc_index(index: pd.Index) -> pd.DatetimeIndex:
     if timestamps.isna().any():
         raise ValueError("OHLCV index contains missing timestamps")
     return pd.DatetimeIndex(timestamps)
+
+
+def _validate_four_hour_boundaries(timestamps: pd.DatetimeIndex) -> None:
+    off_grid = timestamps[
+        (timestamps.hour % 4 != 0)
+        | (timestamps.minute != 0)
+        | (timestamps.second != 0)
+        | (timestamps.microsecond != 0)
+    ]
+    if len(off_grid):
+        rendered = ", ".join(timestamp.isoformat() for timestamp in off_grid.unique())
+        raise ValueError(f"OHLCV timestamps must align to a UTC 4-hour boundary: {rendered}")
+
+
+def _validate_spike_range_ratio(value: float) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("spike_range_ratio must be finite and greater than zero") from error
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError("spike_range_ratio must be finite and greater than zero")
+    return ratio
 
 
 def _require_ohlcv_schema(frame: pd.DataFrame) -> None:
@@ -176,11 +206,11 @@ def _reindex_and_fill_single_gaps(frame: pd.DataFrame, frequency: pd.Timedelta) 
     return result
 
 
-def _flag_spikes_and_flat_bars(frame: pd.DataFrame) -> pd.DataFrame:
+def _flag_spikes_and_flat_bars(frame: pd.DataFrame, spike_range_ratio: float) -> pd.DataFrame:
     result = frame.copy()
     tradable = result.loc[:, ["open", "high", "low", "close"]].notna().all(axis=1)
     price_range = result["high"] - result["low"]
-    result["anomaly_spike"] = tradable & ((price_range / result["close"]) > _SPIKE_RANGE_RATIO)
+    result["anomaly_spike"] = tradable & ((price_range / result["close"]) > spike_range_ratio)
     result["anomaly_flat"] = tradable & (price_range == 0) & ~result["is_filled"]
     result.attrs = frame.attrs.copy()
     return _set_entry_data_valid(result)
@@ -190,13 +220,13 @@ def _set_entry_data_valid(frame: pd.DataFrame) -> pd.DataFrame:
     result = frame.copy()
     unverified = result["anomaly_spike"] | result["anomaly_flat"]
     contamination = result["is_filled"] | result["is_quarantined"] | unverified
-    preceding_contamination = (
+    recent_contamination = (
         contamination.groupby(result["segment_id"], sort=False)
-        .transform(lambda rows: rows.shift(1, fill_value=False).rolling(_ENTRY_LOOKBACK, min_periods=1).max())
+        .transform(lambda rows: rows.rolling(_ENTRY_LOOKBACK, min_periods=1).max())
         .astype(bool)
     )
     valid_candle = result.loc[:, _OHLCV_COLUMNS].notna().all(axis=1)
-    result["entry_data_valid"] = valid_candle & ~contamination & ~preceding_contamination
+    result["entry_data_valid"] = valid_candle & ~recent_contamination
     return result
 
 
