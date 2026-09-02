@@ -1,0 +1,27 @@
+{
+  "fold_ids": [
+    "fold-000",
+    "fold-001"
+  ],
+  "trial_ids": [
+    "baseline",
+    "ema_150",
+    "ema_250",
+    "entry_40",
+    "entry_60",
+    "exit_15",
+    "exit_25",
+    "stop_2_0",
+    "stop_3_0"
+  ],
+  "cost_ids": [
+    "zero",
+    "baseline",
+    "stress_10bps",
+    "stress_20bps"
+  ],
+  "stitched_oos_row_count": 1085,
+  "dsr_8dp": 0.99856494,
+  "pbo_8dp": 0.28888889,
+  "decision": "INSUFFICIENT_STATISTICS"
+}

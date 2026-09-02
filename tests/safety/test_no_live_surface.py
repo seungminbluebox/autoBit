@@ -48,6 +48,7 @@ def test_cli_exposes_exactly_the_offline_public_commands() -> None:
         "data-download",
         "data-quality",
         "backtest",
+        "walk-forward",
     )
     help_text = parser.format_help().lower()
     for token in FORBIDDEN_HELP_TOKENS:
