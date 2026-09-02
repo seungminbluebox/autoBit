@@ -150,13 +150,19 @@ def core_backtest(request: BacktestRequest) -> BacktestResult:
         else "segment_id"
     )
     execution = request.frame.copy(deep=True)
-    execution["_force_flat_after_bar"] = False
+    execution["_gap_before_current_bar"] = False
+    timestamp_gap = execution.index.to_series().diff().gt(_CANDLE_FREQUENCY)
     if segment_column in execution:
-        following_segment = execution[segment_column].shift(-1)
-        execution["_force_flat_after_bar"] = (
-            following_segment.notna()
-            & execution[segment_column].ne(following_segment)
+        preceding_segment = execution[segment_column].shift(1)
+        execution["_gap_before_current_bar"] = (
+            timestamp_gap
+            | (
+                preceding_segment.notna()
+                & execution[segment_column].ne(preceding_segment)
+            )
         )
+    else:
+        execution["_gap_before_current_bar"] = timestamp_gap
     return run_backtest(execution, request.config)
 
 

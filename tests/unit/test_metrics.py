@@ -246,6 +246,28 @@ def test_buy_and_hold_enters_at_first_next_open_and_liquidates_last_close() -> N
         result.quantity = 1.0  # type: ignore[misc]
 
 
+def test_buy_and_hold_can_enter_at_the_first_observed_open() -> None:
+    index = pd.date_range("2026-01-01", periods=3, freq="4h", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "open": [100.0, 500.0, 900.0],
+            "close": [110.0, 700.0, 1_000.0],
+        },
+        index=index,
+    )
+
+    result = run_buy_and_hold(
+        frame,
+        CostConfig(fee_rate=0.0, slippage_rate=0.0),
+        enter_at_first_open=True,
+    )
+
+    assert result.entry_time == index[0].to_pydatetime()
+    assert result.entry_price == 100.0
+    assert result.exit_time == index[-1].to_pydatetime()
+    assert result.final_equity == pytest.approx(1_000.0)
+
+
 def test_buy_and_hold_with_no_next_open_returns_finite_cash_only_result() -> None:
     frame = pd.DataFrame(
         {"open": [100.0], "close": [105.0]},

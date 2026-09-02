@@ -1453,16 +1453,17 @@ def _segmented_risk_scenario(*, lose_before_gap: bool) -> tuple[pd.DataFrame, pd
         "previous_close": 99.0,
         "previous_entry_high": 99.0,
     }
-    boundary = (
-        {"open": 89.0, "high": 91.0, "low": 88.0, "close": 90.0}
+    boundary = {"open": 100.0, "high": 101.0, "low": 96.0, "close": 100.0}
+    post_gap_record = (
+        {**signal, "open": 89.0, "high": 101.0, "low": 88.0, "close": 100.0}
         if lose_before_gap
-        else {"open": 100.0, "high": 101.0, "low": 96.0, "close": 100.0}
+        else {}
     )
     records = [
         {**defaults, **signal},
         {**defaults, "open": 100.0, "high": 101.0, "low": 96.0, "close": 100.0},
         {**defaults, **boundary},
-        {**defaults, **(signal if lose_before_gap else {})},
+        {**defaults, **post_gap_record},
         {**defaults, "open": 100.0, "high": 101.0, "low": 96.0, "close": 100.0},
     ]
     full_index = pd.date_range(start, periods=7, freq="4h", tz="UTC")
@@ -1478,7 +1479,7 @@ def _segmented_risk_scenario(*, lose_before_gap: bool) -> tuple[pd.DataFrame, pd
 
 def test_gap_preserves_daily_loss_cooldown_but_a_fresh_fold_resets_it() -> None:
     """Only a new phase may clear account-level breaker memory after a loss."""
-    frame, gap_boundary, post_gap = _segmented_risk_scenario(lose_before_gap=True)
+    frame, _, post_gap = _segmented_risk_scenario(lose_before_gap=True)
     config = BacktestConfig(
         costs=CostConfig(fee_rate=0.0, slippage_rate=0.0),
         force_liquidate_at_end=True,
@@ -1495,7 +1496,7 @@ def test_gap_preserves_daily_loss_cooldown_but_a_fresh_fold_resets_it() -> None:
 
     carried_equity = next(
         point.equity for point in result.equity_curve
-        if point.timestamp == gap_boundary.to_pydatetime()
+        if point.timestamp == post_gap.to_pydatetime()
     )
     fresh = run_backtest(
         frame.loc[post_gap:].copy(deep=True),
@@ -1505,6 +1506,85 @@ def test_gap_preserves_daily_loss_cooldown_but_a_fresh_fold_resets_it() -> None:
         order.side == "BUY" and order.status == OrderStatus.COMPLETED
         for order in fresh.orders
     )
+
+
+def test_future_gap_does_not_change_the_pre_gap_execution_prefix() -> None:
+    """The same observed prefix must not react to a discontinuity not yet seen."""
+    gapped, boundary, post_gap = _segmented_risk_scenario(lose_before_gap=False)
+    bridge_index = pd.date_range(
+        boundary + pd.Timedelta(hours=4),
+        post_gap - pd.Timedelta(hours=4),
+        freq="4h",
+        tz="UTC",
+    )
+    bridge = pd.DataFrame(
+        [gapped.loc[boundary].to_dict()] * len(bridge_index),
+        index=bridge_index,
+    )
+    uninterrupted = pd.concat([gapped, bridge]).sort_index()
+    uninterrupted["_execution_segment_id"] = 0
+    config = BacktestConfig(
+        costs=CostConfig(fee_rate=0.0, slippage_rate=0.0),
+        force_liquidate_at_end=True,
+    )
+
+    gapped_result = core_backtest(_real_core_request(gapped, config))
+    uninterrupted_result = core_backtest(_real_core_request(uninterrupted, config))
+    boundary_time = boundary.to_pydatetime()
+
+    assert tuple(
+        order for order in gapped_result.orders if order.occurred_at <= boundary_time
+    ) == tuple(
+        order
+        for order in uninterrupted_result.orders
+        if order.occurred_at <= boundary_time
+    )
+    assert tuple(
+        trade for trade in gapped_result.trades if trade.exit_time <= boundary_time
+    ) == tuple(
+        trade
+        for trade in uninterrupted_result.trades
+        if trade.exit_time <= boundary_time
+    )
+    assert tuple(
+        point for point in gapped_result.equity_curve if point.timestamp <= boundary_time
+    ) == tuple(
+        point
+        for point in uninterrupted_result.equity_curve
+        if point.timestamp <= boundary_time
+    )
+
+
+def test_gap_cancels_a_partial_configured_pending_entry_before_open_matching() -> None:
+    """A market entry waiting across a gap cannot partially fill at the new open."""
+    frame, _, post_gap = _segmented_risk_scenario(lose_before_gap=False)
+    signal_time = post_gap - pd.Timedelta(hours=20)
+    frame = frame.loc[(frame.index <= signal_time) | (frame.index >= post_gap)].copy()
+    frame["_execution_segment_id"] = 0
+    frame.loc[post_gap:, "_execution_segment_id"] = 1
+
+    result = core_backtest(
+        _real_core_request(
+            frame,
+            BacktestConfig(
+                costs=CostConfig(fee_rate=0.0, slippage_rate=0.0),
+                entry_fill_fraction=0.5,
+                force_liquidate_at_end=True,
+            ),
+        )
+    )
+
+    entry_events = [order for order in result.orders if order.side == "BUY"]
+    assert [event.status for event in entry_events] == [
+        OrderStatus.CREATED,
+        OrderStatus.SUBMITTED,
+        OrderStatus.CANCELED,
+    ]
+    assert entry_events[-1].reason == "DATA_GAP"
+    assert entry_events[-1].occurred_at == post_gap.to_pydatetime()
+    assert all(event.filled_quantity == 0.0 for event in entry_events)
+    assert not result.trades
+    assert not any(order.reason == "FORCED_GAP" for order in result.orders)
 
 
 def test_gap_invalid_bar_preserves_volatility_halt_and_unstable_ratio_resets_recovery() -> None:
@@ -1579,9 +1659,10 @@ def test_gap_invalid_bar_preserves_volatility_halt_and_unstable_ratio_resets_rec
     assert entries[0].signal_time == observed_index[7].to_pydatetime()
 
 
-def test_gap_force_flat_has_native_costed_ledger_and_cancels_the_stop() -> None:
-    """A live position and stop terminate at the last observed close, never after a gap."""
-    frame, gap_boundary, _ = _segmented_risk_scenario(lose_before_gap=False)
+def test_gap_liquidates_at_severe_post_gap_open_before_the_stop_can_match() -> None:
+    """The broker hook cancels stale stops before realizing the full opening jump."""
+    frame, gap_boundary, post_gap = _segmented_risk_scenario(lose_before_gap=False)
+    frame.loc[post_gap, ["open", "high", "low", "close"]] = [50.0, 52.0, 49.0, 51.0]
     config = BacktestConfig(
         costs=CostConfig(fee_rate=0.001, slippage_rate=0.002),
         force_liquidate_at_end=True,
@@ -1601,14 +1682,14 @@ def test_gap_force_flat_has_native_costed_ledger_and_cancels_the_stop() -> None:
         OrderStatus.COMPLETED,
     ]
     forced_fill = forced_orders[-1]
-    assert forced_fill.fill_time == gap_boundary.to_pydatetime()
-    assert forced_fill.fill_price == pytest.approx(float(frame.loc[gap_boundary, "close"]) * 0.998)
+    assert forced_fill.fill_time == post_gap.to_pydatetime()
+    assert forced_fill.fill_price == pytest.approx(float(frame.loc[post_gap, "open"]) * 0.998)
     assert forced_fill.fee == pytest.approx(
         forced_fill.filled_quantity * float(forced_fill.fill_price) * 0.001
     )
     assert forced_fill.slippage == pytest.approx(
         forced_fill.filled_quantity
-        * (float(frame.loc[gap_boundary, "close"]) - float(forced_fill.fill_price))
+        * (float(frame.loc[post_gap, "open"]) - float(forced_fill.fill_price))
     )
     assert trade.exit_time == forced_fill.fill_time
     assert trade.exit_price == pytest.approx(forced_fill.fill_price)
@@ -1625,7 +1706,20 @@ def test_gap_force_flat_has_native_costed_ledger_and_cancels_the_stop() -> None:
     ]
     assert canceled_stops
     assert all(order.reason == "DATA_GAP" for order in canceled_stops)
-    assert all(order.occurred_at <= gap_boundary.to_pydatetime() for order in canceled_stops)
+    assert all(order.occurred_at == post_gap.to_pydatetime() for order in canceled_stops)
+    assert not any(
+        order.reason in {"HARD_STOP", "TRAILING_STOP"}
+        and order.status == OrderStatus.COMPLETED
+        and order.fill_time == post_gap.to_pydatetime()
+        for order in result.orders
+    )
+    assert trade.net_pnl < -15.0
+    assert not any(
+        order.side == "SELL"
+        and order.status == OrderStatus.COMPLETED
+        and order.fill_time == gap_boundary.to_pydatetime()
+        for order in result.orders
+    )
     assert result.total_fees == pytest.approx(trade.fees)
     assert result.total_slippage == pytest.approx(
         sum(
@@ -1636,8 +1730,56 @@ def test_gap_force_flat_has_native_costed_ledger_and_cancels_the_stop() -> None:
     )
 
 
+def test_gap_cancels_reissued_partial_exit_before_forced_open_liquidation() -> None:
+    """A partial exit remainder cannot trade before the gap liquidation hook."""
+    frame = _fixture("partial_exit.csv")
+    post_gap = pd.Timestamp("2025-01-05T16:00:00Z")
+    frame["_execution_segment_id"] = 0
+    frame.loc[post_gap:, "_execution_segment_id"] = 1
+    result = core_backtest(
+        _real_core_request(
+            frame,
+            BacktestConfig(
+                costs=CostConfig(fee_rate=0.0, slippage_rate=0.0),
+                exit_fill_fraction=0.5,
+                force_liquidate_at_end=True,
+            ),
+        )
+    )
+
+    close_exit_events = [
+        order for order in result.orders if order.reason == "CLOSE_EXIT"
+    ]
+    reissued_id = next(
+        order.order_id
+        for order in reversed(close_exit_events)
+        if order.status == OrderStatus.CREATED
+    )
+    reissued_events = [
+        order for order in result.orders if order.order_id == reissued_id
+    ]
+    assert [event.status for event in reissued_events] == [
+        OrderStatus.CREATED,
+        OrderStatus.SUBMITTED,
+        OrderStatus.CANCELED,
+    ]
+    assert reissued_events[-1].reason == "DATA_GAP"
+    assert reissued_events[-1].occurred_at == post_gap.to_pydatetime()
+    assert all(event.filled_quantity == 0.0 for event in reissued_events)
+    forced = next(
+        order
+        for order in result.orders
+        if order.reason == "FORCED_GAP" and order.status == OrderStatus.COMPLETED
+    )
+    assert forced.fill_time == post_gap.to_pydatetime()
+    assert forced.fill_price == float(frame.loc[post_gap, "open"])
+    trade, = result.trades
+    assert trade.exit_time == post_gap.to_pydatetime()
+    assert trade.exit_reason == "FORCED_GAP"
+
+
 def test_real_core_completes_canonical_gap_and_quarantine_segments_flat() -> None:
-    """The production engine closes before every unavailable-price region."""
+    """The production engine never carries a trade across unavailable regions."""
     raw = _frame(1_250).loc[:, ["open", "high", "low", "close", "volume"]]
     gap_times = tuple(raw.index[620:622])
     quarantine_time = raw.index[900]
@@ -1672,22 +1814,6 @@ def test_real_core_completes_canonical_gap_and_quarantine_segments_flat() -> Non
     assert not unavailable_datetimes.intersection(
         point.timestamp for point in completed.result.equity_curve
     )
-    for unavailable_time in (gap_times[-1], quarantine_time):
-        before = max(
-            (
-                point for point in completed.result.equity_curve
-                if point.timestamp < unavailable_time.to_pydatetime()
-            ),
-            key=lambda point: point.timestamp,
-        )
-        after = min(
-            (
-                point for point in completed.result.equity_curve
-                if point.timestamp > unavailable_time.to_pydatetime()
-            ),
-            key=lambda point: point.timestamp,
-        )
-        assert after.equity == pytest.approx(before.equity)
     assert all(
         not (
             trade.entry_time < unavailable.to_pydatetime() < trade.exit_time

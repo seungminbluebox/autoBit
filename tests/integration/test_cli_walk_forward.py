@@ -9,7 +9,7 @@ from autobit.cli import (
     _apply_walk_forward_end,
     _preflight_validation_output,
     _read_walk_forward_csv,
-    _segmented_benchmark,
+    _continuous_benchmark,
     build_parser,
     main,
 )
@@ -135,7 +135,7 @@ def test_cli_reads_actual_canonical_long_gap_and_quarantine_rows(
     assert pd.isna(loaded.loc[index[12], "close"])
 
 
-def test_segmented_benchmark_never_marks_across_missing_price_regions() -> None:
+def test_walk_forward_benchmark_holds_through_missing_price_regions() -> None:
     index = pd.date_range("2025-01-01", periods=6, freq="4h", tz="UTC")
     frame = pd.DataFrame(
         {
@@ -148,12 +148,34 @@ def test_segmented_benchmark_never_marks_across_missing_price_regions() -> None:
         index=index,
     )
 
-    net_return, max_drawdown = _segmented_benchmark(
+    net_return, max_drawdown = _continuous_benchmark(
         frame, CostScenario("zero", 0.0, 0.0)
     )
 
-    assert net_return == pytest.approx(-0.01)
+    assert net_return == pytest.approx(8.0)
     assert max_drawdown == pytest.approx(0.10)
+
+
+def test_walk_forward_benchmark_does_not_retrade_because_of_a_future_gap() -> None:
+    index = pd.date_range("2025-01-01", periods=6, freq="4h", tz="UTC")
+    complete = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1.0,
+        },
+        index=index,
+    )
+    future_gap = complete.copy(deep=True)
+    future_gap.loc[index[3], ["open", "high", "low", "close", "volume"]] = float("nan")
+    cost = CostScenario("baseline", 0.001, 0.002)
+
+    uninterrupted = _continuous_benchmark(complete, cost)
+    gapped = _continuous_benchmark(future_gap, cost)
+
+    assert gapped == pytest.approx(uninterrupted)
 
 
 def test_walk_forward_has_no_private_execution_arguments() -> None:

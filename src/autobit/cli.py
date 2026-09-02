@@ -533,7 +533,7 @@ def _benchmark_rows(
     ].copy(deep=True)
     rows: list[BenchmarkComparisonRow] = []
     for cost in registered_cost_scenarios():
-        benchmark_return, benchmark_drawdown = _segmented_benchmark(oos, cost)
+        benchmark_return, benchmark_drawdown = _continuous_benchmark(oos, cost)
         strategy = trial_snapshots[("baseline", cost.cost_id)]
         rows.append(
             BenchmarkComparisonRow(
@@ -547,23 +547,22 @@ def _benchmark_rows(
     return tuple(rows)
 
 
-def _segmented_benchmark(
+def _continuous_benchmark(
     frame: pd.DataFrame, cost: CostScenario
 ) -> tuple[float, float]:
+    """Hold one position across every unavailable region without retrading."""
     available = frame.loc[:, ("open", "high", "low", "close", "volume")].notna().all(axis=1)
-    run_ids = (~available).cumsum()
-    capital = 100.0
-    combined: list[float] = []
-    costs = CostConfig(fee_rate=cost.fee_rate, slippage_rate=cost.slippage_rate)
-    for _, segment in frame.loc[available].groupby(run_ids.loc[available], sort=False):
-        benchmark = run_buy_and_hold(segment, costs)
-        normalized = _benchmark_equity(segment, benchmark, cost)
-        scaled = tuple(capital * value / 100.0 for value in normalized)
-        combined.extend(scaled)
-        capital = scaled[-1]
-    if not combined:
+    observed = frame.loc[available].copy(deep=True)
+    if observed.empty:
         return 0.0, 0.0
-    return capital / 100.0 - 1.0, _maximum_drawdown(tuple(combined))
+    costs = CostConfig(fee_rate=cost.fee_rate, slippage_rate=cost.slippage_rate)
+    benchmark = run_buy_and_hold(
+        observed,
+        costs,
+        enter_at_first_open=True,
+    )
+    equity = _benchmark_equity(observed, benchmark, cost)
+    return equity[-1] / 100.0 - 1.0, _maximum_drawdown(equity)
 
 
 def _benchmark_equity(

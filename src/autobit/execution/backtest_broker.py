@@ -59,11 +59,16 @@ class EventBacktestBroker(bt.brokers.BackBroker):
     def __init__(self) -> None:
         super().__init__()
         self._pre_submit_hook = None
+        self._pre_match_hook = None
         self._same_bar_order_hook = None
 
     def set_pre_submit_hook(self, hook) -> None:
         """Register the strategy callback that observes native Created orders."""
         self._pre_submit_hook = hook
+
+    def set_pre_match_hook(self, hook) -> None:
+        """Run a data-boundary callback before submitted or pending orders match."""
+        self._pre_match_hook = hook
 
     def set_same_bar_order_hook(self, hook) -> None:
         """Register synchronous delivery for conservative same-bar execution."""
@@ -72,6 +77,11 @@ class EventBacktestBroker(bt.brokers.BackBroker):
     def submit(self, order, check=True):
         self._notify_pre_submit(order)
         return super().submit(order, check=check)
+
+    def next(self) -> None:
+        if self._pre_match_hook is not None:
+            self._pre_match_hook()
+        super().next()
 
     def cancel_end_of_data(
         self,
@@ -127,8 +137,8 @@ class EventBacktestBroker(bt.brokers.BackBroker):
         self._get_value()
         return order.status in (order.Partial, order.Completed)
 
-    def settle_terminal_market_order(self, order: bt.Order, price: float) -> bool:
-        """Natively execute one final market exit at a supplied terminal close price."""
+    def settle_immediate_market_order(self, order: bt.Order, price: float) -> bool:
+        """Natively execute one market exit before the normal broker match cycle."""
         if order.exectype != bt.Order.Market or not order.alive():
             return False
         try:

@@ -30,19 +30,24 @@ class BuyAndHoldResult:
 def run_buy_and_hold(
     frame: pd.DataFrame,
     costs: CostConfig = CostConfig(),
+    *,
+    enter_at_first_open: bool = False,
 ) -> BuyAndHoldResult:
-    """Invest 100 at the first tradable next open and sell at the last close."""
+    """Invest 100 at the selected first/next tradable open and sell the last close."""
     fee_rate = _cost_rate(costs.fee_rate)
     slippage_rate = _cost_rate(costs.slippage_rate)
     if not {"open", "close"}.issubset(frame.columns):
         raise ValueError("benchmark frame requires open and close columns")
-    if len(frame) < 2:
+    if not isinstance(enter_at_first_open, bool):
+        raise ValueError("enter_at_first_open must be a strict boolean")
+    entry_start = 0 if enter_at_first_open else 1
+    if len(frame) <= entry_start:
         return BuyAndHoldResult()
 
     entry_position = next(
         (
             position
-            for position in range(1, len(frame))
+            for position in range(entry_start, len(frame))
             if _tradable_price(frame.iloc[position]["open"])
         ),
         None,

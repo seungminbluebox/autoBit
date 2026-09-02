@@ -113,7 +113,7 @@ class EnrichedPandasData(bt.feeds.PandasData):
         "atr_value",
         "exit_low",
         "baseline_atr_pct",
-        "force_flat_after_bar",
+        "gap_before_current_bar",
     )
     params = (
         ("warmup_complete", "_warmup_complete"),
@@ -125,7 +125,7 @@ class EnrichedPandasData(bt.feeds.PandasData):
         ("atr_value", "_atr_value"),
         ("exit_low", "exit_low"),
         ("baseline_atr_pct", "baseline_atr_pct"),
-        ("force_flat_after_bar", "_force_flat_after_bar"),
+        ("gap_before_current_bar", "_gap_before_current_bar"),
     )
 
 
@@ -172,17 +172,22 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self._profitable_trades_since_streak_halt = 0
         self._volatility_halted = False
         self._volatility_stable_bars = 0
+        self._gap_handled_current_bar = False
         self._terminal_final_equity: float | None = None
         self.broker.set_pre_submit_hook(self._on_order_created)
+        self.broker.set_pre_match_hook(self._handle_gap_before_current_bar)
         self.broker.set_same_bar_order_hook(self.notify_order)
 
     def next(self) -> None:
         now = self._now()
         equity = float(self.broker.getvalue())
-        self.equity_points.append(EquityPoint(now, equity))
-        if bool(self.data.force_flat_after_bar[0]):
-            self._force_flat_for_gap()
-            self._evaluate_current_risk(now, float(self.broker.getvalue()))
+        if self.equity_points and self.equity_points[-1].timestamp == now:
+            self.equity_points[-1] = EquityPoint(now, equity)
+        else:
+            self.equity_points.append(EquityPoint(now, equity))
+        if self._gap_handled_current_bar:
+            self._gap_handled_current_bar = False
+            self._evaluate_current_risk(now, equity)
             return
         risk_decision = self._evaluate_current_risk(now, equity)
 
@@ -317,8 +322,11 @@ class _DonchianBacktestStrategy(bt.Strategy):
         """Close remaining inventory at the final observed close for isolated runs."""
         self._liquidate_at_observed_close("FORCED_END", terminal=True)
 
-    def _force_flat_for_gap(self) -> None:
-        """End broker/position state while retaining this phase's risk memory."""
+    def _handle_gap_before_current_bar(self) -> None:
+        """Flatten at a newly observed segment before the broker can match orders."""
+        if not bool(self.data.gap_before_current_bar[0]):
+            return
+        self._gap_handled_current_bar = True
         for order in tuple(self._tracked_orders.values()):
             self._record_native_status(order)
             if order.alive():
@@ -330,24 +338,47 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self._entry_partial_pending = False
         self._exit_partial_pending = False
         if self.position.size > 0.0:
-            self._liquidate_at_observed_close("FORCED_GAP", terminal=False)
+            self._liquidate_at_current_open("FORCED_GAP")
+        else:
+            self._entry_fill_bits.clear()
+            self._exit_fill_bits.clear()
         self._reset_position_tracking()
         if abs(float(self.position.size)) > 1e-12 or self.broker.get_orders_open():
             raise RuntimeError("data-gap boundary left open broker state")
 
     def _liquidate_at_observed_close(self, reason: str, *, terminal: bool) -> None:
         """Close inventory natively at the current observed close."""
+        self._liquidate_at_reference(
+            reason,
+            reference_price=float(self.data.close[0]),
+            terminal=terminal,
+        )
+
+    def _liquidate_at_current_open(self, reason: str) -> None:
+        """Close inventory natively at the newly observed post-gap open."""
+        self._liquidate_at_reference(
+            reason,
+            reference_price=float(self.data.open[0]),
+            terminal=False,
+        )
+
+    def _liquidate_at_reference(
+        self,
+        reason: str,
+        *,
+        reference_price: float,
+        terminal: bool,
+    ) -> None:
         quantity = float(self.position.size)
-        reference_close = float(self.data.close[0])
         if (
             not math.isfinite(quantity)
             or quantity <= 0.0
-            or not math.isfinite(reference_close)
-            or reference_close <= 0.0
+            or not math.isfinite(reference_price)
+            or reference_price <= 0.0
         ):
             return
         now = self._now()
-        fill_price = reference_close * (1.0 - float(self.adapter_config.costs.slippage_rate))
+        fill_price = reference_price * (1.0 - float(self.adapter_config.costs.slippage_rate))
         if not math.isfinite(fill_price):
             raise ValueError("terminal liquidation values must be finite")
         if fill_price <= 0.0:
@@ -357,9 +388,9 @@ class _DonchianBacktestStrategy(bt.Strategy):
             signal_time=now.isoformat(),
             reason=reason,
             fill_fraction=1.0,
-            terminal_reference_price=reference_close,
+            terminal_reference_price=reference_price,
         )
-        if self.exit_order is None or not self.broker.settle_terminal_market_order(
+        if self.exit_order is None or not self.broker.settle_immediate_market_order(
             self.exit_order, fill_price
         ):
             raise RuntimeError("terminal liquidation could not settle natively")
@@ -898,9 +929,9 @@ def _prepare_frame(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     prepared["_entry_data_valid"] = prepared["entry_data_valid"]
     prepared["_ema_value"] = prepared[f"ema_{config.ema_period}"]
     prepared["_atr_value"] = prepared[f"atr_{config.atr_period}"]
-    prepared["_force_flat_after_bar"] = (
-        prepared["_force_flat_after_bar"]
-        if "_force_flat_after_bar" in prepared
+    prepared["_gap_before_current_bar"] = (
+        prepared["_gap_before_current_bar"]
+        if "_gap_before_current_bar" in prepared
         else False
     )
     return prepared
