@@ -1183,6 +1183,99 @@ def _quality_topology_frame() -> pd.DataFrame:
     return _frame(12)
 
 
+def _set_filled_quality_row(frame: pd.DataFrame, position: int) -> pd.Timestamp:
+    timestamp = frame.index[position]
+    prior_close = (
+        float(frame.iloc[:position]["close"].dropna().iloc[-1])
+        if position
+        else float(frame.iloc[0]["close"])
+    )
+    frame.loc[timestamp, ["open", "high", "low", "close", "volume"]] = [
+        prior_close,
+        prior_close,
+        prior_close,
+        prior_close,
+        0.0,
+    ]
+    frame.loc[timestamp, "is_filled"] = True
+    frame.loc[timestamp, "is_quarantined"] = False
+    frame.loc[timestamp, "anomaly_spike"] = False
+    frame.loc[timestamp, "anomaly_flat"] = False
+    return timestamp
+
+
+def test_real_canonical_single_gap_accepts_one_observed_bounded_fill() -> None:
+    raw = _frame(20).loc[:, ["open", "high", "low", "close", "volume"]]
+    missing_time = raw.index[5]
+    predecessor = raw.index[4]
+    successor = raw.index[6]
+    prior_close = float(raw.loc[predecessor, "close"])
+    canonical = canonicalize_ohlcv(
+        raw.drop(index=missing_time),
+        (raw.index[-1] + timedelta(hours=8)).to_pydatetime(),
+    ).frame
+
+    validated = validate_walk_forward_frame(canonical)
+
+    assert validated.index[validated["is_filled"]].equals(pd.DatetimeIndex([missing_time]))
+    assert validated.loc[missing_time, ["open", "high", "low", "close"]].eq(prior_close).all()
+    assert float(validated.loc[missing_time, "volume"]) == 0.0
+    assert not bool(validated.loc[missing_time, "entry_data_valid"])
+    assert not bool(validated.loc[successor, "entry_data_valid"])
+    assert validated.loc[[predecessor, missing_time, successor], "segment_id"].tolist() == [0, 0, 0]
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "filled_predecessor_of_long_gap",
+        "filled_successor_of_long_gap",
+        "consecutive_filled",
+        "leading_filled",
+        "trailing_filled",
+        "segment_transition_through_filled",
+        "filled_anomaly_flag",
+    ),
+)
+def test_filled_topology_rejects_noncanonical_synthetic_rows(malformation: str) -> None:
+    frame = _quality_topology_frame()
+    if malformation in {
+        "filled_predecessor_of_long_gap",
+        "filled_successor_of_long_gap",
+    }:
+        gap_index = frame.index[5:7]
+        frame.loc[gap_index, ["open", "high", "low", "close", "volume"]] = math.nan
+        frame.loc[gap_index, "entry_data_valid"] = False
+        frame.loc[frame.index[7]:, "segment_id"] = 1
+        fill_position = 4 if malformation.startswith("filled_predecessor") else 7
+        filled_time = _set_filled_quality_row(frame, fill_position)
+        if fill_position == 4:
+            frame.loc[filled_time, "entry_data_valid"] = False
+        else:
+            frame.loc[filled_time:, "entry_data_valid"] = False
+    elif malformation == "consecutive_filled":
+        _set_filled_quality_row(frame, 4)
+        _set_filled_quality_row(frame, 5)
+        frame.loc[frame.index[4]:, "entry_data_valid"] = False
+    elif malformation == "leading_filled":
+        _set_filled_quality_row(frame, 0)
+        frame.loc[:, "entry_data_valid"] = False
+    elif malformation == "trailing_filled":
+        filled_time = _set_filled_quality_row(frame, len(frame) - 1)
+        frame.loc[filled_time, "entry_data_valid"] = False
+    elif malformation == "segment_transition_through_filled":
+        filled_time = _set_filled_quality_row(frame, 5)
+        frame.loc[filled_time, "entry_data_valid"] = False
+        frame.loc[frame.index[6]:, "segment_id"] = 1
+    else:
+        filled_time = _set_filled_quality_row(frame, 5)
+        frame.loc[filled_time:, "entry_data_valid"] = False
+        frame.loc[filled_time, "anomaly_flat"] = True
+
+    with pytest.raises(ValueError, match="filled"):
+        validate_walk_forward_frame(frame)
+
+
 @pytest.mark.parametrize(
     "malformation",
     (

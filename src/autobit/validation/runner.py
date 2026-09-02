@@ -446,8 +446,12 @@ def _validate_quality_surface(
     spike = flags["anomaly_spike"]
     flat = flags["anomaly_flat"]
     entry_valid = flags["entry_data_valid"]
-    if (filled & quarantined).any() or (spike & flat).any():
-        raise ValueError("quality flags contain an impossible combination")
+    if (
+        (filled & quarantined).any()
+        or (filled & (spike | flat)).any()
+        or (spike & flat).any()
+    ):
+        raise ValueError("quality flags contain an impossible filled/anomaly combination")
     if (unavailable & (filled | spike | flat)).any():
         raise ValueError("unavailable rows cannot be filled or anomalous candles")
     if (available & quarantined).any():
@@ -467,11 +471,27 @@ def _validate_quality_surface(
     ):
         raise ValueError("filled quality rows must be flat zero-volume candles")
 
-    # Plan 1 clears OHLCV for a raw candle it quarantines, but the true flag
-    # still proves that its timestamp was observed.  Only an unquarantined
-    # unavailable row is synthetic reindex evidence belonging to a long gap.
+    # Plan 1 fills only isolated singleton gaps whose immediate neighbours are
+    # genuinely observed timestamps.  A quarantined raw candle still counts as
+    # observed; a filled candle and an unquarantined unavailable row are both
+    # synthetic and cannot serve as a boundary.
+    observed = quarantined | (available & ~filled)
+    for position in (offset for offset, value in enumerate(filled) if bool(value)):
+        if position == 0 or position == len(frame) - 1:
+            raise ValueError("filled quality row must be an interior singleton")
+        if bool(filled.iloc[position - 1]) or bool(filled.iloc[position + 1]):
+            raise ValueError("filled quality rows must be isolated singletons")
+        if not bool(observed.iloc[position - 1]) or not bool(observed.iloc[position + 1]):
+            raise ValueError("filled quality row must be bounded by observed nonfilled rows")
+        if not (
+            segment_values[position - 1]
+            == segment_values[position]
+            == segment_values[position + 1]
+        ):
+            raise ValueError("filled quality row must preserve its surrounding segment")
+
+    # Only an unquarantined unavailable row is synthetic long-gap evidence.
     long_gap = unavailable & ~quarantined
-    observed = available | quarantined
     if segment_values[0] != 0:
         raise ValueError("quality segment_id must start at zero")
     current_segment = 0
