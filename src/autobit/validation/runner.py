@@ -9,9 +9,16 @@ from typing import Literal
 import pandas as pd
 
 from autobit.backtest.analyzers import PerformanceMetrics, calculate_metrics
-from autobit.backtest.engine import BacktestConfig, BacktestResult, EquityPoint, TradeRecord, run_backtest
+from autobit.backtest.engine import (
+    BacktestConfig,
+    BacktestResult,
+    EquityPoint,
+    OrderRecord,
+    TradeRecord,
+    run_backtest,
+)
 from autobit.config import CostConfig, StrategyConfig
-from autobit.domain.models import PositionState
+from autobit.domain.models import OrderStatus, PositionState
 from autobit.indicators.trend import compute_trend_indicators
 from autobit.validation.models import (
     CostScenario,
@@ -21,7 +28,9 @@ from autobit.validation.models import (
     TrialConfig,
     WalkForwardResult,
     WalkForwardRun,
+    WalkForwardConfig,
 )
+from autobit.validation.splits import build_rolling_folds
 from autobit.validation.trials import registered_cost_scenarios, registered_trials
 
 
@@ -233,7 +242,7 @@ def _stitch_oos(
         if not equity:
             equity.append(EquityPoint(first.timestamp, 100.0))
         for previous, current in zip(points, points[1:], strict=False):
-            period_return = current.equity / previous.equity - 1.0
+            period_return = _within_fold_return(previous.equity, current.equity)
             returns.append(ReturnPoint(current.timestamp, period_return))
             compounded_equity *= 1.0 + period_return
             equity.append(EquityPoint(current.timestamp, compounded_equity))
@@ -265,6 +274,15 @@ def _stitch_oos(
         equity_curve=tuple(equity),
         metrics=metrics,
     )
+
+
+def _within_fold_return(previous_equity: float, current_equity: float) -> float:
+    """Convert a fresh-100 fold curve to returns, including terminal bankruptcy."""
+    if previous_equity > 0.0:
+        return current_equity / previous_equity - 1.0
+    if previous_equity == 0.0 and current_equity == 0.0:
+        return 0.0
+    raise ValueError("zero-equity recovery is not a valid OOS return path")
 
 
 def _validated_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -316,7 +334,26 @@ def _validated_folds(index: pd.DatetimeIndex, folds: Sequence[FoldWindow]) -> tu
         test_index = _validated_utc_index(fold.test_index, "fold test_index")
         if not train_index.equals(expected_train) or not test_index.equals(expected_test):
             raise ValueError("fold indexes must exactly match half-open frame intervals")
-    return result
+    canonical = tuple(build_rolling_folds(index, WalkForwardConfig()))
+    if len(result) != len(canonical) or any(
+        not _same_fold(supplied, expected)
+        for supplied, expected in zip(result, canonical, strict=True)
+    ):
+        raise ValueError("folds must match the complete canonical schedule")
+    return canonical
+
+
+def _same_fold(left: FoldWindow, right: FoldWindow) -> bool:
+    """Compare fold content without pandas index truth-value ambiguity."""
+    return (
+        left.fold_id == right.fold_id
+        and left.train_start == right.train_start
+        and left.train_end == right.train_end
+        and left.test_start == right.test_start
+        and left.test_end == right.test_end
+        and left.train_index.equals(right.train_index)
+        and left.test_index.equals(right.test_index)
+    )
 
 
 def _validated_utc_index(index: object, name: str) -> pd.DatetimeIndex:
@@ -365,16 +402,174 @@ def _validate_backtest_result(result: object, request: BacktestRequest) -> None:
     if not result.equity_curve:
         raise ValueError("backtest result must contain phase equity")
     timestamps: list[datetime] = []
+    previous_equity: float | None = None
     for point in result.equity_curve:
-        if not isinstance(point, EquityPoint) or not math.isfinite(float(point.equity)) or point.equity < 0.0:
+        if not isinstance(point, EquityPoint) or not _is_finite_number(point.equity) or point.equity < 0.0:
             raise ValueError("backtest equity must be finite and nonnegative")
-        if point.timestamp.tzinfo is None or point.timestamp.utcoffset() is None:
-            raise ValueError("backtest equity timestamps must be timezone-aware")
-        timestamp = point.timestamp.astimezone(timezone.utc)
-        if timestamp not in request.frame.index:
-            raise ValueError("backtest equity must remain inside the execution phase")
-        timestamps.append(timestamp)
+        if previous_equity == 0.0 and point.equity > 0.0:
+            raise ValueError("zero-equity recovery is not a valid backtest path")
+        previous_equity = float(point.equity)
+        timestamps.append(_phase_timestamp(point.timestamp, "backtest equity", request))
     if any(right <= left for left, right in zip(timestamps, timestamps[1:], strict=False)):
         raise ValueError("backtest equity timestamps must be strictly increasing")
     if not math.isclose(result.equity_curve[-1].equity, result.final_equity, rel_tol=0.0, abs_tol=1e-10):
         raise ValueError("backtest final equity must match the final phase equity")
+    _validate_orders(result.orders, request)
+    _validate_trades(result.trades, request)
+    _validate_reconciliation(result)
+
+
+def _validate_orders(orders: tuple[OrderRecord, ...], request: BacktestRequest) -> None:
+    """Reject malformed order lifecycle evidence before metrics can consume it."""
+    groups: dict[str, list[OrderRecord]] = {}
+    occurred: list[datetime] = []
+    for order in orders:
+        if not isinstance(order, OrderRecord):
+            raise ValueError("backtest orders must be OrderRecord values")
+        if not isinstance(order.order_id, str) or not order.order_id:
+            raise ValueError("backtest order IDs must be nonempty strings")
+        if not isinstance(order.status, OrderStatus):
+            raise ValueError("backtest order status must be valid")
+        if order.side not in {"BUY", "SELL"}:
+            raise ValueError("backtest order side must be BUY or SELL")
+        requested, filled, remainder, fee, slippage = _finite_order_values(order)
+        if requested <= 0.0 or filled < 0.0 or remainder < 0.0 or fee < 0.0 or slippage < 0.0:
+            raise ValueError("backtest order quantities and costs must be nonnegative")
+        if filled > requested + 1e-10 or not math.isclose(
+            requested, filled + remainder, rel_tol=0.0, abs_tol=1e-10
+        ):
+            raise ValueError("backtest order quantities must reconcile")
+        occurred_at = _phase_timestamp(order.occurred_at, "backtest order occurred_at", request)
+        signal_time = _phase_timestamp(order.signal_time, "backtest order signal_time", request)
+        if signal_time > occurred_at:
+            raise ValueError("backtest order signal_time must not follow occurred_at")
+        occurred.append(occurred_at)
+        if filled > 0.0:
+            if order.fill_time is None or order.fill_price is None:
+                raise ValueError("filled backtest orders require time and price")
+            fill_time = _phase_timestamp(order.fill_time, "backtest order fill_time", request)
+            if fill_time < signal_time or not _is_finite_number(order.fill_price) or order.fill_price <= 0.0:
+                raise ValueError("backtest order fills must be finite and ordered")
+        elif order.fill_time is not None or order.fill_price is not None:
+            raise ValueError("unfilled backtest orders must not have fill data")
+        if order.stop_price is not None and (
+            not _is_finite_number(order.stop_price) or order.stop_price <= 0.0
+        ):
+            raise ValueError("backtest stop_price must be finite and positive")
+        groups.setdefault(order.order_id, []).append(order)
+    if any(right < left for left, right in zip(occurred, occurred[1:], strict=False)):
+        raise ValueError("backtest order records must be chronologically ordered")
+    for lifecycle in groups.values():
+        _validate_order_lifecycle(lifecycle)
+
+
+def _finite_order_values(order: OrderRecord) -> tuple[float, float, float, float, float]:
+    values = (
+        order.requested_quantity,
+        order.filled_quantity,
+        order.remainder_quantity,
+        order.fee,
+        order.slippage,
+    )
+    if not all(_is_finite_number(value) for value in values):
+        raise ValueError("backtest order values must be finite")
+    return tuple(float(value) for value in values)  # type: ignore[return-value]
+
+
+def _validate_order_lifecycle(lifecycle: list[OrderRecord]) -> None:
+    first = lifecycle[0]
+    if first.status is not OrderStatus.CREATED:
+        raise ValueError("backtest order lifecycle must begin CREATED")
+    terminal = {
+        OrderStatus.COMPLETED,
+        OrderStatus.CANCELED,
+        OrderStatus.EXPIRED,
+        OrderStatus.INSUFFICIENT_CASH,
+        OrderStatus.REJECTED,
+    }
+    transitions = {
+        OrderStatus.CREATED: {OrderStatus.SUBMITTED, OrderStatus.REJECTED, OrderStatus.CANCELED},
+        OrderStatus.SUBMITTED: {OrderStatus.ACCEPTED, OrderStatus.CANCELED, OrderStatus.REJECTED},
+        OrderStatus.ACCEPTED: terminal | {OrderStatus.PARTIAL},
+        OrderStatus.PARTIAL: {OrderStatus.PARTIAL, OrderStatus.COMPLETED, OrderStatus.CANCELED},
+    }
+    previous = lifecycle[0]
+    for current in lifecycle[1:]:
+        if current.side != previous.side or not math.isclose(
+            current.requested_quantity, previous.requested_quantity, rel_tol=0.0, abs_tol=1e-10
+        ):
+            raise ValueError("backtest order lifecycle fields must remain stable")
+        if current.status not in transitions.get(previous.status, set()):
+            raise ValueError("backtest order lifecycle transition is invalid")
+        if current.filled_quantity + 1e-10 < previous.filled_quantity or current.remainder_quantity > previous.remainder_quantity + 1e-10:
+            raise ValueError("backtest order lifecycle quantities must be monotonic")
+        previous = current
+    if lifecycle[-1].status not in terminal:
+        raise ValueError("backtest order lifecycle must be terminal")
+
+
+def _validate_trades(trades: tuple[TradeRecord, ...], request: BacktestRequest) -> None:
+    """Require finite, closed, internally consistent trade evidence."""
+    for trade in trades:
+        if not isinstance(trade, TradeRecord):
+            raise ValueError("backtest trades must be TradeRecord values")
+        values = (
+            trade.quantity,
+            trade.entry_price,
+            trade.exit_price,
+            trade.gross_pnl,
+            trade.net_pnl,
+            trade.fees,
+        )
+        if not all(_is_finite_number(value) for value in values):
+            raise ValueError("backtest trade values must be finite")
+        if trade.quantity <= 0.0 or trade.entry_price <= 0.0 or trade.exit_price <= 0.0 or trade.fees < 0.0:
+            raise ValueError("backtest trade quantity, prices, and fees must be valid")
+        entry_time = _phase_timestamp(trade.entry_time, "backtest trade entry_time", request)
+        exit_time = _phase_timestamp(trade.exit_time, "backtest trade exit_time", request)
+        if entry_time > exit_time:
+            raise ValueError("backtest trade exit_time must not precede entry_time")
+        gross = trade.quantity * (trade.exit_price - trade.entry_price)
+        if not math.isclose(trade.gross_pnl, gross, rel_tol=0.0, abs_tol=1e-10):
+            raise ValueError("backtest trade gross PnL must reconcile")
+        if not math.isclose(trade.net_pnl, trade.gross_pnl - trade.fees, rel_tol=0.0, abs_tol=1e-10):
+            raise ValueError("backtest trade net PnL must reconcile")
+        if not isinstance(trade.exit_reason, str) or not trade.exit_reason:
+            raise ValueError("backtest trade exit_reason must be nonempty")
+
+
+def _validate_reconciliation(result: BacktestResult) -> None:
+    """Cross-check cumulative ledger costs against top-level totals."""
+    final_orders: dict[str, OrderRecord] = {}
+    for order in result.orders:
+        final_orders[order.order_id] = order
+    if final_orders:
+        order_fees = sum(order.fee for order in final_orders.values())
+        order_slippage = sum(order.slippage for order in final_orders.values())
+        if not math.isclose(result.total_fees, order_fees, rel_tol=0.0, abs_tol=1e-10):
+            raise ValueError("backtest total_fees must reconcile with orders")
+        if not math.isclose(result.total_slippage, order_slippage, rel_tol=0.0, abs_tol=1e-10):
+            raise ValueError("backtest total_slippage must reconcile with orders")
+    if result.trades and not math.isclose(
+        result.total_fees,
+        sum(trade.fees for trade in result.trades),
+        rel_tol=0.0,
+        abs_tol=1e-10,
+    ):
+        raise ValueError("backtest total_fees must reconcile with trades")
+
+
+def _phase_timestamp(value: object, name: str, request: BacktestRequest) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    timestamp = value.astimezone(timezone.utc)
+    if timestamp not in request.frame.index:
+        raise ValueError(f"{name} must remain inside the execution phase")
+    return timestamp
+
+
+def _is_finite_number(value: object) -> bool:
+    try:
+        return not isinstance(value, bool) and math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False

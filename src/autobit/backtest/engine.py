@@ -320,50 +320,24 @@ class _DonchianBacktestStrategy(bt.Strategy):
             return
         now = self._now()
         fill_price = reference_close * (1.0 - float(self.adapter_config.costs.slippage_rate))
-        fee = quantity * fill_price * float(self.adapter_config.costs.fee_rate)
-        slippage = quantity * (reference_close - fill_price)
-        if not all(math.isfinite(value) for value in (fill_price, fee, slippage)):
+        if not math.isfinite(fill_price):
             raise ValueError("terminal liquidation values must be finite")
-        if fill_price <= 0.0 or fee < 0.0 or slippage < 0.0:
+        if fill_price <= 0.0:
             raise ValueError("terminal liquidation values must be nonnegative")
-
-        order_id = str(self._next_run_order_id)
-        self._next_run_order_id += 1
-        self.order_records.extend(
-            (
-                OrderRecord(
-                    order_id=order_id,
-                    status=OrderStatus.CREATED,
-                    side="SELL",
-                    requested_quantity=quantity,
-                    filled_quantity=0.0,
-                    remainder_quantity=quantity,
-                    occurred_at=now,
-                    signal_time=now,
-                    reason="FORCED_END",
-                ),
-                OrderRecord(
-                    order_id=order_id,
-                    status=OrderStatus.COMPLETED,
-                    side="SELL",
-                    requested_quantity=quantity,
-                    filled_quantity=quantity,
-                    remainder_quantity=0.0,
-                    occurred_at=now,
-                    signal_time=now,
-                    fill_time=now,
-                    fill_price=fill_price,
-                    fee=fee,
-                    slippage=slippage,
-                    reason="FORCED_END",
-                ),
-            )
+        self.exit_order = self.sell(
+            size=quantity,
+            signal_time=now.isoformat(),
+            reason="FORCED_END",
+            fill_fraction=1.0,
+            terminal_reference_price=reference_close,
         )
-        self.total_fees += fee
-        self.total_slippage += slippage
-        self._exit_fill_bits.append((now, quantity, fill_price, fee))
-        self._record_completed_trade("FORCED_END")
-        final_equity = float(self.broker.getvalue()) + quantity * (fill_price - reference_close) - fee
+        if self.exit_order is None or not self.broker.settle_terminal_market_order(
+            self.exit_order, fill_price
+        ):
+            raise RuntimeError("terminal liquidation could not settle natively")
+        if abs(float(self.position.size)) > 1e-12 or self.broker.get_orders_open():
+            raise RuntimeError("terminal liquidation left open broker state")
+        final_equity = float(self.broker.getvalue())
         if not math.isfinite(final_equity) or final_equity < 0.0:
             raise ValueError("terminal liquidation equity must be finite and nonnegative")
         self._terminal_final_equity = final_equity
@@ -817,8 +791,12 @@ class _DonchianBacktestStrategy(bt.Strategy):
         return sum(self._bit_slippage(order, bit) for bit in order.executed.exbits)
 
     def _bit_slippage(self, order: bt.Order, bit: object) -> float:
-        fill_time = pd.Timestamp(_bt_utc(float(bit.dt)))
-        reference_open = float(self.p.reference_opens[fill_time])
+        terminal_reference = order.info.get("terminal_reference_price")
+        if terminal_reference is None:
+            fill_time = pd.Timestamp(_bt_utc(float(bit.dt)))
+            reference_open = float(self.p.reference_opens[fill_time])
+        else:
+            reference_open = float(terminal_reference)
         if order.exectype == bt.Order.Stop:
             trigger = float(order.info.stop_price)
             reference = min(reference_open, trigger) if order.issell() else max(reference_open, trigger)

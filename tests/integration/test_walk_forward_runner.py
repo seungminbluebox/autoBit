@@ -6,19 +6,27 @@ import math
 import pandas as pd
 import pytest
 
-from autobit.backtest.engine import BacktestConfig, BacktestResult, EquityPoint, run_backtest
+from autobit.backtest.engine import (
+    BacktestConfig,
+    BacktestResult,
+    EquityPoint,
+    OrderRecord,
+    TradeRecord,
+    run_backtest,
+)
 from autobit.config import CostConfig, StrategyConfig
-from autobit.domain.models import PositionState
+from autobit.domain.models import OrderStatus, PositionState
 from autobit.indicators.trend import compute_trend_indicators
-from autobit.validation.models import CostScenario, FoldWindow, TrialConfig
+from autobit.validation.models import CostScenario, FoldWindow, TrialConfig, WalkForwardConfig
 from autobit.validation.runner import (
     BacktestRequest,
     core_backtest,
     run_walk_forward,
 )
+from autobit.validation.splits import build_rolling_folds
 
 
-def _frame(periods: int = 608) -> pd.DataFrame:
+def _frame(periods: int = 5_000) -> pd.DataFrame:
     index = pd.date_range("2022-01-01", periods=periods, freq="4h", tz="UTC")
     prices = pd.Series(range(periods), index=index, dtype="float64") + 100.0
     return pd.DataFrame(
@@ -40,26 +48,9 @@ def _frame(periods: int = 608) -> pd.DataFrame:
 
 
 def _folds(frame: pd.DataFrame, *, count: int = 1) -> tuple[FoldWindow, ...]:
-    test_width = 3
-    result: list[FoldWindow] = []
-    for number in range(count):
-        test_start_position = 601 + number * test_width
-        test_end_position = test_start_position + test_width
-        test_index = frame.index[test_start_position:test_end_position]
-        train_end_position = test_start_position - 1
-        train_index = frame.index[:train_end_position]
-        result.append(
-            FoldWindow(
-                fold_id=f"fold-{number:03d}",
-                train_start=train_index[0],
-                train_end=frame.index[train_end_position],
-                test_start=test_index[0],
-                test_end=frame.index[test_end_position],
-                train_index=train_index.copy(),
-                test_index=test_index.copy(),
-            )
-        )
-    return tuple(result)
+    canonical = tuple(build_rolling_folds(frame.index, WalkForwardConfig()))
+    assert len(canonical) >= count
+    return canonical[:count]
 
 
 def _result(request: BacktestRequest, values: tuple[float, ...] = (100.0, 110.0, 121.0)) -> BacktestResult:
@@ -116,6 +107,21 @@ def test_runner_executes_each_oos_cell_once_with_a_fresh_flat_request() -> None:
     assert frame["open"].gt(0.0).all()
 
 
+def test_runner_rejects_a_canonical_fold_prefix_before_any_backtest_call() -> None:
+    """A shorter hand-picked schedule could hide unfavorable completed OOS folds."""
+    frame = _frame(5_600)
+    canonical = _folds(frame, count=2)
+    calls: list[BacktestRequest] = []
+
+    def fake_backtest(request: BacktestRequest) -> BacktestResult:
+        calls.append(request)
+        return _result(request)
+
+    with pytest.raises(ValueError, match="complete canonical"):
+        run_walk_forward(frame, canonical[:1], fake_backtest)
+    assert calls == []
+
+
 def test_train_failure_is_retained_without_suppressing_its_oos_cell() -> None:
     """Dropping an error or skipping the OOS retry would create a biased result matrix."""
     frame = _frame()
@@ -156,9 +162,117 @@ def test_train_failure_is_retained_without_suppressing_its_oos_cell() -> None:
     assert train_failed_stitched.equity_curve
 
 
+def test_runner_retains_malformed_nested_backtest_evidence_as_failed_rows() -> None:
+    """Nested ledger corruption must never reach a COMPLETED validation result."""
+    frame = _frame()
+    folds = _folds(frame)
+    malformed = {
+        ("baseline", "zero"): "nan_fee",
+        ("baseline", "baseline"): "infinite_trade",
+        ("ema_150", "zero"): "quantity_lifecycle",
+        ("ema_150", "baseline"): "timestamp_and_id",
+    }
+
+    def fake_backtest(request: BacktestRequest) -> BacktestResult:
+        result = _result(request)
+        kind = malformed.get((request.trial_id, request.cost_id))
+        if request.phase != "OOS" or kind is None:
+            return result
+        start = request.frame.index[-2].to_pydatetime()
+        end = request.frame.index[-1].to_pydatetime()
+        if kind == "nan_fee":
+            return replace(
+                result,
+                orders=(
+                    OrderRecord(
+                        order_id="order-1",
+                        status=OrderStatus.COMPLETED,
+                        side="BUY",
+                        requested_quantity=1.0,
+                        filled_quantity=1.0,
+                        remainder_quantity=0.0,
+                        occurred_at=start,
+                        signal_time=start,
+                        fill_time=end,
+                        fill_price=100.0,
+                        fee=math.nan,
+                    ),
+                ),
+            )
+        if kind == "infinite_trade":
+            return replace(
+                result,
+                trades=(
+                    TradeRecord(
+                        entry_time=start,
+                        exit_time=end,
+                        quantity=1.0,
+                        entry_price=math.inf,
+                        exit_price=101.0,
+                        gross_pnl=math.inf,
+                        net_pnl=math.inf,
+                        fees=0.0,
+                        exit_reason="FORCED_END",
+                    ),
+                ),
+            )
+        if kind == "quantity_lifecycle":
+            return replace(
+                result,
+                orders=(
+                    OrderRecord(
+                        order_id="order-2",
+                        status=OrderStatus.COMPLETED,
+                        side="SELL",
+                        requested_quantity=1.0,
+                        filled_quantity=2.0,
+                        remainder_quantity=-1.0,
+                        occurred_at=end,
+                        signal_time=start,
+                        fill_time=end,
+                        fill_price=100.0,
+                    ),
+                ),
+            )
+        return replace(
+            result,
+            orders=(
+                OrderRecord(
+                    order_id="",
+                    status=OrderStatus.COMPLETED,
+                    side="BUY",
+                    requested_quantity=1.0,
+                    filled_quantity=1.0,
+                    remainder_quantity=0.0,
+                    occurred_at=start.replace(tzinfo=None),
+                    signal_time=start.replace(tzinfo=None),
+                    fill_time=end.replace(tzinfo=None),
+                    fill_price=100.0,
+                ),
+            ),
+        )
+
+    result = run_walk_forward(frame, folds, fake_backtest)
+
+    failed = {
+        (run.trial_id, run.cost_id)
+        for run in result.runs
+        if run.phase == "OOS" and run.status == "FAILED"
+    }
+    assert failed == set(malformed)
+    for trial_id, cost_id in malformed:
+        stitched = next(
+            item
+            for item in result.stitched_oos
+            if item.trial_id == trial_id and item.cost_id == cost_id
+        )
+        assert stitched.status == "INCOMPLETE"
+        assert stitched.equity_curve == ()
+
+
 def test_runner_uses_only_pre_test_context_and_excludes_future_and_embargo_rows() -> None:
     """Passing a full enriched frame would allow test metrics to see future observations."""
-    frame = _frame(609)
+    frame = _frame()
     folds = _folds(frame)
     captured: list[pd.DataFrame] = []
 
@@ -183,7 +297,7 @@ def test_runner_uses_only_pre_test_context_and_excludes_future_and_embargo_rows(
 
 def test_stitched_oos_compounds_within_fold_returns_without_reset_or_boundary_duplicates() -> None:
     """Concatenating fresh-100 curves would create a false drawdown and duplicate timestamps."""
-    frame = _frame(612)
+    frame = _frame(5_600)
     folds = _folds(frame, count=2)
 
     def fake_backtest(request: BacktestRequest) -> BacktestResult:
@@ -202,13 +316,66 @@ def test_stitched_oos_compounds_within_fold_returns_without_reset_or_boundary_du
         [100.0, 110.0, 121.0, 108.9, 119.79]
     )
     assert [point.timestamp for point in stitched.equity_curve] == [
-        folds[0].test_index[0].to_pydatetime(),
-        folds[0].test_index[1].to_pydatetime(),
-        folds[0].test_index[2].to_pydatetime(),
-        folds[1].test_index[1].to_pydatetime(),
-        folds[1].test_index[2].to_pydatetime(),
+        folds[0].test_index[-3].to_pydatetime(),
+        folds[0].test_index[-2].to_pydatetime(),
+        folds[0].test_index[-1].to_pydatetime(),
+        folds[1].test_index[-2].to_pydatetime(),
+        folds[1].test_index[-1].to_pydatetime(),
     ]
     assert len({point.timestamp for point in stitched.equity_curve}) == len(stitched.equity_curve)
+
+
+def test_stitched_oos_preserves_a_complete_bankruptcy_path_without_dividing_by_zero() -> None:
+    """A fold that reaches zero stays zero, while later fold returns remain observable."""
+    frame = _frame(5_600)
+    folds = _folds(frame, count=2)
+
+    def fake_backtest(request: BacktestRequest) -> BacktestResult:
+        if request.phase == "OOS" and request.fold_id == "fold-000":
+            return _result(request, (100.0, 0.0, 0.0))
+        return _result(request)
+
+    result = run_walk_forward(frame, folds, fake_backtest)
+    stitched = next(
+        item for item in result.stitched_oos
+        if item.trial_id == "baseline" and item.cost_id == "zero"
+    )
+
+    assert stitched.status == "COMPLETE"
+    assert [point.value for point in stitched.returns] == pytest.approx([-1.0, 0.0, 0.1, 0.1])
+    assert [point.equity for point in stitched.equity_curve] == pytest.approx(
+        [100.0, 0.0, 0.0, 0.0, 0.0]
+    )
+
+
+def test_runner_retains_zero_equity_recovery_as_a_failed_oos_cell() -> None:
+    """A zero-to-positive recovery is impossible for a fresh 100-equity fold path."""
+    frame = _frame()
+    folds = _folds(frame)
+
+    def fake_backtest(request: BacktestRequest) -> BacktestResult:
+        if (
+            request.phase == "OOS"
+            and request.trial_id == "baseline"
+            and request.cost_id == "zero"
+        ):
+            return _result(request, (100.0, 0.0, 1.0))
+        return _result(request)
+
+    result = run_walk_forward(frame, folds, fake_backtest)
+    failed = next(
+        run
+        for run in result.runs
+        if run.phase == "OOS" and run.trial_id == "baseline" and run.cost_id == "zero"
+    )
+    stitched = next(
+        item for item in result.stitched_oos
+        if item.trial_id == "baseline" and item.cost_id == "zero"
+    )
+
+    assert failed.status == "FAILED"
+    assert "zero-equity recovery" in (failed.error or "")
+    assert stitched.status == "INCOMPLETE"
 
 
 def test_runner_rejects_unknown_fold_ids_and_indexes_outside_half_open_windows() -> None:
@@ -255,18 +422,26 @@ def test_runner_applies_exact_scenario_costs_to_each_isolated_request() -> None:
 
 def test_runner_rejects_noncanonical_frame_and_overlapping_oos_folds() -> None:
     """Non-UTC data or overlapping OOS periods would invalidate chronological evidence."""
-    frame = _frame(612)
+    frame = _frame(5_600)
     folds = _folds(frame, count=2)
     non_utc = frame.copy()
     non_utc.index = non_utc.index.tz_convert("Asia/Seoul")
     nonfinite = frame.copy()
     nonfinite.iloc[0, nonfinite.columns.get_loc("close")] = math.inf
+    overlap_test_start = folds[0].test_start + pd.Timedelta(hours=4)
+    overlap_train_end = overlap_test_start - pd.DateOffset(days=5)
+    overlap_train_start = overlap_train_end - pd.DateOffset(years=2)
     overlap = replace(
         folds[1],
-        train_end=frame.index[601],
-        test_start=frame.index[602],
-        train_index=frame.index[:601],
-        test_index=frame.index[602:607],
+        train_start=overlap_train_start,
+        train_end=overlap_train_end,
+        test_start=overlap_test_start,
+        train_index=frame.index[
+            (frame.index >= overlap_train_start) & (frame.index < overlap_train_end)
+        ],
+        test_index=frame.index[
+            (frame.index >= overlap_test_start) & (frame.index < folds[1].test_end)
+        ],
     )
 
     with pytest.raises(ValueError, match="canonical UTC"):

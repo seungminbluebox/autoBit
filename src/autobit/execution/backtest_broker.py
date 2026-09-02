@@ -122,6 +122,27 @@ class EventBacktestBroker(bt.brokers.BackBroker):
         self._get_value()
         return order.status in (order.Partial, order.Completed)
 
+    def settle_terminal_market_order(self, order: bt.Order, price: float) -> bool:
+        """Natively execute one final market exit at a supplied terminal close price."""
+        if order.exectype != bt.Order.Market or not order.alive():
+            return False
+        try:
+            self.submitted.remove(order)
+        except ValueError:
+            return False
+
+        self._notify_same_bar(order)
+        self.submit_accept(order)
+        self._notify_same_bar(order)
+        try:
+            self.pending.remove(order)
+        except ValueError:
+            return False
+        self._execute(order, ago=0, price=float(price))
+        self._notify_same_bar(order)
+        self._get_value()
+        return order.status == order.Completed
+
     def buy(
         self,
         owner,

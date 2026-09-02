@@ -27,6 +27,32 @@ def _fixture(name: str) -> pd.DataFrame:
     )
 
 
+def _run_terminal_instrumented(
+    frame: pd.DataFrame, config: BacktestConfig
+) -> tuple[_DonchianBacktestStrategy, EventBacktestBroker, EnrichedPandasData]:
+    """Run the real core topology while retaining the broker for settlement assertions."""
+    prepared = _prepare_frame(frame, config.strategy)
+    reference_opens = {
+        pd.Timestamp(timestamp): float(open_price)
+        for timestamp, open_price in prepared["open"].items()
+    }
+    cerebro = bt.Cerebro(cheat_on_open=False, stdstats=False)
+    broker = EventBacktestBroker()
+    cerebro.setbroker(broker)
+    broker.set_coc(False)
+    broker.setcash(float(config.initial_equity))
+    broker.setcommission(commission=float(config.costs.fee_rate))
+    data = EnrichedPandasData(dataname=prepared)
+    cerebro.adddata(data)
+    cerebro.addstrategy(
+        _DonchianBacktestStrategy,
+        adapter_config=config,
+        reference_opens=reference_opens,
+    )
+    strategy, = cerebro.run()
+    return strategy, broker, data
+
+
 def test_close_signal_fills_at_next_open() -> None:
     result = run_backtest(
         _fixture("entry_next_open.csv"),
@@ -255,7 +281,12 @@ def test_opt_in_terminal_liquidation_closes_remaining_position_at_last_close() -
         if order.side == "BUY" and order.status == "COMPLETED"
     )
     forced = [order for order in result.orders if order.reason == "FORCED_END"]
-    assert [order.status.value for order in forced] == ["CREATED", "COMPLETED"]
+    assert [order.status.value for order in forced] == [
+        "CREATED",
+        "SUBMITTED",
+        "ACCEPTED",
+        "COMPLETED",
+    ]
     assert forced[-1].fill_time == frame.index[-1].to_pydatetime()
     assert forced[-1].fill_price == pytest.approx(105.0 * (1.0 - slippage_rate))
     assert forced[-1].fee == pytest.approx(
@@ -306,6 +337,49 @@ def test_terminal_liquidation_cancels_partial_exit_before_closing_only_its_remai
     trade, = result.trades
     assert trade.exit_reason == "FORCED_END"
     assert trade.quantity == pytest.approx(partial.requested_quantity)
+
+
+def test_terminal_liquidation_settles_the_native_broker_and_emits_one_forced_order() -> None:
+    """Synthetic-only terminal records leave native broker cash and BTC out of sync."""
+    config = BacktestConfig(
+        costs=CostConfig(fee_rate=0.0005, slippage_rate=0.001),
+        force_liquidate_at_end=True,
+    )
+    strategy, broker, data = _run_terminal_instrumented(
+        _fixture("entry_next_open.csv").iloc[:612], config
+    )
+
+    forced = [
+        order
+        for order in strategy.order_records
+        if order.reason == "FORCED_END"
+    ]
+    assert [order.status.value for order in forced] == [
+        "CREATED",
+        "SUBMITTED",
+        "ACCEPTED",
+        "COMPLETED",
+    ]
+    assert broker.getposition(data).size == pytest.approx(0.0)
+    assert not tuple(broker.get_orders_open())
+    assert broker.getcash() == pytest.approx(broker.getvalue())
+    assert strategy.equity_points[-1].equity == pytest.approx(broker.getvalue())
+    forced_trade, = [trade for trade in strategy.trade_records if trade.exit_reason == "FORCED_END"]
+    assert forced_trade.quantity == pytest.approx(forced[-1].filled_quantity)
+    assert forced[-1].slippage == pytest.approx(
+        forced[-1].filled_quantity
+        * (105.0 - forced[-1].fill_price)
+    )
+    assert strategy.total_fees == pytest.approx(sum(
+        order.fee
+        for order in strategy.order_records
+        if order.status in ("PARTIAL", "COMPLETED")
+    ))
+    assert strategy.total_slippage == pytest.approx(sum(
+        order.slippage
+        for order in strategy.order_records
+        if order.status in ("PARTIAL", "COMPLETED")
+    ))
 
 
 def test_final_bar_partial_entry_remainder_is_terminally_canceled() -> None:
