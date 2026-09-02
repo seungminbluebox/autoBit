@@ -73,9 +73,14 @@ class EventBacktestBroker(bt.brokers.BackBroker):
         self._notify_pre_submit(order)
         return super().submit(order, check=check)
 
-    def cancel_end_of_data(self, order: bt.Order) -> bool:
+    def cancel_end_of_data(
+        self,
+        order: bt.Order,
+        *,
+        terminal_reason: str = "END_OF_DATA",
+    ) -> bool:
         """Terminally cancel an order that cannot receive another broker cycle."""
-        order.addinfo(terminal_reason="END_OF_DATA")
+        order.addinfo(terminal_reason=terminal_reason)
         try:
             self.submitted.remove(order)
         except ValueError:

@@ -1,7 +1,7 @@
 """Isolated, deterministic execution of pre-registered walk-forward cells."""
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 from typing import Literal
@@ -143,47 +143,21 @@ BacktestFn = Callable[[BacktestRequest], BacktestResult]
 
 
 def core_backtest(request: BacktestRequest) -> BacktestResult:
-    """Run each finite quality segment flat, never carrying BTC across a gap."""
+    """Run one phase with flat execution boundaries and continuous account risk."""
     segment_column = (
         "_execution_segment_id"
         if "_execution_segment_id" in request.frame
         else "segment_id"
     )
-    if segment_column not in request.frame or request.frame[segment_column].nunique() <= 1:
-        return run_backtest(request.frame, request.config)
-
-    equity: list[EquityPoint] = []
-    orders: list[OrderRecord] = []
-    trades: list[TradeRecord] = []
-    current_equity = float(request.config.initial_equity)
-    total_fees = 0.0
-    total_slippage = 0.0
-    for ordinal, (_, segment) in enumerate(
-        request.frame.groupby(segment_column, sort=False)
-    ):
-        segment_config = replace(request.config, initial_equity=current_equity)
-        segment_result = run_backtest(segment.copy(deep=True), segment_config)
-        if not segment_result.equity_curve:
-            raise ValueError("each executable quality segment must produce equity")
-        if not _close_enough(segment_result.equity_curve[0].equity, current_equity):
-            raise ValueError("quality segment must restart from carried flat equity")
-        equity.extend(segment_result.equity_curve)
-        orders.extend(
-            replace(order, order_id=f"segment-{ordinal:03d}:{order.order_id}")
-            for order in segment_result.orders
+    execution = request.frame.copy(deep=True)
+    execution["_force_flat_after_bar"] = False
+    if segment_column in execution:
+        following_segment = execution[segment_column].shift(-1)
+        execution["_force_flat_after_bar"] = (
+            following_segment.notna()
+            & execution[segment_column].ne(following_segment)
         )
-        trades.extend(segment_result.trades)
-        current_equity = float(segment_result.final_equity)
-        total_fees += float(segment_result.total_fees)
-        total_slippage += float(segment_result.total_slippage)
-    return BacktestResult(
-        equity_curve=tuple(equity),
-        orders=tuple(orders),
-        trades=tuple(trades),
-        final_equity=current_equity,
-        total_fees=total_fees,
-        total_slippage=total_slippage,
-    )
+    return run_backtest(execution, request.config)
 
 
 def run_walk_forward(
@@ -494,21 +468,31 @@ def _validate_quality_surface(
         raise ValueError("filled quality rows must be flat zero-volume candles")
 
     long_gap = unavailable & ~quarantined
+    if segment_values[0] != 0:
+        raise ValueError("quality segment_id must start at zero")
     current_segment = 0
-    inside_gap = False
-    for position, (segment, is_gap) in enumerate(
-        zip(segment_values, long_gap.tolist(), strict=True)
-    ):
-        if position == 0 and segment != 0:
-            raise ValueError("quality segment_id must start at zero")
-        if inside_gap and not is_gap:
-            current_segment += 1
-            inside_gap = False
-        if segment != current_segment:
-            raise ValueError("quality segment_id transition does not follow a long gap")
-        inside_gap = inside_gap or bool(is_gap)
-    if inside_gap:
-        raise ValueError("a long-gap region must end at a new finite segment")
+    position = 0
+    while position < len(frame):
+        if segment_values[position] != current_segment:
+            raise ValueError("quality segment_id transition does not follow a long-gap region")
+        if not bool(long_gap.iloc[position]):
+            position += 1
+            continue
+
+        gap_start = position
+        if gap_start == 0 or not bool(available.iloc[gap_start - 1]):
+            raise ValueError("a long-gap region must have a preceding finite canonical row")
+        while position < len(frame) and bool(long_gap.iloc[position]):
+            if segment_values[position] != current_segment:
+                raise ValueError("quality segment_id must remain stable inside a long-gap region")
+            position += 1
+        if position - gap_start < 2:
+            raise ValueError("a long-gap region must contain at least two unavailable rows")
+        if position == len(frame) or not bool(available.iloc[position]):
+            raise ValueError("a long-gap region must have a following finite canonical row")
+        current_segment += 1
+        if segment_values[position] != current_segment:
+            raise ValueError("quality segment_id transition after a long-gap region must increment once")
 
     contamination = filled | quarantined | spike | flat
     expected_entry = available & ~(

@@ -21,7 +21,6 @@ from autobit.data.quality import canonicalize_ohlcv
 from autobit.domain.models import OrderStatus, PositionState
 from autobit.indicators.trend import compute_trend_indicators
 from autobit.validation.models import CostScenario, FoldWindow, TrialConfig, WalkForwardConfig
-from autobit.validation import runner as validation_runner
 from autobit.validation.runner import (
     BacktestRequest,
     _run_request,
@@ -1146,6 +1145,11 @@ def test_runner_accepts_real_canonical_gap_and_quarantine_without_crossing_them(
     assert quarantine_time not in first.index
     assert int(first.loc[after_gap, "segment_id"]) == 1
     assert pd.isna(first.loc[after_gap, "ema_200"])
+    assert pd.isna(first.loc[after_gap, "entry_high"])
+    assert pd.isna(first.loc[after_gap, "previous_close"])
+    post_gap_execution = first.loc[after_gap:]
+    assert not post_gap_execution["warmup_complete"].iloc[:600].any()
+    assert bool(post_gap_execution["warmup_complete"].iloc[600])
     assert not bool(first.loc[after_quarantine, "entry_data_valid"])
 
 
@@ -1174,6 +1178,65 @@ def test_gap_acceptance_rejects_unflagged_or_malformed_invalid_rows(
         validate_walk_forward_frame(malformed)
 
 
+def _quality_topology_frame() -> pd.DataFrame:
+    """Return a finite, flag-complete frame suitable for topology mutations."""
+    return _frame(12)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "single_gap",
+        "leading_gap",
+        "quarantined_predecessor",
+        "quarantined_successor",
+        "trailing_gap",
+        "repeated_transition",
+        "misplaced_transition",
+    ),
+)
+def test_long_gap_topology_rejects_fabricated_or_misplaced_transitions(
+    malformation: str,
+) -> None:
+    """Only a bounded 2+ row canonical long gap can increment a segment."""
+    frame = _quality_topology_frame()
+    gap_start = 4
+    gap_end = 6
+    if malformation == "single_gap":
+        gap_end = 5
+    elif malformation == "leading_gap":
+        gap_start = 0
+        gap_end = 2
+    elif malformation == "trailing_gap":
+        gap_start = len(frame) - 2
+        gap_end = len(frame)
+
+    gap_index = frame.index[gap_start:gap_end]
+    frame.loc[gap_index, ["open", "high", "low", "close", "volume"]] = math.nan
+    frame.loc[gap_index, "entry_data_valid"] = False
+    if gap_end < len(frame):
+        frame.loc[frame.index[gap_end]:, "segment_id"] = 1
+
+    if malformation == "quarantined_predecessor":
+        predecessor = frame.index[gap_start - 1]
+        frame.loc[predecessor, ["open", "high", "low", "close", "volume"]] = math.nan
+        frame.loc[predecessor, "is_quarantined"] = True
+        frame.loc[predecessor:, "entry_data_valid"] = False
+    elif malformation == "quarantined_successor":
+        successor = frame.index[gap_end]
+        frame.loc[successor, ["open", "high", "low", "close", "volume"]] = math.nan
+        frame.loc[successor, "is_quarantined"] = True
+        frame.loc[successor:, "entry_data_valid"] = False
+    elif malformation == "repeated_transition":
+        frame.loc[frame.index[gap_end + 1]:, "segment_id"] = 2
+    elif malformation == "misplaced_transition":
+        frame.loc[frame.index[gap_start - 1]:frame.index[gap_end - 1], "segment_id"] = 1
+        frame.loc[frame.index[gap_end]:, "segment_id"] = 2
+
+    with pytest.raises(ValueError, match="long-gap|segment_id transition"):
+        validate_walk_forward_frame(frame)
+
+
 def test_core_adapter_executes_the_real_core_backtest_with_the_request_config() -> None:
     """A runner adapter that bypassed the core engine would not preserve execution semantics."""
     frame = compute_trend_indicators(_frame(604), StrategyConfig())
@@ -1198,47 +1261,143 @@ def test_core_adapter_executes_the_real_core_backtest_with_the_request_config() 
     assert core_backtest(request) == run_backtest(request.frame, request.config)
 
 
-def test_core_adapter_restarts_flat_at_each_quality_segment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A missing-price region cannot carry inventory or a price return across segments."""
-    frame = compute_trend_indicators(_frame(8), StrategyConfig())
-    frame.loc[:, "segment_id"] = [0] * 4 + [1] * 4
-    calls: list[tuple[int, float]] = []
+def _segmented_risk_scenario(*, lose_before_gap: bool) -> tuple[pd.DataFrame, pd.Timestamp, pd.Timestamp]:
+    base = _fixture("entry_next_open.csv").iloc[:610].copy(deep=True)
+    start = base.index[-1] + pd.Timedelta(hours=4)
+    defaults: dict[str, object] = {
+        "open": 99.0,
+        "high": 100.0,
+        "low": 98.0,
+        "close": 99.0,
+        "volume": 1.0,
+        "warmup_complete": True,
+        "entry_data_valid": True,
+        "ema_200": 90.0,
+        "entry_high": 110.0,
+        "previous_close": 99.0,
+        "previous_entry_high": 99.0,
+        "atr_14": 2.0,
+        "exit_low": 80.0,
+        "baseline_atr_pct": 0.02,
+    }
+    signal = {
+        "open": 99.0,
+        "high": 101.0,
+        "low": 98.0,
+        "close": 100.0,
+        "entry_high": 99.0,
+        "previous_close": 99.0,
+        "previous_entry_high": 99.0,
+    }
+    boundary = (
+        {"open": 89.0, "high": 91.0, "low": 88.0, "close": 90.0}
+        if lose_before_gap
+        else {"open": 100.0, "high": 101.0, "low": 96.0, "close": 100.0}
+    )
+    records = [
+        {**defaults, **signal},
+        {**defaults, "open": 100.0, "high": 101.0, "low": 96.0, "close": 100.0},
+        {**defaults, **boundary},
+        {**defaults, **(signal if lose_before_gap else {})},
+        {**defaults, "open": 100.0, "high": 101.0, "low": 96.0, "close": 100.0},
+    ]
+    full_index = pd.date_range(start, periods=7, freq="4h", tz="UTC")
+    observed_index = full_index[[0, 1, 2, 5, 6]]
+    appended = pd.DataFrame(records, index=observed_index).loc[:, base.columns]
+    frame = pd.concat([base, appended])
+    gap_boundary = observed_index[2]
+    post_gap = observed_index[3]
+    frame["_execution_segment_id"] = 0
+    frame.loc[post_gap:, "_execution_segment_id"] = 1
+    return frame, gap_boundary, post_gap
 
-    def segment_backtest(segment: pd.DataFrame, config: BacktestConfig) -> BacktestResult:
-        segment_id = int(segment["segment_id"].iloc[0])
-        calls.append((segment_id, config.initial_equity))
-        final = config.initial_equity * 1.10
-        return BacktestResult(
-            equity_curve=(
-                EquityPoint(segment.index[0].to_pydatetime(), config.initial_equity),
-                EquityPoint(segment.index[-1].to_pydatetime(), final),
-            ),
-            orders=(), trades=(), final_equity=final,
-            total_fees=0.0, total_slippage=0.0,
+
+def test_gap_preserves_daily_loss_cooldown_but_a_fresh_fold_resets_it() -> None:
+    """Only a new phase may clear account-level breaker memory after a loss."""
+    frame, gap_boundary, post_gap = _segmented_risk_scenario(lose_before_gap=True)
+    config = BacktestConfig(
+        costs=CostConfig(fee_rate=0.0, slippage_rate=0.0),
+        force_liquidate_at_end=True,
+    )
+    result = core_backtest(_real_core_request(frame, config))
+
+    assert any(trade.net_pnl <= -4.0 for trade in result.trades)
+    assert not any(
+        order.side == "BUY"
+        and order.status == OrderStatus.COMPLETED
+        and order.signal_time >= post_gap.to_pydatetime()
+        for order in result.orders
+    )
+
+    carried_equity = next(
+        point.equity for point in result.equity_curve
+        if point.timestamp == gap_boundary.to_pydatetime()
+    )
+    fresh = run_backtest(
+        frame.loc[post_gap:].copy(deep=True),
+        replace(config, initial_equity=carried_equity),
+    )
+    assert any(
+        order.side == "BUY" and order.status == OrderStatus.COMPLETED
+        for order in fresh.orders
+    )
+
+
+def test_gap_force_flat_has_native_costed_ledger_and_cancels_the_stop() -> None:
+    """A live position and stop terminate at the last observed close, never after a gap."""
+    frame, gap_boundary, _ = _segmented_risk_scenario(lose_before_gap=False)
+    config = BacktestConfig(
+        costs=CostConfig(fee_rate=0.001, slippage_rate=0.002),
+        force_liquidate_at_end=True,
+    )
+
+    completed = _run_request(_real_core_request(frame, config), core_backtest)
+
+    assert completed.status == "COMPLETED"
+    assert completed.result is not None
+    result = completed.result
+    trade = next(trade for trade in result.trades if trade.exit_reason == "FORCED_GAP")
+    forced_orders = [order for order in result.orders if order.reason == "FORCED_GAP"]
+    assert [order.status for order in forced_orders] == [
+        OrderStatus.CREATED,
+        OrderStatus.SUBMITTED,
+        OrderStatus.ACCEPTED,
+        OrderStatus.COMPLETED,
+    ]
+    forced_fill = forced_orders[-1]
+    assert forced_fill.fill_time == gap_boundary.to_pydatetime()
+    assert forced_fill.fill_price == pytest.approx(float(frame.loc[gap_boundary, "close"]) * 0.998)
+    assert forced_fill.fee == pytest.approx(
+        forced_fill.filled_quantity * float(forced_fill.fill_price) * 0.001
+    )
+    assert forced_fill.slippage == pytest.approx(
+        forced_fill.filled_quantity
+        * (float(frame.loc[gap_boundary, "close"]) - float(forced_fill.fill_price))
+    )
+    assert trade.exit_time == forced_fill.fill_time
+    assert trade.exit_price == pytest.approx(forced_fill.fill_price)
+    assert trade.fees == pytest.approx(
+        sum(
+            order.fee
+            for order in result.orders
+            if order.status == OrderStatus.COMPLETED
         )
-
-    monkeypatch.setattr(validation_runner, "run_backtest", segment_backtest)
-    request = BacktestRequest(
-        phase="OOS", fold_id="fold-000", trial_id="baseline",
-        trial=TrialConfig("baseline", 200, 50, 20, 14, 2.5),
-        cost_id="zero", cost=CostScenario("zero", 0.0, 0.0),
-        frame=frame,
-        config=BacktestConfig(
-            strategy=StrategyConfig(), costs=CostConfig(0.0, 0.0),
-            force_liquidate_at_end=True,
-        ),
-        initial_equity=100.0, initial_state=PositionState.FLAT, pending_orders=0,
     )
-
-    result = core_backtest(request)
-
-    assert calls == [(0, 100.0), (1, 110.00000000000001)]
-    assert [point.equity for point in result.equity_curve] == pytest.approx(
-        [100.0, 110.0, 110.0, 121.0]
+    canceled_stops = [
+        order for order in result.orders
+        if order.status == OrderStatus.CANCELED and order.stop_price is not None
+    ]
+    assert canceled_stops
+    assert all(order.reason == "DATA_GAP" for order in canceled_stops)
+    assert all(order.occurred_at <= gap_boundary.to_pydatetime() for order in canceled_stops)
+    assert result.total_fees == pytest.approx(trade.fees)
+    assert result.total_slippage == pytest.approx(
+        sum(
+            order.slippage
+            for order in result.orders
+            if order.status == OrderStatus.COMPLETED
+        )
     )
-    assert result.final_equity == pytest.approx(121.0)
 
 
 def test_real_core_completes_canonical_gap_and_quarantine_segments_flat() -> None:
