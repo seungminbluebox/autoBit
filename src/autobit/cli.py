@@ -1,7 +1,7 @@
 """Offline, public-data-only research command line interface."""
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -19,6 +19,7 @@ from autobit.data.collector import collect_range
 from autobit.data.quality import QualityReport, canonicalize_ohlcv
 from autobit.data.storage import _atomic_write, _canonical_json_bytes, save_snapshot
 from autobit.data.upbit_public import UpbitPublicClient
+from autobit.indicators.trend import compute_trend_indicators
 from autobit.reporting.reports import SCHEMA_VERSION, write_report_bundle
 
 
@@ -38,7 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     quality.set_defaults(handler=_run_data_quality)
 
     simulation = commands.add_parser("backtest", help="Run a historical simulation")
-    simulation.add_argument("--input", type=Path, required=True, help="Enriched CSV source")
+    simulation.add_argument(
+        "--input", type=Path, required=True, help="Canonical processed CSV source"
+    )
     simulation.add_argument("--output", type=Path, required=True, help="Report directory")
     simulation.add_argument(
         "--slippage",
@@ -102,25 +105,32 @@ def _run_data_quality(arguments: argparse.Namespace) -> int:
     _atomic_write(
         arguments.output / "quality.json",
         _canonical_json_bytes(
-            {"schema_version": SCHEMA_VERSION, "quality": asdict(result.report)}
+            {
+                "schema_version": SCHEMA_VERSION,
+                "processed_sha256": hashlib.sha256(processed).hexdigest(),
+                "quality": asdict(result.report),
+            }
         ),
     )
     return 0
 
 
 def _run_backtest(arguments: argparse.Namespace) -> int:
-    frame = _read_enriched_csv(arguments.input)
     config = BacktestConfig(
         costs=CostConfig(
             fee_rate=CostConfig().fee_rate,
             slippage_rate=arguments.slippage,
         )
     )
+    processed = _read_processed_csv(arguments.input)
+    quality = _load_quality_provenance(arguments.input, len(processed))
+    frame = compute_trend_indicators(processed, config.strategy)
     result = run_backtest(frame, config)
     benchmark = run_buy_and_hold(frame, config.costs)
     metrics = calculate_metrics(
         equity_curve=result.equity_curve,
         trades=result.trades,
+        orders=result.orders,
         periods_per_year=2190,
         total_fees=result.total_fees,
         total_slippage=result.total_slippage,
@@ -130,7 +140,7 @@ def _run_backtest(arguments: argparse.Namespace) -> int:
         result=result,
         metrics=metrics,
         benchmark=benchmark,
-        quality=_quality_from_enriched(frame),
+        quality=quality,
         config=config,
         data_path=arguments.input,
         source_root=Path(__file__).resolve().parent,
@@ -165,31 +175,41 @@ def _read_ohlcv(path: Path) -> pd.DataFrame:
     return frame
 
 
-def _read_enriched_csv(path: Path) -> pd.DataFrame:
+def _read_processed_csv(path: Path) -> pd.DataFrame:
     frame = pd.read_csv(path)
     if "timestamp" not in frame:
-        raise ValueError("enriched CSV must contain a timestamp column")
+        raise ValueError("processed CSV must contain a timestamp column")
     frame.index = pd.to_datetime(frame.pop("timestamp"), utc=True, errors="raise")
     return frame
 
 
-def _quality_from_enriched(frame: pd.DataFrame) -> QualityReport:
-    def count(column: str) -> int:
-        return int(frame[column].fillna(False).astype(bool).sum()) if column in frame else 0
-
-    return QualityReport(
-        total_bars=len(frame),
-        duplicates=int(frame.index.duplicated().sum()),
-        conflicting_duplicates=0,
-        short_gap_bars=count("is_filled"),
-        long_gap_regions=0,
-        impossible_candles=0,
-        nonpositive_prices=int((frame[["open", "high", "low", "close"]] <= 0.0).any(axis=1).sum()),
-        negative_volume=int((frame["volume"] < 0.0).sum()),
-        zero_volume=int((frame["volume"] == 0.0).sum()),
-        spike_flags=count("anomaly_spike"),
-        removed_partial_bars=0,
-    )
+def _load_quality_provenance(processed_path: Path, row_count: int) -> QualityReport:
+    sidecar = processed_path.with_name("quality.json")
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "quality provenance sidecar is missing or malformed"
+        ) from error
+    if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("quality provenance schema_version is invalid")
+    expected_hash = payload.get("processed_sha256")
+    actual_hash = hashlib.sha256(processed_path.read_bytes()).hexdigest()
+    if not isinstance(expected_hash, str) or expected_hash != actual_hash:
+        raise ValueError("quality provenance does not match processed data bytes")
+    quality = payload.get("quality")
+    expected_fields = tuple(field.name for field in fields(QualityReport))
+    if not isinstance(quality, dict) or set(quality) != set(expected_fields):
+        raise ValueError("quality provenance fields are invalid")
+    values: dict[str, int] = {}
+    for name in expected_fields:
+        value = quality[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("quality provenance counts must be nonnegative integers")
+        values[name] = value
+    if values["total_bars"] != row_count:
+        raise ValueError("quality provenance total_bars does not match processed data")
+    return QualityReport(**values)
 
 
 def _utc_end(value: str) -> str:

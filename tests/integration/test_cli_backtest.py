@@ -35,19 +35,37 @@ EXPECTED_FILES = {
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 
 
-def _quality() -> QualityReport:
+def _quality(*, total_bars: int = 2, impossible_candles: int = 0) -> QualityReport:
     return QualityReport(
-        total_bars=2,
+        total_bars=total_bars,
         duplicates=0,
         conflicting_duplicates=0,
         short_gap_bars=0,
         long_gap_regions=0,
-        impossible_candles=0,
+        impossible_candles=impossible_candles,
         nonpositive_prices=0,
         negative_volume=0,
         zero_volume=0,
         spike_flags=0,
         removed_partial_bars=0,
+    )
+
+
+def _write_quality_sidecar(
+    path: Path, quality: QualityReport, processed_path: Path
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "processed_sha256": hashlib.sha256(
+                    processed_path.read_bytes()
+                ).hexdigest(),
+                "quality": asdict(quality),
+            },
+            allow_nan=False,
+        ),
+        encoding="utf-8",
     )
 
 
@@ -296,14 +314,56 @@ def test_data_quality_reads_csv_and_writes_canonical_csv_plus_quality(tmp_path: 
     assert quality["quality"]["short_gap_bars"] == 1
 
 
+def test_canonical_quality_output_is_directly_consumable_by_backtest(tmp_path: Path) -> None:
+    timestamps = pd.date_range("2025-01-01", periods=614, freq="4h", tz="UTC")
+    raw = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": 100.0,
+            "high": 102.0,
+            "low": 98.0,
+            "close": 100.0,
+            "volume": 2.0,
+        }
+    )
+    source = tmp_path / "raw.csv"
+    raw.to_csv(source, index=False)
+    canonical = tmp_path / "canonical"
+    report = tmp_path / "report"
+
+    assert main(["data-quality", "--input", str(source), "--output", str(canonical)]) == 0
+    assert main(
+        [
+            "backtest",
+            "--input",
+            str(canonical / "processed.csv"),
+            "--output",
+            str(report),
+            "--slippage",
+            "0",
+        ]
+    ) == 0
+
+    summary = json.loads((report / "summary.json").read_text(encoding="utf-8"))
+    assert summary["schema_version"] == "1.0"
+    assert summary["metrics"]["trade_count"] == 0
+
+
 def test_backtest_command_runs_one_enriched_scenario_and_writes_bundle(tmp_path: Path) -> None:
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    processed = canonical / "processed.csv"
+    processed.write_bytes((FIXTURES / "entry_next_open.csv").read_bytes())
+    _write_quality_sidecar(
+        canonical / "quality.json", _quality(total_bars=614), processed
+    )
     output = tmp_path / "report"
 
     assert main(
         [
             "backtest",
             "--input",
-            str(FIXTURES / "entry_next_open.csv"),
+            str(processed),
             "--output",
             str(output),
             "--slippage",
@@ -317,6 +377,148 @@ def test_backtest_command_runs_one_enriched_scenario_and_writes_bundle(tmp_path:
     assert summary["metrics"]["trade_count"] == 1
     assert summary["final_equity"] > 0.0
     assert len((output / "trades.csv").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_impossible_candle_quality_provenance_reaches_report_exactly(tmp_path: Path) -> None:
+    timestamps = pd.date_range("2025-01-01", periods=614, freq="4h", tz="UTC")
+    raw = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": 100.0,
+            "high": 102.0,
+            "low": 98.0,
+            "close": 100.0,
+            "volume": 2.0,
+        }
+    )
+    raw.loc[0, "high"] = 97.0
+    source = tmp_path / "raw.csv"
+    raw.to_csv(source, index=False)
+    canonical = tmp_path / "canonical"
+    report = tmp_path / "report"
+
+    main(["data-quality", "--input", str(source), "--output", str(canonical)])
+    main(
+        [
+            "backtest",
+            "--input",
+            str(canonical / "processed.csv"),
+            "--output",
+            str(report),
+        ]
+    )
+
+    source_quality = json.loads(
+        (canonical / "quality.json").read_text(encoding="utf-8")
+    )
+    report_quality = json.loads(
+        (report / "quality.json").read_text(encoding="utf-8")
+    )
+    manifest = json.loads((report / "manifest.json").read_text(encoding="utf-8"))
+    assert source_quality["quality"]["impossible_candles"] == 1
+    assert report_quality["quality"] == source_quality["quality"]
+    assert manifest["data_sha256"] == source_quality["processed_sha256"]
+
+
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        None,
+        "{malformed",
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "quality": asdict(_quality(total_bars=999)),
+            }
+        ),
+    ],
+)
+def test_backtest_fails_closed_for_missing_malformed_or_mismatched_quality(
+    tmp_path: Path, sidecar: str | None
+) -> None:
+    processed = tmp_path / "processed.csv"
+    processed.write_bytes((FIXTURES / "entry_next_open.csv").read_bytes())
+    if sidecar is not None:
+        (tmp_path / "quality.json").write_text(sidecar, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="quality provenance"):
+        main(
+            [
+                "backtest",
+                "--input",
+                str(processed),
+                "--output",
+                str(tmp_path / "report"),
+            ]
+        )
+
+
+def test_backtest_rejects_quality_sidecar_from_different_processed_bytes(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw.csv"
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2025-01-01", periods=614, freq="4h", tz="UTC"
+            ),
+            "open": 100.0,
+            "high": 102.0,
+            "low": 99.0,
+            "close": 101.0,
+            "volume": 2.0,
+        }
+    ).to_csv(raw, index=False)
+    canonical = tmp_path / "canonical"
+    main(["data-quality", "--input", str(raw), "--output", str(canonical)])
+    processed = canonical / "processed.csv"
+    processed.write_bytes(processed.read_bytes() + b"\n")
+
+    with pytest.raises(ValueError, match="quality provenance"):
+        main(
+            [
+                "backtest",
+                "--input",
+                str(processed),
+                "--output",
+                str(tmp_path / "report"),
+            ]
+        )
+
+
+def test_terminal_open_position_has_nonzero_exposure_and_turnover_in_cli_report(
+    tmp_path: Path,
+) -> None:
+    frame = pd.read_csv(
+        FIXTURES / "entry_next_open.csv",
+    ).iloc[:613]
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    processed = canonical / "processed.csv"
+    frame.to_csv(processed, index=False)
+    _write_quality_sidecar(
+        canonical / "quality.json", _quality(total_bars=len(frame)), processed
+    )
+    output = tmp_path / "report"
+
+    assert main(
+        [
+            "backtest",
+            "--input",
+            str(processed),
+            "--output",
+            str(output),
+            "--slippage",
+            "0",
+        ]
+    ) == 0
+
+    summary = json.loads(
+        (output / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["metrics"]["trade_count"] == 0
+    assert summary["metrics"]["exposure"] > 0.0
+    assert summary["metrics"]["turnover"] > 0.0
 
 
 @pytest.mark.parametrize(

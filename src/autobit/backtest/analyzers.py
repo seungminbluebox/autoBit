@@ -2,11 +2,11 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import statistics
 
-from autobit.backtest.engine import EquityPoint, TradeRecord
+from autobit.backtest.engine import EquityPoint, OrderRecord, TradeRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,11 +35,19 @@ class PerformanceMetrics:
     total_slippage: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class _FillEvent:
+    timestamp: datetime
+    signed_quantity: float
+    notional: float
+
+
 def calculate_metrics(
     closed_pnls: Sequence[float] | None = None,
     *,
     equity_curve: Sequence[float | EquityPoint] | None = None,
     trades: Sequence[TradeRecord] | None = None,
+    orders: Sequence[OrderRecord] | None = None,
     holding_bars: Sequence[float] | None = None,
     periods_per_year: int = 2190,
     exposure: float | None = None,
@@ -51,15 +59,18 @@ def calculate_metrics(
 
     ``turnover`` is the two-sided traded notional divided by mean equity. When
     omitted with real trades, it is derived using entry plus exit notional.
-    Exposure is the fraction of equity-curve intervals spent in completed
-    positions. Drawdown duration counts consecutive underwater equity bars.
-    All undefined ratios use ``0.0`` so serialized reports never contain NaN
-    or Infinity.
+    Exposure is the fraction of observed equity bars with a nonzero position.
+    Order lifecycle records are de-duplicated into fill increments,
+    so terminal open positions and partial fills contribute to exposure and
+    turnover without changing closed-trade statistics. Drawdown duration counts
+    consecutive underwater equity bars. All undefined ratios use ``0.0`` so
+    serialized reports never contain NaN or Infinity.
     """
     if isinstance(periods_per_year, bool) or not isinstance(periods_per_year, int) or periods_per_year <= 0:
         raise ValueError("periods_per_year must be a positive integer")
 
     trade_records = tuple(trades or ())
+    fill_events = _order_fill_events(tuple(orders or ()))
     if closed_pnls is None:
         pnl_values = tuple(float(trade.net_pnl) for trade in trade_records)
     else:
@@ -82,19 +93,25 @@ def calculate_metrics(
     fee_value = _finite_scalar(fee_value, "total_fees", nonnegative=True)
     slippage_value = _finite_scalar(total_slippage, "total_slippage", nonnegative=True)
 
-    exposure_value = (
-        _derived_exposure(holding_values, len(equity_values))
-        if exposure is None
-        else _finite_scalar(exposure, "exposure")
-    )
+    if exposure is None:
+        exposure_value = (
+            _order_exposure(fill_events, equity_times)
+            if fill_events and equity_times
+            else _derived_exposure(holding_values, len(equity_values))
+        )
+    else:
+        exposure_value = _finite_scalar(exposure, "exposure")
     if not 0.0 <= exposure_value <= 1.0:
         raise ValueError("exposure must be in [0, 1]")
 
-    turnover_value = (
-        _derived_turnover(trade_records, equity_values)
-        if turnover is None
-        else _finite_scalar(turnover, "turnover", nonnegative=True)
-    )
+    if turnover is None:
+        turnover_value = (
+            _fill_turnover(fill_events, equity_values)
+            if fill_events
+            else _derived_turnover(trade_records, equity_values)
+        )
+    else:
+        turnover_value = _finite_scalar(turnover, "turnover", nonnegative=True)
     turnover_value = _finite_scalar(turnover_value, "turnover", nonnegative=True)
 
     wins = tuple(value for value in pnl_values if value > 0.0)
@@ -277,6 +294,77 @@ def _trade_holding_bars(
     if any(value < 0.0 for value in result):
         raise ValueError("trade exit_time must not precede entry_time")
     return result
+
+
+def _order_fill_events(orders: Sequence[OrderRecord]) -> tuple[_FillEvent, ...]:
+    cumulative: dict[str, tuple[str, float, float]] = {}
+    events: list[_FillEvent] = []
+    for order in orders:
+        filled = _finite_scalar(
+            order.filled_quantity, "order filled_quantity", nonnegative=True
+        )
+        prior_side, prior_quantity, prior_notional = cumulative.get(
+            order.order_id, (order.side, 0.0, 0.0)
+        )
+        if order.side not in {"BUY", "SELL"} or order.side != prior_side:
+            raise ValueError("order side must remain BUY or SELL")
+        if filled + 1e-12 < prior_quantity:
+            raise ValueError("order filled_quantity must be cumulative")
+        if filled <= prior_quantity + 1e-12:
+            continue
+        if order.fill_time is None or order.fill_price is None:
+            raise ValueError("new order fills require fill_time and fill_price")
+        if order.fill_time.tzinfo is None or order.fill_time.utcoffset() is None:
+            raise ValueError("order fill_time must be timezone-aware")
+        price = _finite_scalar(order.fill_price, "order fill_price", nonnegative=True)
+        cumulative_notional = filled * price
+        delta_quantity = filled - prior_quantity
+        delta_notional = cumulative_notional - prior_notional
+        if delta_notional < 0.0 or not math.isfinite(delta_notional):
+            raise ValueError("order fill notional must be finite and cumulative")
+        cumulative[order.order_id] = (
+            order.side,
+            filled,
+            cumulative_notional,
+        )
+        events.append(
+            _FillEvent(
+                timestamp=order.fill_time.astimezone(timezone.utc),
+                signed_quantity=delta_quantity if order.side == "BUY" else -delta_quantity,
+                notional=delta_notional,
+            )
+        )
+    return tuple(sorted(events, key=lambda event: event.timestamp))
+
+
+def _order_exposure(
+    events: Sequence[_FillEvent], equity_times: Sequence[datetime]
+) -> float:
+    if not events or not equity_times:
+        return 0.0
+    position = 0.0
+    event_index = 0
+    exposed_bars = 0
+    for timestamp in equity_times:
+        while event_index < len(events) and events[event_index].timestamp <= timestamp:
+            position += events[event_index].signed_quantity
+            event_index += 1
+        if position < -1e-9:
+            raise ValueError("sell fills exceed accumulated buy fills")
+        if position > 1e-12:
+            exposed_bars += 1
+    return exposed_bars / len(equity_times)
+
+
+def _fill_turnover(
+    events: Sequence[_FillEvent], equity: Sequence[float]
+) -> float:
+    if not events or not equity:
+        return 0.0
+    mean_equity = _finite_mean(equity)
+    if mean_equity <= 0.0:
+        return 0.0
+    return _derived_finite(sum(event.notional for event in events) / mean_equity)
 
 
 def _derived_exposure(holding_bars: Sequence[float], equity_count: int) -> float:

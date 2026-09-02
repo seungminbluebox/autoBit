@@ -16,6 +16,12 @@ def compute_trend_indicators(frame: pd.DataFrame, config: StrategyConfig) -> pd.
 
     result[f"ema_{config.ema_period}"] = result.ta.ema(length=config.ema_period)
     result[f"atr_{config.atr_period}"] = result.ta.atr(length=config.atr_period)
+    atr_percent = result[f"atr_{config.atr_period}"] / result["close"]
+    result["baseline_atr_pct"] = atr_percent.groupby(
+        result["segment_id"], sort=False
+    ).transform(
+        lambda values: values.shift(1).rolling(252, min_periods=1).median()
+    )
     result["entry_high"] = result["high"].shift(1).rolling(config.entry_period).max()
     result["exit_low"] = result["low"].shift(1).rolling(config.exit_period).min()
     result["previous_close"] = result["close"].shift(1)

@@ -6,8 +6,9 @@ import pytest
 
 from autobit.backtest.analyzers import PerformanceMetrics, calculate_metrics
 from autobit.backtest.benchmark import BuyAndHoldResult, run_buy_and_hold
-from autobit.backtest.engine import EquityPoint, TradeRecord
+from autobit.backtest.engine import EquityPoint, OrderRecord, TradeRecord
 from autobit.config import CostConfig
+from autobit.domain.models import OrderStatus
 
 import pandas as pd
 
@@ -219,3 +220,46 @@ def test_buy_and_hold_rejects_arithmetic_that_would_make_nonfinite_output() -> N
 
     with pytest.raises(ValueError, match="finite"):
         run_buy_and_hold(frame, CostConfig(fee_rate=0.5, slippage_rate=0.5))
+
+
+def test_open_position_partial_fills_drive_exposure_and_turnover_without_duplicates() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    equity = tuple(
+        EquityPoint(start + timedelta(hours=4 * index), 100.0)
+        for index in range(5)
+    )
+
+    def event(
+        order_id: str,
+        status: OrderStatus,
+        side: str,
+        filled: float,
+        fill_price: float,
+        fill_bar: int,
+    ) -> OrderRecord:
+        timestamp = start + timedelta(hours=4 * fill_bar)
+        return OrderRecord(
+            order_id=order_id,
+            status=status,
+            side=side,
+            requested_quantity=0.5,
+            filled_quantity=filled,
+            remainder_quantity=0.5 - filled,
+            occurred_at=timestamp,
+            signal_time=start,
+            fill_time=timestamp,
+            fill_price=fill_price,
+        )
+
+    orders = (
+        event("buy", OrderStatus.PARTIAL, "BUY", 0.2, 100.0, 1),
+        event("buy", OrderStatus.COMPLETED, "BUY", 0.5, 104.0, 2),
+        event("sell", OrderStatus.PARTIAL, "SELL", 0.1, 110.0, 3),
+        event("sell", OrderStatus.CANCELED, "SELL", 0.1, 110.0, 3),
+    )
+
+    metrics = calculate_metrics(equity_curve=equity, trades=[], orders=orders)
+
+    assert metrics.trade_count == 0
+    assert metrics.exposure == pytest.approx(0.8)
+    assert metrics.turnover == pytest.approx(0.63)
