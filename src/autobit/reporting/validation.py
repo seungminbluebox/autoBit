@@ -565,16 +565,29 @@ def _trade_ledger(metrics: MetricSnapshot) -> _TradeLedger:
     if metrics.average_loss == 0.0:
         losses = 0
         gross_losses = 0.0
-        if not _close(net_pnl, gross_wins):
-            raise ValueError("expectancy is inconsistent with win and loss evidence")
-    else:
-        losses_value = (net_pnl - gross_wins) / metrics.average_loss
+    elif gross_wins > 0.0:
+        if metrics.profit_factor <= 0.0:
+            raise ValueError("trades with wins and losses require positive profit_factor")
+        disclosed_gross_losses = gross_wins / metrics.profit_factor
+        losses_value = disclosed_gross_losses / abs(metrics.average_loss)
         losses = round(losses_value)
-        if losses < 0 or wins + losses > count or not _close(losses_value, losses):
+        if losses <= 0 or wins + losses > count or not _close(losses_value, losses):
+            raise ValueError("trade loss count implied by profit_factor must be integer-like")
+        gross_losses = losses * abs(metrics.average_loss)
+        if not _close(disclosed_gross_losses, gross_losses):
+            raise ValueError("profit_factor is inconsistent with average_loss and loss count")
+    else:
+        if metrics.profit_factor != 0.0:
+            raise ValueError("zero wins require profit_factor=0")
+        disclosed_gross_losses = -net_pnl
+        losses_value = disclosed_gross_losses / abs(metrics.average_loss)
+        losses = round(losses_value)
+        if losses <= 0 or wins + losses > count or not _close(losses_value, losses):
             raise ValueError("trade loss count implied by expectancy must be integer-like")
-        if losses == 0:
-            raise ValueError("zero losses require average_loss=0")
-        gross_losses = abs(losses * metrics.average_loss)
+        gross_losses = losses * abs(metrics.average_loss)
+    expected_net_pnl = gross_wins - gross_losses
+    if not _close(expected_net_pnl, net_pnl):
+        raise ValueError("expectancy is inconsistent with win and loss evidence")
     expected_profit_factor = gross_wins / gross_losses if gross_losses > 0.0 else 0.0
     expected_ratio = (
         metrics.average_win / abs(metrics.average_loss)

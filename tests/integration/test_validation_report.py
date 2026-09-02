@@ -568,8 +568,11 @@ def test_fold_cost_totals_must_sum_to_stitched_costs(tmp_path: Path, field: str)
     ("field", "value"),
     (
         ("profit_factor", 99.0),
+        ("profit_factor", 0.0),
+        ("profit_factor", -1.0),
         ("win_rate", 0.333),
         ("expectancy", 9.0),
+        ("average_loss", 0.02),
         ("average_win_loss_ratio", 99.0),
     ),
 )
@@ -579,7 +582,7 @@ def test_each_fold_trade_metric_algebra_is_self_consistent(
     report = _report()
     row = report.fold_metrics[0]
     forged = replace(row, metrics=replace(row.metrics, **{field: value}))
-    with pytest.raises(ValueError, match="trade|win|profit|expectancy"):
+    with pytest.raises(ValueError, match="trade|win|loss|profit|expectancy"):
         write_validation_bundle(
             tmp_path / "report",
             _replace_fold_metric(report, row.fold_id, row.trial_id, row.cost_id, forged),
@@ -620,19 +623,22 @@ def test_zero_implied_losses_require_zero_average_loss_and_ratio(tmp_path: Path)
         replace(report, fold_metrics=tuple(rebuilt_folds)),
         "entry_40", "zero", stitched,
     )
-    with pytest.raises(ValueError, match="zero losses|average_loss"):
+    with pytest.raises(ValueError, match="zero losses|average_loss|profit_factor"):
         write_validation_bundle(tmp_path / "report", forged)
 
 
 @pytest.mark.parametrize(
     ("closed_pnls", "equity_curve"),
     (
-        ((1.0, 2.0), (100.0, 101.0)),
-        ((-1.0, -2.0), (100.0, 99.0)),
+        ((1.0, 2.0), (100.0, 103.0)),
+        ((-1.0, -2.0), (100.0, 97.0)),
         ((0.0,), (100.0, 100.0)),
         ((1e-8,), (100.0, 100.00000001)),
         ((-1e-8,), (100.0, 99.99999999)),
         ((1.0, -1e-8), (100.0, 100.99999999)),
+        ((1.0, -1e-10), (100.0, 100.9999999999)),
+        ((1.0, -1e-12), (100.0, 100.999999999999)),
+        ((1e8, -1e-4), (1e10, 10099999999.9999)),
     ),
 )
 def test_task2_trade_metrics_preserve_exact_sign_for_tiny_pnl(
@@ -641,9 +647,49 @@ def test_task2_trade_metrics_preserve_exact_sign_for_tiny_pnl(
     snapshot = _snapshot_from_task2(closed_pnls, equity_curve)
 
     validation_reporting._validate_metrics(snapshot, cost_id="zero")
-    if closed_pnls == (1.0, -1e-8):
-        assert snapshot.profit_factor == pytest.approx(1e8)
-        assert snapshot.average_win_loss_ratio == pytest.approx(1e8)
+    if len(closed_pnls) == 2 and closed_pnls[0] > 0.0 and closed_pnls[1] < 0.0:
+        expected_ratio = closed_pnls[0] / abs(closed_pnls[1])
+        assert snapshot.profit_factor == pytest.approx(expected_ratio)
+        assert snapshot.average_win_loss_ratio == pytest.approx(expected_ratio)
+
+
+@pytest.mark.parametrize(
+    ("closed_pnls", "equity_curve"),
+    (
+        ((1.0, -1e-12), (100.0, 100.999999999999)),
+        ((1e8, -1e-4), (1e10, 10099999999.9999)),
+    ),
+)
+def test_bundle_accepts_cancellation_prone_task2_trade_metrics(
+    tmp_path: Path,
+    closed_pnls: tuple[float, ...],
+    equity_curve: tuple[float, ...],
+) -> None:
+    report = _report()
+    snapshot = _snapshot_from_task2(closed_pnls, equity_curve)
+    empty = _snapshot_from_task2((), (100.0, 100.0))
+    fold_metrics = tuple(
+        replace(
+            row,
+            metrics=snapshot if row.fold_id == "fold-000" else empty,
+        )
+        if (row.trial_id, row.cost_id) == ("entry_40", "zero")
+        else row
+        for row in report.fold_metrics
+    )
+    stitched = next(
+        row for row in report.trial_metrics
+        if (row.trial_id, row.cost_id) == ("entry_40", "zero")
+    )
+    report = _replace_trial_metric(
+        replace(report, fold_metrics=fold_metrics),
+        stitched.trial_id,
+        stitched.cost_id,
+        replace(stitched, metrics=snapshot),
+    )
+
+    bundle = write_validation_bundle(tmp_path / "report", report)
+    assert bundle.trial_metrics_path.exists()
 
 
 @pytest.mark.parametrize(
