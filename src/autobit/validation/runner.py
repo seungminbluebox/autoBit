@@ -471,18 +471,26 @@ def _validate_quality_surface(
     ):
         raise ValueError("filled quality rows must be flat zero-volume candles")
 
-    # Plan 1 fills only isolated singleton gaps whose immediate neighbours are
-    # genuinely observed timestamps.  A quarantined raw candle still counts as
-    # observed; a filled candle and an unquarantined unavailable row are both
-    # synthetic and cannot serve as a boundary.
+    # Plan 1 fills only isolated singleton gaps from the immediate predecessor's
+    # usable close.  Its predecessor must therefore be a normal observed candle;
+    # the successor may also be an observed raw candle that was quarantined.
     observed = quarantined | (available & ~filled)
+    normal_observed = available & ~filled & ~quarantined
     for position in (offset for offset, value in enumerate(filled) if bool(value)):
         if position == 0 or position == len(frame) - 1:
             raise ValueError("filled quality row must be an interior singleton")
         if bool(filled.iloc[position - 1]) or bool(filled.iloc[position + 1]):
             raise ValueError("filled quality rows must be isolated singletons")
-        if not bool(observed.iloc[position - 1]) or not bool(observed.iloc[position + 1]):
-            raise ValueError("filled quality row must be bounded by observed nonfilled rows")
+        if not bool(normal_observed.iloc[position - 1]):
+            raise ValueError("filled quality row requires a normal observed predecessor")
+        if not bool(observed.iloc[position + 1]):
+            raise ValueError("filled quality row requires an observed nonfilled successor")
+        predecessor_close = numeric.iloc[position - 1]["close"]
+        if not (
+            numeric.iloc[position][["open", "high", "low", "close"]]
+            == predecessor_close
+        ).all():
+            raise ValueError("filled quality row must equal its predecessor close")
         if not (
             segment_values[position - 1]
             == segment_values[position]
@@ -510,8 +518,9 @@ def _validate_quality_surface(
             if segment_values[position] != current_segment:
                 raise ValueError("quality segment_id must remain stable inside a long-gap region")
             position += 1
-        if position - gap_start < 2:
-            raise ValueError("a long-gap region must contain at least two unavailable rows")
+        gap_size = position - gap_start
+        if gap_size == 1 and not bool(quarantined.iloc[gap_start - 1]):
+            raise ValueError("a one-row long-gap region requires a quarantined predecessor")
         if position == len(frame) or not bool(observed.iloc[position]):
             raise ValueError("a long-gap region must have a following observed canonical row")
         current_segment += 1

@@ -1204,12 +1204,17 @@ def _set_filled_quality_row(frame: pd.DataFrame, position: int) -> pd.Timestamp:
     return timestamp
 
 
-def test_real_canonical_single_gap_accepts_one_observed_bounded_fill() -> None:
+@pytest.mark.parametrize("successor_quarantined", (False, True))
+def test_real_canonical_single_gap_accepts_one_observed_bounded_fill(
+    successor_quarantined: bool,
+) -> None:
     raw = _frame(20).loc[:, ["open", "high", "low", "close", "volume"]]
     missing_time = raw.index[5]
     predecessor = raw.index[4]
     successor = raw.index[6]
     prior_close = float(raw.loc[predecessor, "close"])
+    if successor_quarantined:
+        raw.loc[successor, "high"] = raw.loc[successor, "low"] - 1.0
     canonical = canonicalize_ohlcv(
         raw.drop(index=missing_time),
         (raw.index[-1] + timedelta(hours=8)).to_pydatetime(),
@@ -1222,7 +1227,27 @@ def test_real_canonical_single_gap_accepts_one_observed_bounded_fill() -> None:
     assert float(validated.loc[missing_time, "volume"]) == 0.0
     assert not bool(validated.loc[missing_time, "entry_data_valid"])
     assert not bool(validated.loc[successor, "entry_data_valid"])
+    assert bool(validated.loc[successor, "is_quarantined"]) is successor_quarantined
     assert validated.loc[[predecessor, missing_time, successor], "segment_id"].tolist() == [0, 0, 0]
+
+
+@pytest.mark.parametrize("malformation", ("wrong_prior_close", "quarantined_predecessor"))
+def test_filled_price_invariant_rejects_noncanonical_rows(malformation: str) -> None:
+    frame = _quality_topology_frame()
+    predecessor = frame.index[4]
+    filled_time = _set_filled_quality_row(frame, 5)
+    frame.loc[filled_time:, "entry_data_valid"] = False
+
+    if malformation == "wrong_prior_close":
+        wrong_price = float(frame.loc[predecessor, "close"]) + 1.0
+        frame.loc[filled_time, ["open", "high", "low", "close"]] = wrong_price
+    else:
+        frame.loc[predecessor, ["open", "high", "low", "close", "volume"]] = math.nan
+        frame.loc[predecessor, "is_quarantined"] = True
+        frame.loc[predecessor:, "entry_data_valid"] = False
+
+    with pytest.raises(ValueError, match="filled.*predecessor"):
+        validate_walk_forward_frame(frame)
 
 
 @pytest.mark.parametrize(
@@ -1290,7 +1315,7 @@ def test_filled_topology_rejects_noncanonical_synthetic_rows(malformation: str) 
 def test_long_gap_topology_rejects_fabricated_or_misplaced_transitions(
     malformation: str,
 ) -> None:
-    """Only a bounded 2+ row canonical long gap can increment a segment."""
+    """A singleton after a normal candle cannot masquerade as a long gap."""
     frame = _quality_topology_frame()
     gap_start = 4
     gap_end = 6
@@ -1321,6 +1346,34 @@ def test_long_gap_topology_rejects_fabricated_or_misplaced_transitions(
 
     with pytest.raises(ValueError, match="long-gap|segment_id transition"):
         validate_walk_forward_frame(frame)
+
+
+@pytest.mark.parametrize("successor_quarantined", (False, True))
+def test_real_canonical_unfilled_singleton_after_quarantine_is_accepted(
+    successor_quarantined: bool,
+) -> None:
+    """A quarantined predecessor leaves no usable close for Plan 1 to fill from."""
+    raw = _frame(20).loc[:, ["open", "high", "low", "close", "volume"]]
+    finite_time = raw.index[4]
+    quarantined_time = raw.index[5]
+    missing_time = raw.index[6]
+    successor = raw.index[7]
+    raw.loc[quarantined_time, "high"] = raw.loc[quarantined_time, "low"] - 1.0
+    if successor_quarantined:
+        raw.loc[successor, "high"] = raw.loc[successor, "low"] - 1.0
+
+    canonical = canonicalize_ohlcv(
+        raw.drop(index=missing_time),
+        (raw.index[-1] + timedelta(hours=8)).to_pydatetime(),
+    ).frame
+    validated = validate_walk_forward_frame(canonical)
+
+    assert bool(validated.loc[quarantined_time, "is_quarantined"])
+    assert not bool(validated.loc[missing_time, "is_quarantined"])
+    assert not bool(validated.loc[missing_time, "is_filled"])
+    assert validated.loc[missing_time, ["open", "high", "low", "close", "volume"]].isna().all()
+    assert bool(validated.loc[successor, "is_quarantined"]) is successor_quarantined
+    assert validated.loc[[finite_time, quarantined_time, missing_time, successor], "segment_id"].tolist() == [0, 0, 0, 1]
 
 
 @pytest.mark.parametrize("boundary_side", ("predecessor", "successor"))
