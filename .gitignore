@@ -1,2 +1,8 @@
 .env
 .worktrees/
+.venv/
+data/raw/
+data/processed/
+reports/
+*.sqlite3
+*.tmp
