@@ -100,7 +100,20 @@ class _FillEvidence:
     timestamp: datetime
     side: str
     quantity: float
+    price: float
+    notional: float
     fee: float
+    slippage: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ClosedTradeCycle:
+    entry_time: datetime
+    exit_time: datetime
+    quantity: float
+    entry_notional: float
+    exit_notional: float
+    fees: float
     slippage: float
 
 
@@ -111,8 +124,10 @@ class _OrderEvidence:
     buy_quantity: float
     sell_quantity: float
     fill_fees: float
+    fill_slippage: float
     total_fees: float
     total_slippage: float
+    cycles: tuple[_ClosedTradeCycle, ...]
 
 
 BacktestFn = Callable[[BacktestRequest], BacktestResult]
@@ -449,8 +464,10 @@ def _validate_backtest_result(result: object, request: BacktestRequest) -> None:
     if not math.isclose(result.equity_curve[-1].equity, result.final_equity, rel_tol=0.0, abs_tol=1e-10):
         raise ValueError("backtest final equity must match the final phase equity")
     order_evidence = _validate_orders(result.orders, request)
-    _validate_trades(result.trades, request, order_evidence)
+    realized_net_pnl = _validate_trades(result.trades, request, order_evidence)
     _validate_reconciliation(result, order_evidence)
+    if not _close_enough(result.final_equity, request.initial_equity + realized_net_pnl):
+        raise ValueError("final phase equity must reconcile with closed trade cycles")
 
 
 def _validate_orders(orders: tuple[OrderRecord, ...], request: BacktestRequest) -> _OrderEvidence:
@@ -532,21 +549,25 @@ def _validate_orders(orders: tuple[OrderRecord, ...], request: BacktestRequest) 
             sell_quantity += fill.quantity
         if inventory < -_RECONCILIATION_TOLERANCE:
             raise ValueError("backtest fills must not create negative BTC inventory")
-    if not _close_enough(inventory, 0.0):
-        raise ValueError("forced-liquidation phase must finish with zero BTC inventory")
-
     total_fees = sum(order.fee for order in final_orders)
     fill_fees = sum(fill.fee for fill in fills)
     if not _close_enough(fill_fees, total_fees):
         raise ValueError("backtest order fees must reconcile with fill increments")
+    total_slippage = sum(order.slippage for order in final_orders)
+    fill_slippage = sum(fill.slippage for fill in fills)
+    if not _close_enough(fill_slippage, total_slippage):
+        raise ValueError("backtest order slippage must reconcile with fill increments")
+    cycles = _reconstruct_closed_trade_cycles(fills)
     return _OrderEvidence(
         final_orders=tuple(final_orders),
         fills=tuple(fills),
         buy_quantity=buy_quantity,
         sell_quantity=sell_quantity,
         fill_fees=fill_fees,
+        fill_slippage=fill_slippage,
         total_fees=total_fees,
-        total_slippage=sum(order.slippage for order in final_orders),
+        total_slippage=total_slippage,
+        cycles=cycles,
     )
 
 
@@ -561,6 +582,70 @@ def _finite_order_values(order: OrderRecord) -> tuple[float, float, float, float
     if not all(_is_finite_number(value) for value in values):
         raise ValueError("backtest order values must be finite")
     return tuple(float(value) for value in values)  # type: ignore[return-value]
+
+
+def _reconstruct_closed_trade_cycles(
+    fills: Sequence[_FillEvidence],
+) -> tuple[_ClosedTradeCycle, ...]:
+    """Build exact flat-to-flat economics from chronological native fill increments."""
+    inventory = 0.0
+    entry_time: datetime | None = None
+    entry_quantity = 0.0
+    entry_notional = 0.0
+    entry_fees = 0.0
+    entry_slippage = 0.0
+    exit_quantity = 0.0
+    exit_notional = 0.0
+    exit_fees = 0.0
+    exit_slippage = 0.0
+    cycles: list[_ClosedTradeCycle] = []
+
+    for fill in fills:
+        if fill.side == "BUY":
+            if _close_enough(inventory, 0.0):
+                entry_time = fill.timestamp
+            inventory += fill.quantity
+            entry_quantity += fill.quantity
+            entry_notional += fill.notional
+            entry_fees += fill.fee
+            entry_slippage += fill.slippage
+            continue
+
+        inventory -= fill.quantity
+        exit_quantity += fill.quantity
+        exit_notional += fill.notional
+        exit_fees += fill.fee
+        exit_slippage += fill.slippage
+        if inventory < -_RECONCILIATION_TOLERANCE:
+            raise ValueError("backtest fills must not create negative BTC inventory")
+        if not _close_enough(inventory, 0.0):
+            continue
+        if entry_time is None or not _close_enough(entry_quantity, exit_quantity):
+            raise ValueError("backtest trade cycles must close matched BTC quantity")
+        cycles.append(
+            _ClosedTradeCycle(
+                entry_time=entry_time,
+                exit_time=fill.timestamp,
+                quantity=entry_quantity,
+                entry_notional=entry_notional,
+                exit_notional=exit_notional,
+                fees=entry_fees + exit_fees,
+                slippage=entry_slippage + exit_slippage,
+            )
+        )
+        entry_time = None
+        entry_quantity = 0.0
+        entry_notional = 0.0
+        entry_fees = 0.0
+        entry_slippage = 0.0
+        exit_quantity = 0.0
+        exit_notional = 0.0
+        exit_fees = 0.0
+        exit_slippage = 0.0
+
+    if not _close_enough(inventory, 0.0):
+        raise ValueError("forced-liquidation phase must finish with zero BTC inventory")
+    return tuple(cycles)
 
 
 def _validate_order_lifecycle(
@@ -590,6 +675,7 @@ def _validate_order_lifecycle(
         OrderStatus.PARTIAL: terminal | {OrderStatus.PARTIAL},
     }
     fills: dict[int, _FillEvidence] = {}
+    pending_slippage = 0.0
     previous = lifecycle[0]
     for current in lifecycle[1:]:
         if (
@@ -630,34 +716,57 @@ def _validate_order_lifecycle(
             or fill_delta <= _RECONCILIATION_TOLERANCE
         ):
             raise ValueError("COMPLETED orders must fully settle exactly once")
+        if fill_delta <= _RECONCILIATION_TOLERANCE:
+            pending_slippage += max(0.0, slippage_delta)
         if fill_delta > _RECONCILIATION_TOLERANCE:
             if current.fill_time is None:
                 raise ValueError("incremental backtest fills require a fill timestamp")
+            previous_notional = _cumulative_order_notional(previous.record)
+            current_notional = _cumulative_order_notional(current.record)
+            notional_delta = current_notional - previous_notional
+            if not math.isfinite(notional_delta) or notional_delta <= _RECONCILIATION_TOLERANCE:
+                raise ValueError("incremental backtest fills require positive notional")
             fills[current.ordinal] = _FillEvidence(
                 timestamp=current.fill_time,
                 side=current.record.side,
                 quantity=fill_delta,
+                price=notional_delta / fill_delta,
+                notional=notional_delta,
                 fee=max(0.0, fee_delta),
-                slippage=max(0.0, slippage_delta),
+                slippage=pending_slippage + max(0.0, slippage_delta),
             )
+            pending_slippage = 0.0
         previous = current
     if lifecycle[-1].record.status not in terminal:
         raise ValueError("backtest order lifecycle must be terminal")
+    if pending_slippage > _RECONCILIATION_TOLERANCE:
+        raise ValueError("backtest order slippage requires a fill increment")
     return lifecycle[-1].record, fills
+
+
+def _cumulative_order_notional(order: OrderRecord) -> float:
+    if order.filled_quantity <= _RECONCILIATION_TOLERANCE:
+        return 0.0
+    if order.fill_price is None or not _is_finite_number(order.fill_price):
+        raise ValueError("filled backtest orders require finite fill notional")
+    return float(order.filled_quantity) * float(order.fill_price)
 
 
 def _validate_trades(
     trades: tuple[TradeRecord, ...],
     request: BacktestRequest,
     order_evidence: _OrderEvidence,
-) -> None:
+) -> float:
     """Require finite, closed, internally consistent trade evidence."""
     buy_fill_times = {fill.timestamp for fill in order_evidence.fills if fill.side == "BUY"}
     sell_fill_times = {fill.timestamp for fill in order_evidence.fills if fill.side == "SELL"}
     previous_exit: datetime | None = None
     trade_quantity = 0.0
     trade_fees = 0.0
-    for trade in trades:
+    realized_net_pnl = 0.0
+    if len(trades) != len(order_evidence.cycles):
+        raise ValueError("backtest trade cycles must match closed fill cycles")
+    for trade, cycle in zip(trades, order_evidence.cycles, strict=True):
         if not isinstance(trade, TradeRecord):
             raise ValueError("backtest trades must be TradeRecord values")
         values = (
@@ -680,6 +789,21 @@ def _validate_trades(
             raise ValueError("backtest trade chronology must not overlap")
         if entry_time not in buy_fill_times or exit_time not in sell_fill_times:
             raise ValueError("backtest trade times must match order fill evidence")
+        expected_entry_price = cycle.entry_notional / cycle.quantity
+        expected_exit_price = cycle.exit_notional / cycle.quantity
+        expected_gross_pnl = cycle.exit_notional - cycle.entry_notional
+        expected_net_pnl = expected_gross_pnl - cycle.fees
+        if (
+            entry_time != cycle.entry_time
+            or exit_time != cycle.exit_time
+            or not _close_enough(trade.quantity, cycle.quantity)
+            or not _close_enough(trade.entry_price, expected_entry_price)
+            or not _close_enough(trade.exit_price, expected_exit_price)
+            or not _close_enough(trade.fees, cycle.fees)
+            or not _close_enough(trade.gross_pnl, expected_gross_pnl)
+            or not _close_enough(trade.net_pnl, expected_net_pnl)
+        ):
+            raise ValueError("backtest trade must reconcile with its closed fill cycle")
         gross = trade.quantity * (trade.exit_price - trade.entry_price)
         if not math.isclose(trade.gross_pnl, gross, rel_tol=0.0, abs_tol=1e-10):
             raise ValueError("backtest trade gross PnL must reconcile")
@@ -690,10 +814,12 @@ def _validate_trades(
         previous_exit = exit_time
         trade_quantity += trade.quantity
         trade_fees += trade.fees
+        realized_net_pnl += trade.net_pnl
     if not _close_enough(trade_quantity, order_evidence.sell_quantity):
         raise ValueError("closed trade quantity must reconcile with sell fills")
     if not _close_enough(trade_fees, order_evidence.total_fees):
         raise ValueError("closed trade fees must reconcile with order fills")
+    return realized_net_pnl
 
 
 def _validate_reconciliation(result: BacktestResult, order_evidence: _OrderEvidence) -> None:

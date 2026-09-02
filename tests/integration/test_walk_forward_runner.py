@@ -58,7 +58,7 @@ def _folds(frame: pd.DataFrame, *, count: int = 1) -> tuple[FoldWindow, ...]:
     return canonical[:count]
 
 
-def _result(request: BacktestRequest, values: tuple[float, ...] = (100.0, 110.0, 121.0)) -> BacktestResult:
+def _result(request: BacktestRequest, values: tuple[float, ...] = (100.0, 100.0, 100.0)) -> BacktestResult:
     points = tuple(
         EquityPoint(timestamp.to_pydatetime(), value)
         for timestamp, value in zip(request.frame.index[-len(values):], values, strict=True)
@@ -126,6 +126,124 @@ def _order_lifecycle(
             fill_price=100.0 if filled > 0.0 else None,
             **common,
         ),
+    )
+
+
+def _filled_lifecycle(
+    *,
+    order_id: str,
+    side: str,
+    quantity: float,
+    occurred_at: object,
+    fill_price: float,
+    fee: float = 0.0,
+    slippage: float = 0.0,
+) -> tuple[OrderRecord, ...]:
+    """Construct one fully filled native-shaped order at a known economic price."""
+    common = dict(
+        order_id=order_id,
+        side=side,
+        requested_quantity=quantity,
+        occurred_at=occurred_at,
+        signal_time=occurred_at,
+    )
+    return (
+        OrderRecord(
+            status=OrderStatus.CREATED,
+            filled_quantity=0.0,
+            remainder_quantity=quantity,
+            **common,
+        ),
+        OrderRecord(
+            status=OrderStatus.SUBMITTED,
+            filled_quantity=0.0,
+            remainder_quantity=quantity,
+            **common,
+        ),
+        OrderRecord(
+            status=OrderStatus.ACCEPTED,
+            filled_quantity=0.0,
+            remainder_quantity=quantity,
+            **common,
+        ),
+        OrderRecord(
+            status=OrderStatus.COMPLETED,
+            filled_quantity=quantity,
+            remainder_quantity=0.0,
+            fill_time=occurred_at,
+            fill_price=fill_price,
+            fee=fee,
+            slippage=slippage,
+            **common,
+        ),
+    )
+
+
+def _ledger_result(
+    request: BacktestRequest,
+    *,
+    values: tuple[float, ...],
+    orders: tuple[OrderRecord, ...],
+    trades: tuple[TradeRecord, ...],
+    total_fees: float,
+    total_slippage: float = 0.0,
+) -> BacktestResult:
+    return replace(
+        _result(request, values),
+        orders=orders,
+        trades=trades,
+        total_fees=total_fees,
+        total_slippage=total_slippage,
+    )
+
+
+def _single_cycle_result(
+    request: BacktestRequest,
+    values: tuple[float, ...],
+    *,
+    entry_price: float,
+    exit_price: float,
+    fees: float = 0.0,
+) -> BacktestResult:
+    """Return a phase curve with one evidence-backed flat-to-flat BTC cycle."""
+    entry_time = request.frame.index[-len(values)].to_pydatetime()
+    exit_time = request.frame.index[-1].to_pydatetime()
+    gross_pnl = exit_price - entry_price
+    net_pnl = gross_pnl - fees
+    return _ledger_result(
+        request,
+        values=values,
+        orders=(
+            *_filled_lifecycle(
+                order_id="single-cycle-buy",
+                side="BUY",
+                quantity=1.0,
+                occurred_at=entry_time,
+                fill_price=entry_price,
+            ),
+            *_filled_lifecycle(
+                order_id="single-cycle-sell",
+                side="SELL",
+                quantity=1.0,
+                occurred_at=exit_time,
+                fill_price=exit_price,
+                fee=fees,
+            ),
+        ),
+        trades=(
+            TradeRecord(
+                entry_time=entry_time,
+                exit_time=exit_time,
+                quantity=1.0,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                gross_pnl=gross_pnl,
+                net_pnl=net_pnl,
+                fees=fees,
+                exit_reason="FORCED_END",
+            ),
+        ),
+        total_fees=fees,
     )
 
 
@@ -394,7 +512,7 @@ def test_runner_accepts_tiny_initial_equity_floating_point_drift() -> None:
             and request.trial_id == "baseline"
             and request.cost_id == "zero"
         ):
-            return _result(request, (100.0 + 5e-11, 110.0, 121.0))
+            return _result(request, (100.0 + 5e-11, 100.0, 100.0))
         return _result(request)
 
     result = run_walk_forward(frame, folds, fake_backtest)
@@ -559,6 +677,181 @@ def test_runner_retains_economically_inconsistent_order_and_trade_evidence() -> 
         assert stitched.status == "INCOMPLETE"
 
 
+def test_runner_retains_trade_records_that_conflict_with_fill_cycles() -> None:
+    """Aggregates alone cannot prove a trade used the prices, lots, or PnL it claims."""
+    frame = _frame()
+    folds = _folds(frame)
+    invalid = {
+        ("baseline", "zero"): "forged_price_and_pnl",
+        ("baseline", "baseline"): "swapped_two_cycle_economics",
+        ("ema_150", "zero"): "final_equity_gap",
+    }
+
+    def fake_backtest(request: BacktestRequest) -> BacktestResult:
+        kind = invalid.get((request.trial_id, request.cost_id))
+        if request.phase != "OOS" or kind is None:
+            return _result(request, (100.0, 100.0, 100.0))
+        first = request.frame.index[-9].to_pydatetime()
+        second = request.frame.index[-8].to_pydatetime()
+        third = request.frame.index[-7].to_pydatetime()
+        fourth = request.frame.index[-6].to_pydatetime()
+        if kind == "forged_price_and_pnl":
+            return _ledger_result(
+                request,
+                values=(100.0, 100.0, 100.0),
+                orders=(
+                    *_filled_lifecycle(
+                        order_id="buy-100",
+                        side="BUY",
+                        quantity=1.0,
+                        occurred_at=first,
+                        fill_price=100.0,
+                    ),
+                    *_filled_lifecycle(
+                        order_id="sell-100",
+                        side="SELL",
+                        quantity=1.0,
+                        occurred_at=second,
+                        fill_price=100.0,
+                    ),
+                ),
+                trades=(
+                    TradeRecord(
+                        entry_time=first,
+                        exit_time=second,
+                        quantity=1.0,
+                        entry_price=1.0,
+                        exit_price=2.0,
+                        gross_pnl=1.0,
+                        net_pnl=1.0,
+                        fees=0.0,
+                        exit_reason="FORCED_END",
+                    ),
+                ),
+                total_fees=0.0,
+            )
+        if kind == "swapped_two_cycle_economics":
+            return _ledger_result(
+                request,
+                values=(100.0, 102.8, 102.8),
+                orders=(
+                    *_filled_lifecycle(
+                        order_id="cycle-one-buy",
+                        side="BUY",
+                        quantity=1.0,
+                        occurred_at=first,
+                        fill_price=100.0,
+                        fee=0.1,
+                    ),
+                    *_filled_lifecycle(
+                        order_id="cycle-one-sell",
+                        side="SELL",
+                        quantity=1.0,
+                        occurred_at=second,
+                        fill_price=101.0,
+                        fee=0.2,
+                    ),
+                    *_filled_lifecycle(
+                        order_id="cycle-two-buy",
+                        side="BUY",
+                        quantity=2.0,
+                        occurred_at=third,
+                        fill_price=100.0,
+                        fee=0.4,
+                    ),
+                    *_filled_lifecycle(
+                        order_id="cycle-two-sell",
+                        side="SELL",
+                        quantity=2.0,
+                        occurred_at=fourth,
+                        fill_price=102.0,
+                        fee=0.5,
+                    ),
+                ),
+                trades=(
+                    TradeRecord(
+                        entry_time=first,
+                        exit_time=second,
+                        quantity=2.0,
+                        entry_price=100.0,
+                        exit_price=101.0,
+                        gross_pnl=2.0,
+                        net_pnl=1.1,
+                        fees=0.9,
+                        exit_reason="CLOSE_EXIT",
+                    ),
+                    TradeRecord(
+                        entry_time=third,
+                        exit_time=fourth,
+                        quantity=1.0,
+                        entry_price=100.0,
+                        exit_price=102.0,
+                        gross_pnl=2.0,
+                        net_pnl=1.7,
+                        fees=0.3,
+                        exit_reason="CLOSE_EXIT",
+                    ),
+                ),
+                total_fees=1.2,
+            )
+        return _ledger_result(
+            request,
+            values=(100.0, 100.0, 100.0),
+            orders=(
+                *_filled_lifecycle(
+                    order_id="buy-then-profit",
+                    side="BUY",
+                    quantity=1.0,
+                    occurred_at=first,
+                    fill_price=100.0,
+                ),
+                *_filled_lifecycle(
+                    order_id="sell-then-profit",
+                    side="SELL",
+                    quantity=1.0,
+                    occurred_at=second,
+                    fill_price=101.0,
+                ),
+            ),
+            trades=(
+                TradeRecord(
+                    entry_time=first,
+                    exit_time=second,
+                    quantity=1.0,
+                    entry_price=100.0,
+                    exit_price=101.0,
+                    gross_pnl=1.0,
+                    net_pnl=1.0,
+                    fees=0.0,
+                    exit_reason="CLOSE_EXIT",
+                ),
+            ),
+            total_fees=0.0,
+        )
+
+    result = run_walk_forward(frame, folds, fake_backtest)
+    failed = {
+        (run.trial_id, run.cost_id)
+        for run in result.runs
+        if run.phase == "OOS" and run.status == "FAILED"
+    }
+
+    assert failed == set(invalid)
+    for trial_id, cost_id in invalid:
+        failed_run = next(
+            run
+            for run in result.runs
+            if run.phase == "OOS" and run.trial_id == trial_id and run.cost_id == cost_id
+        )
+        assert "cycle" in (failed_run.error or "")
+        stitched = next(
+            item
+            for item in result.stitched_oos
+            if item.trial_id == trial_id and item.cost_id == cost_id
+        )
+        assert stitched.status == "INCOMPLETE"
+
+
 @pytest.mark.parametrize(
     ("fixture_name", "config"),
     (
@@ -642,9 +935,21 @@ def test_stitched_oos_compounds_within_fold_returns_without_reset_or_boundary_du
     folds = _folds(frame, count=2)
 
     def fake_backtest(request: BacktestRequest) -> BacktestResult:
-        if request.phase == "OOS" and request.fold_id == "fold-001":
-            return _result(request, (100.0, 90.0, 99.0))
-        return _result(request)
+        if request.phase != "OOS":
+            return _result(request)
+        if request.fold_id == "fold-001":
+            return _single_cycle_result(
+                request,
+                (100.0, 90.0, 99.0),
+                entry_price=100.0,
+                exit_price=99.0,
+            )
+        return _single_cycle_result(
+            request,
+            (100.0, 110.0, 121.0),
+            entry_price=100.0,
+            exit_price=121.0,
+        )
 
     result = run_walk_forward(frame, folds, fake_backtest)
     stitched = next(
@@ -672,9 +977,22 @@ def test_stitched_oos_preserves_a_complete_bankruptcy_path_without_dividing_by_z
     folds = _folds(frame, count=2)
 
     def fake_backtest(request: BacktestRequest) -> BacktestResult:
-        if request.phase == "OOS" and request.fold_id == "fold-000":
-            return _result(request, (100.0, 0.0, 0.0))
-        return _result(request)
+        if request.phase != "OOS":
+            return _result(request)
+        if request.fold_id == "fold-000":
+            return _single_cycle_result(
+                request,
+                (100.0, 0.0, 0.0),
+                entry_price=100.0,
+                exit_price=1.0,
+                fees=1.0,
+            )
+        return _single_cycle_result(
+            request,
+            (100.0, 110.0, 121.0),
+            entry_price=100.0,
+            exit_price=121.0,
+        )
 
     result = run_walk_forward(frame, folds, fake_backtest)
     stitched = next(
