@@ -1188,11 +1188,10 @@ def _quality_topology_frame() -> pd.DataFrame:
     (
         "single_gap",
         "leading_gap",
-        "quarantined_predecessor",
-        "quarantined_successor",
         "trailing_gap",
         "repeated_transition",
         "misplaced_transition",
+        "transition_on_unobserved_boundary",
     ),
 )
 def test_long_gap_topology_rejects_fabricated_or_misplaced_transitions(
@@ -1217,24 +1216,43 @@ def test_long_gap_topology_rejects_fabricated_or_misplaced_transitions(
     if gap_end < len(frame):
         frame.loc[frame.index[gap_end]:, "segment_id"] = 1
 
-    if malformation == "quarantined_predecessor":
-        predecessor = frame.index[gap_start - 1]
-        frame.loc[predecessor, ["open", "high", "low", "close", "volume"]] = math.nan
-        frame.loc[predecessor, "is_quarantined"] = True
-        frame.loc[predecessor:, "entry_data_valid"] = False
-    elif malformation == "quarantined_successor":
-        successor = frame.index[gap_end]
-        frame.loc[successor, ["open", "high", "low", "close", "volume"]] = math.nan
-        frame.loc[successor, "is_quarantined"] = True
-        frame.loc[successor:, "entry_data_valid"] = False
-    elif malformation == "repeated_transition":
+    if malformation == "repeated_transition":
         frame.loc[frame.index[gap_end + 1]:, "segment_id"] = 2
     elif malformation == "misplaced_transition":
         frame.loc[frame.index[gap_start - 1]:frame.index[gap_end - 1], "segment_id"] = 1
         frame.loc[frame.index[gap_end]:, "segment_id"] = 2
+    elif malformation == "transition_on_unobserved_boundary":
+        boundary = frame.index[gap_end]
+        frame.loc[boundary, ["open", "high", "low", "close", "volume"]] = math.nan
+        frame.loc[boundary, "entry_data_valid"] = False
 
     with pytest.raises(ValueError, match="long-gap|segment_id transition"):
         validate_walk_forward_frame(frame)
+
+
+@pytest.mark.parametrize("boundary_side", ("predecessor", "successor"))
+def test_real_canonical_long_gap_accepts_an_observed_quarantine_boundary(
+    boundary_side: str,
+) -> None:
+    """An invalid raw candle remains observed even though canonical OHLCV is cleared."""
+    raw = _frame(20).loc[:, ["open", "high", "low", "close", "volume"]]
+    gap_times = tuple(raw.index[5:7])
+    boundary_time = raw.index[4] if boundary_side == "predecessor" else raw.index[7]
+    raw = raw.drop(index=list(gap_times))
+    raw.loc[boundary_time, "high"] = raw.loc[boundary_time, "low"] - 1.0
+
+    canonical = canonicalize_ohlcv(
+        raw,
+        (raw.index[-1] + timedelta(hours=8)).to_pydatetime(),
+    ).frame
+    validated = validate_walk_forward_frame(canonical)
+
+    assert bool(validated.loc[boundary_time, "is_quarantined"])
+    assert validated.loc[boundary_time, ["open", "high", "low", "close", "volume"]].isna().all()
+    assert not validated.loc[list(gap_times), "is_quarantined"].any()
+    assert validated.loc[list(gap_times), ["open", "high", "low", "close", "volume"]].isna().all().all()
+    assert int(validated.loc[gap_times[-1], "segment_id"]) == 0
+    assert int(validated.loc[raw.index[5], "segment_id"]) == 1
 
 
 def test_core_adapter_executes_the_real_core_backtest_with_the_request_config() -> None:
@@ -1341,6 +1359,78 @@ def test_gap_preserves_daily_loss_cooldown_but_a_fresh_fold_resets_it() -> None:
         order.side == "BUY" and order.status == OrderStatus.COMPLETED
         for order in fresh.orders
     )
+
+
+def test_gap_invalid_bar_preserves_volatility_halt_and_unstable_ratio_resets_recovery() -> None:
+    """Only three consecutive valid stable ratios may release a pre-gap halt."""
+    base = _fixture("entry_next_open.csv").iloc[:610].copy(deep=True)
+    start = base.index[-1] + pd.Timedelta(hours=4)
+    defaults: dict[str, object] = {
+        "open": 99.0,
+        "high": 101.0,
+        "low": 98.0,
+        "close": 100.0,
+        "volume": 1.0,
+        "warmup_complete": True,
+        "entry_data_valid": True,
+        "ema_200": 90.0,
+        "entry_high": 99.0,
+        "previous_close": 99.0,
+        "previous_entry_high": 99.0,
+        "atr_14": 2.0,
+        "exit_low": 80.0,
+        "baseline_atr_pct": 0.02,
+    }
+    invalid_after_gap = {
+        **defaults,
+        "warmup_complete": False,
+        "entry_data_valid": False,
+        "ema_200": math.nan,
+        "entry_high": math.nan,
+        "previous_close": math.nan,
+        "previous_entry_high": math.nan,
+        "atr_14": math.nan,
+        "exit_low": math.nan,
+        "baseline_atr_pct": math.nan,
+    }
+    high_volatility = {**defaults, "atr_14": 10.0}
+    renewed_unstable = {**defaults, "atr_14": 4.0}
+    records = [
+        high_volatility,
+        invalid_after_gap,
+        defaults,
+        defaults,
+        renewed_unstable,
+        defaults,
+        defaults,
+        defaults,
+        defaults,
+    ]
+    full_index = pd.date_range(start, periods=11, freq="4h", tz="UTC")
+    observed_index = full_index[[0, 3, 4, 5, 6, 7, 8, 9, 10]]
+    frame = pd.concat(
+        [base, pd.DataFrame(records, index=observed_index).loc[:, base.columns]]
+    )
+    frame["_execution_segment_id"] = 0
+    frame.loc[observed_index[1]:, "_execution_segment_id"] = 1
+
+    result = core_backtest(
+        _real_core_request(
+            frame,
+            BacktestConfig(
+                costs=CostConfig(fee_rate=0.0, slippage_rate=0.0),
+                force_liquidate_at_end=True,
+            ),
+        )
+    )
+
+    entries = [
+        order
+        for order in result.orders
+        if order.side == "BUY" and order.status == OrderStatus.CREATED
+    ]
+    assert len(entries) == 1
+    assert entries[0].signal_time == observed_index[7].to_pydatetime()
 
 
 def test_gap_force_flat_has_native_costed_ledger_and_cancels_the_stop() -> None:

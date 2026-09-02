@@ -586,6 +586,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
         )
         volatility_bar_valid = (
             system_healthy
+            and bool(self.data.warmup_complete[0])
             and bool(self.data.entry_data_valid[0])
             and math.isfinite(volatility_ratio)
         )
@@ -597,6 +598,12 @@ class _DonchianBacktestStrategy(bt.Strategy):
         elif math.isfinite(volatility_ratio) and volatility_ratio > 3.0:
             self._volatility_halted = True
             self._volatility_stable_bars = 0
+        volatility_recovered = (
+            self._volatility_halted
+            and volatility_bar_valid
+            and volatility_ratio <= 1.5
+            and self._volatility_stable_bars >= 3
+        )
         decision = evaluate_risk(
             now=now,
             drawdown=drawdown,
@@ -641,7 +648,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
         ):
             self._streak_halt_started_at = None
             self._profitable_trades_since_streak_halt = 0
-        if self._volatility_halted and "volatility_halt" not in decision.reasons:
+        if volatility_recovered:
             self._volatility_halted = False
             self._volatility_stable_bars = 0
         self._last_equity = equity

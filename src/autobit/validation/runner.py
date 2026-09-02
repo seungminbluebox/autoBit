@@ -467,7 +467,11 @@ def _validate_quality_surface(
     ):
         raise ValueError("filled quality rows must be flat zero-volume candles")
 
+    # Plan 1 clears OHLCV for a raw candle it quarantines, but the true flag
+    # still proves that its timestamp was observed.  Only an unquarantined
+    # unavailable row is synthetic reindex evidence belonging to a long gap.
     long_gap = unavailable & ~quarantined
+    observed = available | quarantined
     if segment_values[0] != 0:
         raise ValueError("quality segment_id must start at zero")
     current_segment = 0
@@ -480,16 +484,16 @@ def _validate_quality_surface(
             continue
 
         gap_start = position
-        if gap_start == 0 or not bool(available.iloc[gap_start - 1]):
-            raise ValueError("a long-gap region must have a preceding finite canonical row")
+        if gap_start == 0 or not bool(observed.iloc[gap_start - 1]):
+            raise ValueError("a long-gap region must have a preceding observed canonical row")
         while position < len(frame) and bool(long_gap.iloc[position]):
             if segment_values[position] != current_segment:
                 raise ValueError("quality segment_id must remain stable inside a long-gap region")
             position += 1
         if position - gap_start < 2:
             raise ValueError("a long-gap region must contain at least two unavailable rows")
-        if position == len(frame) or not bool(available.iloc[position]):
-            raise ValueError("a long-gap region must have a following finite canonical row")
+        if position == len(frame) or not bool(observed.iloc[position]):
+            raise ValueError("a long-gap region must have a following observed canonical row")
         current_segment += 1
         if segment_values[position] != current_segment:
             raise ValueError("quality segment_id transition after a long-gap region must increment once")
