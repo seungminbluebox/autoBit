@@ -50,6 +50,19 @@ class ValidationInputs:
             raise ValueError("trade_count must be a nonnegative integer")
         if type(self.stress_survived) is not bool:
             raise ValueError("stress_survived must be a bool")
+        for name in (
+            "oos_net_return",
+            "sharpe",
+            "profit_factor",
+            "max_drawdown",
+            "dsr",
+            "pbo",
+            "positive_expectancy_fold_ratio",
+            "max_fold_profit_share",
+            "train_test_sharpe_ratio",
+        ):
+            object.__setattr__(self, name, float(getattr(self, name)))
+        object.__setattr__(self, "trade_count", int(self.trade_count))
 
 
 @dataclass(frozen=True, slots=True)

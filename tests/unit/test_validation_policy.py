@@ -2,6 +2,7 @@ from dataclasses import replace
 import math
 
 import pytest
+import numpy as np
 
 from autobit.validation.policy import ValidationInputs, classify_validation
 
@@ -123,3 +124,15 @@ def test_inputs_and_decisions_are_immutable() -> None:
         values.sharpe = 9.0  # type: ignore[misc]
     with pytest.raises((AttributeError, TypeError)):
         decision.status = "REJECT"  # type: ignore[misc]
+
+
+def test_numpy_real_and_integer_inputs_are_canonicalized_to_builtins() -> None:
+    values = replace(
+        passing_inputs(),
+        oos_net_return=np.float32(0.30),
+        sharpe=np.float64(1.1),
+        trade_count=np.int64(110),
+    )
+    assert type(values.oos_net_return) is float
+    assert type(values.sharpe) is float
+    assert type(values.trade_count) is int
