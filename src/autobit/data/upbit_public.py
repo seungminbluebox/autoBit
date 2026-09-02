@@ -59,6 +59,8 @@ class UpbitPublicClient:
     ) -> None:
         if config.market != "KRW-BTC":
             raise ValueError("public collector supports only the KRW-BTC market")
+        if isinstance(config.page_size, bool) or not isinstance(config.page_size, int) or not 1 <= config.page_size <= 200:
+            raise ValueError("page_size must be an integer from 1 through 200")
         self._http_client = http_client
         self._config = config
         self._sleep = sleep
@@ -78,7 +80,6 @@ class UpbitPublicClient:
             except httpx.TransportError as error:
                 last_failure = error
             else:
-                self.remaining_request_limit = parse_remaining_request_limit(response.headers.get("Remaining-Req"))
                 if response.status_code == 429 or 500 <= response.status_code < 600:
                     last_failure = httpx.HTTPStatusError(
                         f"public candle request returned {response.status_code}",
@@ -87,6 +88,7 @@ class UpbitPublicClient:
                     )
                 else:
                     response.raise_for_status()
+                    self.remaining_request_limit = parse_remaining_request_limit(response.headers.get("Remaining-Req"))
                     payload = response.json()
                     if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
                         raise PublicDataUnavailable("public candle response was not a list of objects")
@@ -108,7 +110,7 @@ class UpbitPublicClient:
                 "count": str(self._config.page_size),
             },
         )
-        return self._http_client.send(request)
+        return self._http_client.send(request, auth=None, follow_redirects=False)
 
     def _throttle_if_needed(self) -> None:
         if self.remaining_request_limit is not None and self.remaining_request_limit.sec_remaining <= 0:
