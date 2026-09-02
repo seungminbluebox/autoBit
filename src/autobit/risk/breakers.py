@@ -241,7 +241,7 @@ def _as_utc(value: object) -> datetime | None:
 
 def _valid_config(config: object) -> bool:
     try:
-        values = _finite_nonnegative_values(
+        values = (
             config.base_risk_rate,
             config.max_exposure,
             config.hard_drawdown,
@@ -251,10 +251,7 @@ def _valid_config(config: object) -> bool:
         )
     except AttributeError:
         return False
-    return values is not None and all(
-        math.isclose(actual, approved, rel_tol=0.0, abs_tol=1e-12)
-        for actual, approved in zip(values, _APPROVED_CONFIG, strict=True)
-    )
+    return values == _APPROVED_CONFIG
 
 
 def _invalid_decision() -> RiskDecision:

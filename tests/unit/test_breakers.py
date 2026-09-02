@@ -370,6 +370,36 @@ def test_modified_or_nonfinite_risk_config_fails_closed(field: str, value: float
     assert decision == RiskDecision(0.0, 0.0, None, ("invalid_config",))
 
 
+@pytest.mark.parametrize(
+    ("field", "approved_value"),
+    [
+        ("base_risk_rate", 0.02),
+        ("max_exposure", 0.70),
+        ("hard_drawdown", 0.15),
+        ("daily_loss_limit", 0.04),
+        ("weekly_reduce_limit", 0.05),
+        ("weekly_halt_limit", 0.07),
+    ],
+)
+def test_adjacent_float_risk_config_change_fails_closed(
+    field: str,
+    approved_value: float,
+) -> None:
+    config_values = {
+        "base_risk_rate": 0.02,
+        "max_exposure": 0.70,
+        "hard_drawdown": 0.15,
+        "daily_loss_limit": 0.04,
+        "weekly_reduce_limit": 0.05,
+        "weekly_halt_limit": 0.07,
+    }
+    config_values[field] = math.nextafter(approved_value, math.inf)
+
+    decision = _evaluate(config=RiskConfig(**config_values))
+
+    assert decision == RiskDecision(0.0, 0.0, None, ("invalid_config",))
+
+
 def test_timezone_aware_non_utc_inputs_are_normalized_for_cooldowns() -> None:
     plus_nine = timezone(timedelta(hours=9))
     local_start = datetime(2026, 1, 1, 9, tzinfo=plus_nine)
