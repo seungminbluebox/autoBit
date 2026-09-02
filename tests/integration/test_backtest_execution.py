@@ -108,6 +108,75 @@ def test_old_stop_wins_when_bar_also_reaches_two_r() -> None:
     assert not any(order.reason == "TRAILING_STOP" for order in result.orders)
 
 
+def test_actual_fill_stop_protects_entry_candle_with_complete_cost_ledgers() -> None:
+    fee_rate = 0.0005
+    slippage_rate = 0.001
+    frame = _fixture("entry_next_open.csv").iloc[:612].copy()
+    fill_time = pd.Timestamp("2025-01-05T04:00:00Z")
+    frame.loc[fill_time, ["open", "high", "low", "close"]] = [
+        100.0,
+        101.0,
+        94.0,
+        100.0,
+    ]
+
+    result = run_backtest(
+        frame,
+        BacktestConfig(
+            costs=CostConfig(fee_rate=fee_rate, slippage_rate=slippage_rate),
+            entry_fill_fraction=0.5,
+        ),
+    )
+
+    entry = next(
+        order
+        for order in result.orders
+        if order.side == "BUY" and order.status == "PARTIAL"
+    )
+    stop = next(
+        order
+        for order in result.orders
+        if order.reason == "HARD_STOP" and order.status == "COMPLETED"
+    )
+    assert entry.fill_time == fill_time
+    assert stop.fill_time == fill_time
+    assert stop.stop_price == pytest.approx(entry.fill_price - 2.5 * 2.0)
+    assert stop.fill_price == pytest.approx(stop.stop_price * (1.0 - slippage_rate))
+    assert stop.filled_quantity == pytest.approx(entry.filled_quantity)
+    assert [
+        order.status.value
+        for order in result.orders
+        if order.order_id == stop.order_id
+    ] == ["CREATED", "SUBMITTED", "ACCEPTED", "COMPLETED"]
+
+    entry_fee = entry.filled_quantity * entry.fill_price * fee_rate
+    exit_fee = stop.filled_quantity * stop.fill_price * fee_rate
+    assert result.total_fees == pytest.approx(entry_fee + exit_fee)
+    expected_slippage = entry.filled_quantity * (entry.fill_price - 100.0)
+    expected_slippage += stop.filled_quantity * (stop.stop_price - stop.fill_price)
+    assert result.total_slippage == pytest.approx(expected_slippage)
+    assert result.final_equity == pytest.approx(
+        100.0
+        + stop.filled_quantity * (stop.fill_price - entry.fill_price)
+        - entry_fee
+        - exit_fee
+    )
+    trade, = result.trades
+    assert trade.entry_time == fill_time
+    assert trade.exit_time == fill_time
+    assert trade.quantity == pytest.approx(entry.filled_quantity)
+    assert trade.exit_reason == "HARD_STOP"
+
+
+def test_repeated_runs_have_identical_results_and_run_local_order_ids() -> None:
+    config = BacktestConfig(costs=CostConfig(fee_rate=0.0, slippage_rate=0.0))
+    first = run_backtest(_fixture("entry_next_open.csv"), config)
+    second = run_backtest(_fixture("entry_next_open.csv"), config)
+
+    assert first == second
+    assert sorted({order.order_id for order in first.orders}) == ["1", "2", "3"]
+
+
 def test_gap_that_exceeds_close_sizing_is_execution_capped() -> None:
     fee_rate = 0.0005
     slippage_rate = 0.0005

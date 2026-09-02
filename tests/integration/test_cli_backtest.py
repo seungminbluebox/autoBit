@@ -379,6 +379,37 @@ def test_backtest_command_runs_one_enriched_scenario_and_writes_bundle(tmp_path:
     assert len((output / "trades.csv").read_text(encoding="utf-8").splitlines()) == 2
 
 
+def test_repeated_backtest_reports_are_byte_identical(tmp_path: Path) -> None:
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    processed = canonical / "processed.csv"
+    processed.write_bytes((FIXTURES / "entry_next_open.csv").read_bytes())
+    _write_quality_sidecar(
+        canonical / "quality.json", _quality(total_bars=614), processed
+    )
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+
+    for output in (first, second):
+        assert main(
+            [
+                "backtest",
+                "--input",
+                str(processed),
+                "--output",
+                str(output),
+                "--slippage",
+                "0",
+            ]
+        ) == 0
+
+    assert {
+        name: (first / name).read_bytes() for name in EXPECTED_FILES
+    } == {
+        name: (second / name).read_bytes() for name in EXPECTED_FILES
+    }
+
+
 @pytest.mark.parametrize("use_dot_segment", [False, True])
 def test_backtest_rejects_report_output_that_overlaps_canonical_provenance(
     tmp_path: Path, use_dot_segment: bool

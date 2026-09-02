@@ -1,7 +1,7 @@
 """Event-driven Backtrader adapter for enriched four-hour data."""
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 
 import backtrader as bt
@@ -10,6 +10,7 @@ import pandas as pd
 from autobit.config import CostConfig, RiskConfig, StrategyConfig
 from autobit.domain.models import OrderStatus
 from autobit.execution.backtest_broker import EventBacktestBroker, OneShotFractionalFiller
+from autobit.risk.breakers import RiskDecision, evaluate_risk
 from autobit.risk.position_sizer import calculate_size
 from autobit.strategy.donchian_trend import (
     PositionSnapshot,
@@ -136,6 +137,8 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self._seen_execution_bits: dict[int, int] = {}
         self._recorded_event_keys: set[tuple[int, OrderStatus, float]] = set()
         self._tracked_orders: dict[int, bt.Order] = {}
+        self._run_order_ids: dict[int, str] = {}
+        self._next_run_order_id = 1
         self._entry_fill_bits: list[tuple[datetime, float, float, float]] = []
         self._exit_fill_bits: list[tuple[datetime, float, float, float]] = []
         self._entry_partial_pending = False
@@ -148,10 +151,30 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self.entry_price: float | None = None
         self.high_water: float | None = None
         self.entry_signal_time: datetime | None = None
+        self._entry_fill_bar: int | None = None
+        self._run_start_equity = float(self.broker.getvalue())
+        self._equity_peak = self._run_start_equity
+        self._risk_equity_history: list[tuple[datetime, float]] = []
+        self._daily_date = None
+        self._daily_baseline_equity = self._run_start_equity
+        self._last_equity = self._run_start_equity
+        self._last_risk_time: datetime | None = None
+        self._consecutive_losses = 0
+        self._recovery_started_at: datetime | None = None
+        self._daily_halt_started_at: datetime | None = None
+        self._weekly_halt_started_at: datetime | None = None
+        self._streak_halt_started_at: datetime | None = None
+        self._profitable_trades_since_streak_halt = 0
+        self._volatility_halted = False
+        self._volatility_stable_bars = 0
         self.broker.set_pre_submit_hook(self._on_order_created)
+        self.broker.set_same_bar_order_hook(self.notify_order)
 
     def next(self) -> None:
-        self.equity_points.append(EquityPoint(self._now(), float(self.broker.getvalue())))
+        now = self._now()
+        equity = float(self.broker.getvalue())
+        self.equity_points.append(EquityPoint(now, equity))
+        risk_decision = self._evaluate_current_risk(now, equity)
 
         if self._entry_partial_pending:
             self._cancel_entry_remainder()
@@ -162,8 +185,18 @@ class _DonchianBacktestStrategy(bt.Strategy):
         if self.position.size > 0.0:
             if self.stop_order is None:
                 self._submit_stop()
+            if self._requires_forced_exit(risk_decision):
+                self._submit_forced_exit(risk_decision)
+                return
             if self.exit_order is None and evaluate_close_exit(self._row()):
                 self._submit_close_exit()
+                return
+            self.high_water = max(float(self.high_water), float(self.data.high[0]))
+            if self.exit_order is None and self._stagnant_exit_due():
+                self._submit_market_exit("STAGNANT_EXIT")
+                return
+            if self.exit_order is None and self._max_hold_exit_due():
+                self._submit_market_exit("MAX_HOLD_EXIT")
                 return
             self._update_trailing_stop()
             return
@@ -171,6 +204,8 @@ class _DonchianBacktestStrategy(bt.Strategy):
             return
 
         row = self._row()
+        if risk_decision.risk_rate <= 0.0 or risk_decision.exposure_cap <= 0.0:
+            return
         if not evaluate_entry(row, is_flat=True, config=self.adapter_config.strategy):
             return
 
@@ -185,8 +220,8 @@ class _DonchianBacktestStrategy(bt.Strategy):
             stop=stop,
             current_atr_pct=atr / entry_reference,
             baseline_atr_pct=baseline_atr_pct,
-            risk_rate=self.adapter_config.risk.base_risk_rate,
-            exposure_cap=self.adapter_config.risk.max_exposure,
+            risk_rate=risk_decision.risk_rate,
+            exposure_cap=risk_decision.exposure_cap,
             costs=self.adapter_config.costs,
         ).quantity
         if size <= 0.0:
@@ -204,8 +239,8 @@ class _DonchianBacktestStrategy(bt.Strategy):
             execution_atr=atr,
             initial_atr_mult=self.adapter_config.strategy.initial_atr_mult,
             baseline_atr_pct=baseline_atr_pct,
-            risk_rate=self.adapter_config.risk.base_risk_rate,
-            exposure_cap=self.adapter_config.risk.max_exposure,
+            risk_rate=risk_decision.risk_rate,
+            exposure_cap=risk_decision.exposure_cap,
             fee_rate=self.adapter_config.costs.fee_rate,
         )
 
@@ -245,6 +280,8 @@ class _DonchianBacktestStrategy(bt.Strategy):
             _same_order(order, self.exit_order) or _same_order(order, self.stop_order)
         ):
             self._exit_partial_pending = True
+        if order.issell() and order.status == order.Completed and self.position.size == 0.0:
+            self._reset_position_tracking()
 
     def _apply_entry_fill(self, order: bt.Order) -> None:
         self.entry_price = float(order.executed.price)
@@ -253,6 +290,9 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self.initial_stop = self.entry_price - initial_atr_mult * entry_atr
         self.current_stop = self.initial_stop
         self.high_water = self.entry_price
+        if self._entry_fill_bar is None:
+            self._entry_fill_bar = len(self.data)
+        self._submit_stop(reconcile_current_bar=True)
 
     def stop(self) -> None:
         for order in self._tracked_orders.values():
@@ -261,7 +301,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
                 self.broker.cancel_end_of_data(order)
                 self._record_native_status(order)
 
-    def _submit_stop(self) -> None:
+    def _submit_stop(self, *, reconcile_current_bar: bool = False) -> None:
         if self.current_stop is None or self.entry_signal_time is None:
             return
         self.stop_order = self.sell(
@@ -273,6 +313,12 @@ class _DonchianBacktestStrategy(bt.Strategy):
             reason="HARD_STOP",
             fill_fraction=self.adapter_config.exit_fill_fraction,
         )
+        if (
+            reconcile_current_bar
+            and self.stop_order is not None
+            and float(self.data.low[0]) <= self.current_stop
+        ):
+            self.broker.reconcile_same_bar_stop(self.stop_order)
 
     def _update_trailing_stop(self) -> None:
         if None in (self.entry_price, self.initial_stop, self.current_stop, self.high_water):
@@ -307,6 +353,9 @@ class _DonchianBacktestStrategy(bt.Strategy):
         )
 
     def _submit_close_exit(self) -> None:
+        self._submit_market_exit("CLOSE_EXIT")
+
+    def _submit_market_exit(self, reason: str) -> None:
         signal_time = self._now()
         if self.stop_order is not None:
             self.cancel(self.stop_order)
@@ -314,9 +363,41 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self.exit_order = self.sell(
             size=float(self.position.size),
             signal_time=signal_time.isoformat(),
-            reason="CLOSE_EXIT",
+            reason=reason,
             fill_fraction=self.adapter_config.exit_fill_fraction,
         )
+
+    def _stagnant_exit_due(self) -> bool:
+        if None in (
+            self._entry_fill_bar,
+            self.entry_price,
+            self.initial_stop,
+            self.high_water,
+        ):
+            return False
+        completed_held_bars = len(self.data) - int(self._entry_fill_bar)
+        if completed_held_bars < self.adapter_config.strategy.stagnant_bars:
+            return False
+        risk_per_unit = float(self.entry_price) - float(self.initial_stop)
+        threshold = (
+            float(self.entry_price)
+            + self.adapter_config.strategy.stagnant_min_r * risk_per_unit
+        )
+        return float(self.high_water) < threshold
+
+    def _max_hold_exit_due(self) -> bool:
+        if self._entry_fill_bar is None:
+            return False
+        completed_held_bars = len(self.data) - self._entry_fill_bar
+        return completed_held_bars >= self.adapter_config.strategy.max_holding_bars
+
+    def _reset_position_tracking(self) -> None:
+        self.initial_stop = None
+        self.current_stop = None
+        self.entry_price = None
+        self.high_water = None
+        self.entry_signal_time = None
+        self._entry_fill_bar = None
 
     def _cancel_entry_remainder(self) -> None:
         self._entry_partial_pending = False
@@ -373,10 +454,172 @@ class _DonchianBacktestStrategy(bt.Strategy):
             }
         )
 
+    def _evaluate_current_risk(self, now: datetime, equity: float) -> RiskDecision:
+        system_healthy = self._risk_inputs_are_healthy(now, equity)
+        if math.isfinite(equity):
+            self._equity_peak = max(self._equity_peak, equity)
+        drawdown = (
+            max(0.0, 1.0 - equity / self._equity_peak)
+            if system_healthy and self._equity_peak > 0.0
+            else math.nan
+        )
+
+        current_date = now.date()
+        if self._daily_date is None:
+            self._daily_date = current_date
+        elif current_date != self._daily_date:
+            self._daily_date = current_date
+            self._daily_baseline_equity = self._last_equity
+        daily_loss = _loss_from_baseline(equity, self._daily_baseline_equity)
+        if (
+            daily_loss >= self.adapter_config.risk.daily_loss_limit
+            and self._daily_halt_started_at is None
+        ):
+            self._daily_halt_started_at = now
+
+        self._risk_equity_history.append((now, equity))
+        cutoff = now - timedelta(days=7)
+        if now - self._risk_equity_history[0][0] < timedelta(days=7):
+            weekly_baseline = self._run_start_equity
+        else:
+            weekly_baseline = next(
+                value
+                for timestamp, value in self._risk_equity_history
+                if timestamp >= cutoff
+            )
+        weekly_loss = _loss_from_baseline(equity, weekly_baseline)
+        if (
+            drawdown >= self.adapter_config.risk.hard_drawdown
+            and self._recovery_started_at is None
+        ):
+            self._recovery_started_at = now
+        if (
+            weekly_loss >= self.adapter_config.risk.weekly_halt_limit
+            and self._weekly_halt_started_at is None
+        ):
+            self._weekly_halt_started_at = now
+        if self._consecutive_losses >= 5 and self._streak_halt_started_at is None:
+            self._streak_halt_started_at = now
+            self._profitable_trades_since_streak_halt = 0
+
+        close = float(self.data.close[0])
+        atr = float(self.data.atr_value[0])
+        baseline_atr_pct = float(self.data.baseline_atr_pct[0])
+        volatility_ratio = (
+            (atr / close) / baseline_atr_pct
+            if close > 0.0 and baseline_atr_pct > 0.0
+            else math.nan
+        )
+        volatility_bar_valid = (
+            system_healthy
+            and bool(self.data.entry_data_valid[0])
+            and math.isfinite(volatility_ratio)
+        )
+        if self._volatility_halted:
+            if volatility_bar_valid and volatility_ratio <= 1.5:
+                self._volatility_stable_bars += 1
+            else:
+                self._volatility_stable_bars = 0
+        elif math.isfinite(volatility_ratio) and volatility_ratio > 3.0:
+            self._volatility_halted = True
+            self._volatility_stable_bars = 0
+        decision = evaluate_risk(
+            now=now,
+            drawdown=drawdown,
+            daily_loss=daily_loss,
+            weekly_loss=weekly_loss,
+            consecutive_losses=self._consecutive_losses,
+            volatility_ratio=volatility_ratio,
+            system_healthy=system_healthy,
+            config=self.adapter_config.risk,
+            recovery_started_at=self._recovery_started_at,
+            daily_halt_started_at=self._daily_halt_started_at,
+            weekly_halt_started_at=self._weekly_halt_started_at,
+            streak_halt_started_at=self._streak_halt_started_at,
+            volatility_halted=self._volatility_halted,
+            volatility_stable_bars=self._volatility_stable_bars,
+            profitable_trades_since_streak_halt=(
+                self._profitable_trades_since_streak_halt
+            ),
+        )
+        if (
+            self._recovery_started_at is not None
+            and now >= self._recovery_started_at + timedelta(hours=72)
+            and drawdown == 0.0
+        ):
+            self._recovery_started_at = None
+        if (
+            self._daily_halt_started_at is not None
+            and now >= self._daily_halt_started_at + timedelta(hours=24)
+            and daily_loss < self.adapter_config.risk.daily_loss_limit
+        ):
+            self._daily_halt_started_at = None
+        if (
+            self._weekly_halt_started_at is not None
+            and now >= self._weekly_halt_started_at + timedelta(hours=48)
+            and weekly_loss < self.adapter_config.risk.weekly_halt_limit
+        ):
+            self._weekly_halt_started_at = None
+        if (
+            self._streak_halt_started_at is not None
+            and now >= self._streak_halt_started_at + timedelta(hours=48)
+            and self._profitable_trades_since_streak_halt >= 2
+        ):
+            self._streak_halt_started_at = None
+            self._profitable_trades_since_streak_halt = 0
+        if self._volatility_halted and "volatility_halt" not in decision.reasons:
+            self._volatility_halted = False
+            self._volatility_stable_bars = 0
+        self._last_equity = equity
+        self._last_risk_time = now
+        return decision
+
+    @staticmethod
+    def _requires_forced_exit(decision: RiskDecision) -> bool:
+        return any(
+            reason in {"drawdown_halt", "system_unhealthy", "invalid_input", "invalid_config"}
+            for reason in decision.reasons
+        )
+
+    def _submit_forced_exit(self, decision: RiskDecision) -> None:
+        if self.exit_order is not None:
+            return
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+            self.stop_order = None
+        reason = (
+            "RISK_EXIT"
+            if "drawdown_halt" in decision.reasons
+            else "SYSTEM_EXIT"
+        )
+        self.exit_order = self.sell(
+            size=float(self.position.size),
+            signal_time=self._now().isoformat(),
+            reason=reason,
+            fill_fraction=self.adapter_config.exit_fill_fraction,
+        )
+
+    def _risk_inputs_are_healthy(self, now: datetime, equity: float) -> bool:
+        prices = tuple(
+            float(line[0])
+            for line in (self.data.open, self.data.high, self.data.low, self.data.close)
+        )
+        open_price, high, low, close = prices
+        return (
+            all(math.isfinite(value) and value > 0.0 for value in prices)
+            and high >= max(open_price, low, close)
+            and low <= min(open_price, high, close)
+            and math.isfinite(equity)
+            and equity >= 0.0
+            and (self._last_risk_time is None or now > self._last_risk_time)
+        )
+
     def _on_order_created(self, order: bt.Order) -> None:
         if order.status != order.Created:
             raise RuntimeError("pre-submit hook received a non-Created order")
         self._tracked_orders[order.ref] = order
+        self._run_order_ids[order.ref] = str(self._next_run_order_id)
+        self._next_run_order_id += 1
         self._append_order_record(order, OrderStatus.CREATED)
 
     def _record_callback(self, order: bt.Order) -> None:
@@ -409,7 +652,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
         has_fill = bool(order.executed.size)
         fill_time = _bt_utc(order.executed.dt) if has_fill else None
         return OrderRecord(
-            order_id=str(order.ref),
+            order_id=self._run_order_ids[order.ref],
             status=status,
             side="BUY" if order.isbuy() else "SELL",
             requested_quantity=abs(float(order.created.size)),
@@ -481,6 +724,16 @@ class _DonchianBacktestStrategy(bt.Strategy):
                 exit_reason=str(order.info.reason),
             )
         )
+        if self.trade_records[-1].net_pnl < 0.0:
+            self._consecutive_losses += 1
+        else:
+            self._consecutive_losses = 0
+        if (
+            self._streak_halt_started_at is not None
+            and self.trade_records[-1].net_pnl > 0.0
+            and self.trade_records[-1].exit_time > self._streak_halt_started_at
+        ):
+            self._profitable_trades_since_streak_halt += 1
         self._entry_fill_bits.clear()
         self._exit_fill_bits.clear()
 
@@ -570,3 +823,9 @@ def _bt_utc(value: float) -> datetime:
 
 def _same_order(left: bt.Order, right: bt.Order | None) -> bool:
     return right is not None and left.ref == right.ref
+
+
+def _loss_from_baseline(equity: float, baseline: float) -> float:
+    if not all(math.isfinite(value) for value in (equity, baseline)) or baseline <= 0.0:
+        return math.nan
+    return max(0.0, 1.0 - equity / baseline)

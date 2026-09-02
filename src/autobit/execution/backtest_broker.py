@@ -59,10 +59,15 @@ class EventBacktestBroker(bt.brokers.BackBroker):
     def __init__(self) -> None:
         super().__init__()
         self._pre_submit_hook = None
+        self._same_bar_order_hook = None
 
     def set_pre_submit_hook(self, hook) -> None:
         """Register the strategy callback that observes native Created orders."""
         self._pre_submit_hook = hook
+
+    def set_same_bar_order_hook(self, hook) -> None:
+        """Register synchronous delivery for conservative same-bar execution."""
+        self._same_bar_order_hook = hook
 
     def submit(self, order, check=True):
         self._notify_pre_submit(order)
@@ -87,6 +92,35 @@ class EventBacktestBroker(bt.brokers.BackBroker):
             self.notify(order)
             return True
         return False
+
+    def reconcile_same_bar_stop(self, order: bt.Order) -> bool:
+        """Activate and execute a newly submitted stop against the current bar."""
+        if order.exectype != bt.Order.Stop or not order.alive():
+            return False
+        try:
+            self.submitted.remove(order)
+        except ValueError:
+            return False
+
+        self._notify_same_bar(order)
+        self.submit_accept(order)
+        self._notify_same_bar(order)
+        self.pending.remove(order)
+        status_before = order.status
+        self._try_exec_stop(
+            order,
+            float(order.data.open[0]),
+            float(order.data.high[0]),
+            float(order.data.low[0]),
+            float(order.created.price),
+            float(order.data.close[0]),
+        )
+        if order.status != status_before:
+            self._notify_same_bar(order)
+        if order.alive():
+            self.pending.append(order)
+        self._get_value()
+        return order.status in (order.Partial, order.Completed)
 
     def buy(
         self,
@@ -256,3 +290,7 @@ class EventBacktestBroker(bt.brokers.BackBroker):
     def _notify_pre_submit(self, order: bt.Order) -> None:
         if self._pre_submit_hook is not None:
             self._pre_submit_hook(order)
+
+    def _notify_same_bar(self, order: bt.Order) -> None:
+        if self._same_bar_order_hook is not None:
+            self._same_bar_order_hook(order)
