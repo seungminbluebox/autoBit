@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from itertools import combinations
 import math
-from typing import Iterable
 
 import numpy as np
+from scipy.special import ndtri_exp
 from scipy.stats import norm
 
 
 _EULER_MASCHERONI = 0.5772156649015329
-_MIN_POSITIVE_FLOAT = float(np.nextafter(0.0, 1.0))
 
 
 def deflated_sharpe_probability(
@@ -187,7 +187,7 @@ def _require_positive_integer(value: object, name: str) -> None:
 
 def _finite_real_array(values: object, *, name: str, dimensions: int) -> np.ndarray:
     try:
-        array = np.asarray(values)
+        array = np.asarray(_materialize_nested_iterable(values, depth=dimensions))
     except (TypeError, ValueError) as error:
         raise ValueError(f"{name} must be a rectangular real numeric array") from error
     if array.ndim != dimensions:
@@ -203,15 +203,27 @@ def _finite_real_array(values: object, *, name: str, dimensions: int) -> np.ndar
     return result
 
 
+def _materialize_nested_iterable(values: object, *, depth: int) -> object:
+    if isinstance(values, np.ndarray):
+        return values
+    if isinstance(values, (str, bytes, bytearray)) or not isinstance(values, Iterable):
+        return values
+    materialized = list(values)
+    if depth > 1:
+        return [
+            _materialize_nested_iterable(value, depth=depth - 1)
+            for value in materialized
+        ]
+    return materialized
+
+
 def _expected_maximum_sharpe(*, num_trials: int, observation_count: int) -> float:
     if num_trials == 1:
         return 0.0
     log_trial_count = math.log(num_trials)
-    first_tail = max(math.exp(-log_trial_count), _MIN_POSITIVE_FLOAT)
-    second_tail = max(math.exp(-log_trial_count - 1.0), _MIN_POSITIVE_FLOAT)
     expected_maximum_standard_normal = (
-        (1.0 - _EULER_MASCHERONI) * float(norm.isf(first_tail))
-        + _EULER_MASCHERONI * float(norm.isf(second_tail))
+        (1.0 - _EULER_MASCHERONI) * -float(ndtri_exp(-log_trial_count))
+        + _EULER_MASCHERONI * -float(ndtri_exp(-log_trial_count - 1.0))
     )
     return expected_maximum_standard_normal / math.sqrt(observation_count - 1)
 

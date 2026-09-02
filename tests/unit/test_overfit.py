@@ -4,6 +4,8 @@ import math
 
 import numpy as np
 import pytest
+from scipy.special import ndtri_exp
+from scipy.stats import kurtosis, norm, skew
 
 from autobit.validation.overfit import (
     cpcv_splits,
@@ -137,6 +139,53 @@ def test_dsr_penalizes_more_trials_monotonically() -> None:
     assert probabilities[0] == pytest.approx(0.967520159639809, abs=1e-12)
 
 
+def test_dsr_matches_log_tail_oracle_without_huge_trial_saturation() -> None:
+    """Converting 1/N to float must not flatten distinct enormous penalties."""
+    returns = np.array([1.13, -0.87] * 50_000, dtype=float)
+    trial_counts = (10**324, 10**400, 10**10_000)
+
+    actual = [
+        deflated_sharpe_probability(returns, num_trials=num_trials)
+        for num_trials in trial_counts
+    ]
+    expected = [
+        _log_tail_dsr_oracle(returns, num_trials=num_trials)
+        for num_trials in trial_counts
+    ]
+
+    assert actual == pytest.approx(expected, abs=1e-12)
+    assert actual[0] > actual[1] > actual[2]
+    assert all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in actual)
+    assert math.log(10**10_000) == pytest.approx(10_000 * math.log(10.0))
+
+
+@pytest.mark.parametrize("num_trials", [1, 2, 9, 10**300])
+def test_dsr_log_tail_change_preserves_existing_trial_oracles(num_trials: int) -> None:
+    """Replacing tail evaluation must not change representable-trial DSR results."""
+    returns = np.array([1.13, -0.87] * 50_000, dtype=float)
+
+    assert deflated_sharpe_probability(
+        returns, num_trials=num_trials
+    ) == pytest.approx(
+        _log_tail_dsr_oracle(returns, num_trials=num_trials), abs=1e-12
+    )
+
+
+def test_dsr_materializes_a_one_shot_generator_exactly_once() -> None:
+    """The public iterable contract must not reject or re-consume generators."""
+    consumed: list[float] = []
+
+    def return_source():
+        for value in (0.010, -0.009, 0.008, -0.007) * 250:
+            consumed.append(value)
+            yield value
+
+    probability = deflated_sharpe_probability(return_source(), num_trials=9)
+
+    assert probability == pytest.approx(0.6273299115522453, abs=1e-12)
+    assert len(consumed) == 1000
+
+
 @pytest.mark.parametrize(
     "returns",
     [
@@ -161,6 +210,7 @@ def test_dsr_has_defined_zero_for_insufficient_or_zero_variance_returns(
         np.array([0.01, np.inf, -0.01]),
         np.array([1.0 + 2.0j, 2.0 + 1.0j, 3.0 + 0.0j]),
         np.array(["0.01", "-0.01", "0.02"]),
+        np.array([True, False, True]),
     ],
 )
 def test_dsr_rejects_non_finite_non_real_or_non_vector_returns(
@@ -262,6 +312,32 @@ def test_pbo_does_not_mutate_input_matrices() -> None:
     assert np.array_equal(out_of_sample, original_oos)
 
 
+def test_pbo_materializes_outer_and_row_generators_exactly_once() -> None:
+    """Nested one-shot score iterables must retain rows, columns, and rank order."""
+    consumed_is: list[tuple[int, int]] = []
+    consumed_oos: list[tuple[int, int]] = []
+    in_sample_values = ((3.0, 2.0, 1.0), (1.0, 3.0, 2.0), (2.0, 1.0, 3.0))
+    out_of_sample_values = ((1.0, 2.0, 3.0), (3.0, 1.0, 2.0), (2.0, 3.0, 1.0))
+
+    def matrix_source(values, consumed):
+        for row_index, row in enumerate(values):
+            def row_source(row_values=row, index=row_index):
+                for column_index, value in enumerate(row_values):
+                    consumed.append((index, column_index))
+                    yield value
+
+            yield row_source()
+
+    probability = probability_of_backtest_overfitting(
+        matrix_source(in_sample_values, consumed_is),
+        matrix_source(out_of_sample_values, consumed_oos),
+    )
+
+    assert probability == 1.0
+    assert consumed_is == [(row, column) for row in range(3) for column in range(3)]
+    assert consumed_oos == [(row, column) for row in range(3) for column in range(3)]
+
+
 def test_seeded_random_dsr_and_pbo_properties_are_bounded_and_finite() -> None:
     """Ordinary random samples must never escape the probability domain."""
     random = np.random.default_rng(20260902)
@@ -283,3 +359,29 @@ def test_seeded_random_dsr_and_pbo_properties_are_bounded_and_finite() -> None:
 
         assert math.isfinite(dsr) and 0.0 <= dsr <= 1.0
         assert math.isfinite(pbo) and 0.0 <= pbo <= 1.0
+
+
+def _log_tail_dsr_oracle(returns: np.ndarray, *, num_trials: int) -> float:
+    """Independent SciPy-moment/log-tail oracle for the public DSR result."""
+    observation_count = returns.size
+    observed_sharpe = float(np.mean(returns) / np.std(returns, ddof=1))
+    sample_skew = float(skew(returns, bias=False))
+    pearson_kurtosis = float(kurtosis(returns, fisher=False, bias=False))
+    if num_trials == 1:
+        expected_maximum = 0.0
+    else:
+        log_trial_count = math.log(num_trials)
+        expected_standard_normal = (
+            (1.0 - 0.5772156649015329) * -float(ndtri_exp(-log_trial_count))
+            + 0.5772156649015329 * -float(ndtri_exp(-log_trial_count - 1.0))
+        )
+        expected_maximum = expected_standard_normal / math.sqrt(observation_count - 1)
+    standard_error = math.sqrt(
+        (
+            1.0
+            - sample_skew * observed_sharpe
+            + (pearson_kurtosis - 1.0) / 4.0 * observed_sharpe**2
+        )
+        / (observation_count - 1)
+    )
+    return float(norm.cdf((observed_sharpe - expected_maximum) / standard_error))
