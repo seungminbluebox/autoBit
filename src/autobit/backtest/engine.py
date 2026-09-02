@@ -28,6 +28,7 @@ class BacktestConfig:
     initial_equity: float = 100.0
     entry_fill_fraction: float = field(default=1.0, kw_only=True)
     exit_fill_fraction: float = field(default=1.0, kw_only=True)
+    force_liquidate_at_end: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         try:
@@ -48,6 +49,8 @@ class BacktestConfig:
                 raise ValueError("fill fraction must be finite and in (0, 1]") from error
             if isinstance(value, bool) or not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
                 raise ValueError("fill fraction must be finite and in (0, 1]")
+        if not isinstance(self.force_liquidate_at_end, bool):
+            raise ValueError("force_liquidate_at_end must be boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +170,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self._profitable_trades_since_streak_halt = 0
         self._volatility_halted = False
         self._volatility_stable_bars = 0
+        self._terminal_final_equity: float | None = None
         self.broker.set_pre_submit_hook(self._on_order_created)
         self.broker.set_same_bar_order_hook(self.notify_order)
 
@@ -300,6 +304,73 @@ class _DonchianBacktestStrategy(bt.Strategy):
             if order.alive():
                 self.broker.cancel_end_of_data(order)
                 self._record_native_status(order)
+        if self.adapter_config.force_liquidate_at_end and self.position.size > 0.0:
+            self._force_liquidate_at_end()
+
+    def _force_liquidate_at_end(self) -> None:
+        """Close remaining inventory at the final observed close for isolated runs."""
+        quantity = float(self.position.size)
+        reference_close = float(self.data.close[0])
+        if (
+            not math.isfinite(quantity)
+            or quantity <= 0.0
+            or not math.isfinite(reference_close)
+            or reference_close <= 0.0
+        ):
+            return
+        now = self._now()
+        fill_price = reference_close * (1.0 - float(self.adapter_config.costs.slippage_rate))
+        fee = quantity * fill_price * float(self.adapter_config.costs.fee_rate)
+        slippage = quantity * (reference_close - fill_price)
+        if not all(math.isfinite(value) for value in (fill_price, fee, slippage)):
+            raise ValueError("terminal liquidation values must be finite")
+        if fill_price <= 0.0 or fee < 0.0 or slippage < 0.0:
+            raise ValueError("terminal liquidation values must be nonnegative")
+
+        order_id = str(self._next_run_order_id)
+        self._next_run_order_id += 1
+        self.order_records.extend(
+            (
+                OrderRecord(
+                    order_id=order_id,
+                    status=OrderStatus.CREATED,
+                    side="SELL",
+                    requested_quantity=quantity,
+                    filled_quantity=0.0,
+                    remainder_quantity=quantity,
+                    occurred_at=now,
+                    signal_time=now,
+                    reason="FORCED_END",
+                ),
+                OrderRecord(
+                    order_id=order_id,
+                    status=OrderStatus.COMPLETED,
+                    side="SELL",
+                    requested_quantity=quantity,
+                    filled_quantity=quantity,
+                    remainder_quantity=0.0,
+                    occurred_at=now,
+                    signal_time=now,
+                    fill_time=now,
+                    fill_price=fill_price,
+                    fee=fee,
+                    slippage=slippage,
+                    reason="FORCED_END",
+                ),
+            )
+        )
+        self.total_fees += fee
+        self.total_slippage += slippage
+        self._exit_fill_bits.append((now, quantity, fill_price, fee))
+        self._record_completed_trade("FORCED_END")
+        final_equity = float(self.broker.getvalue()) + quantity * (fill_price - reference_close) - fee
+        if not math.isfinite(final_equity) or final_equity < 0.0:
+            raise ValueError("terminal liquidation equity must be finite and nonnegative")
+        self._terminal_final_equity = final_equity
+        if self.equity_points and self.equity_points[-1].timestamp == now:
+            self.equity_points[-1] = EquityPoint(now, final_equity)
+        else:
+            self.equity_points.append(EquityPoint(now, final_equity))
 
     def _submit_stop(self, *, reconcile_current_bar: bool = False) -> None:
         if self.current_stop is None or self.entry_signal_time is None:
@@ -703,6 +774,11 @@ class _DonchianBacktestStrategy(bt.Strategy):
         if abs(float(bit.psize)) > 1e-12:
             return
 
+        self._record_completed_trade(str(order.info.reason))
+
+    def _record_completed_trade(self, exit_reason: str) -> None:
+        """Record one complete entry/exit sequence from accumulated native fills."""
+
         entry_quantity = sum(item[1] for item in self._entry_fill_bits)
         exit_quantity = sum(item[1] for item in self._exit_fill_bits)
         if entry_quantity <= 0.0 or exit_quantity <= 0.0:
@@ -721,7 +797,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
                 gross_pnl=gross_pnl,
                 net_pnl=gross_pnl - fees,
                 fees=fees,
-                exit_reason=str(order.info.reason),
+                exit_reason=exit_reason,
             )
         )
         if self.trade_records[-1].net_pnl < 0.0:
@@ -787,11 +863,16 @@ def run_backtest(frame: pd.DataFrame, config: BacktestConfig = BacktestConfig())
         reference_opens=reference_opens,
     )
     strategy = cerebro.run()[0]
+    final_equity = (
+        float(strategy._terminal_final_equity)
+        if strategy._terminal_final_equity is not None
+        else float(broker.getvalue())
+    )
     return BacktestResult(
         equity_curve=tuple(strategy.equity_points),
         orders=tuple(strategy.order_records),
         trades=tuple(strategy.trade_records),
-        final_equity=float(broker.getvalue()),
+        final_equity=final_equity,
         total_fees=float(strategy.total_fees),
         total_slippage=float(strategy.total_slippage),
     )

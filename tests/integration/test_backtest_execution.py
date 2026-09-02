@@ -235,6 +235,79 @@ def test_final_bar_entry_has_truthful_ordered_terminal_lifecycle() -> None:
     assert len(keys) == len(set(keys))
 
 
+def test_opt_in_terminal_liquidation_closes_remaining_position_at_last_close() -> None:
+    """Removing terminal liquidation would leave an open trade and omit sell costs."""
+    fee_rate = 0.0005
+    slippage_rate = 0.001
+    frame = _fixture("entry_next_open.csv").iloc[:612]
+
+    result = run_backtest(
+        frame,
+        BacktestConfig(
+            costs=CostConfig(fee_rate=fee_rate, slippage_rate=slippage_rate),
+            force_liquidate_at_end=True,
+        ),
+    )
+
+    entry = next(
+        order
+        for order in result.orders
+        if order.side == "BUY" and order.status == "COMPLETED"
+    )
+    forced = [order for order in result.orders if order.reason == "FORCED_END"]
+    assert [order.status.value for order in forced] == ["CREATED", "COMPLETED"]
+    assert forced[-1].fill_time == frame.index[-1].to_pydatetime()
+    assert forced[-1].fill_price == pytest.approx(105.0 * (1.0 - slippage_rate))
+    assert forced[-1].fee == pytest.approx(
+        forced[-1].filled_quantity * forced[-1].fill_price * fee_rate
+    )
+    assert forced[-1].filled_quantity == pytest.approx(entry.filled_quantity)
+    trade, = result.trades
+    assert trade.exit_reason == "FORCED_END"
+    assert trade.exit_price == pytest.approx(forced[-1].fill_price)
+    assert result.final_equity == pytest.approx(result.equity_curve[-1].equity)
+    assert result.total_fees == pytest.approx(entry.fee + forced[-1].fee)
+
+
+def test_terminal_liquidation_cancels_partial_exit_before_closing_only_its_remainder() -> None:
+    """Forcing the original requested size after a partial exit would oversell inventory."""
+    fee_rate = 0.0005
+    slippage_rate = 0.001
+    frame = _fixture("partial_exit.csv").iloc[:614]
+
+    result = run_backtest(
+        frame,
+        BacktestConfig(
+            costs=CostConfig(fee_rate=fee_rate, slippage_rate=slippage_rate),
+            exit_fill_fraction=0.5,
+            force_liquidate_at_end=True,
+        ),
+    )
+
+    partial = next(
+        order
+        for order in result.orders
+        if order.reason == "CLOSE_EXIT" and order.status == "PARTIAL"
+    )
+    canceled = next(
+        order
+        for order in result.orders
+        if order.reason == "END_OF_DATA" and order.status == "CANCELED"
+    )
+    forced = next(
+        order
+        for order in result.orders
+        if order.reason == "FORCED_END" and order.status == "COMPLETED"
+    )
+    assert canceled.order_id == partial.order_id
+    assert forced.filled_quantity == pytest.approx(partial.remainder_quantity)
+    assert forced.filled_quantity < partial.requested_quantity
+    assert forced.fill_price == pytest.approx(100.0 * (1.0 - slippage_rate))
+    trade, = result.trades
+    assert trade.exit_reason == "FORCED_END"
+    assert trade.quantity == pytest.approx(partial.requested_quantity)
+
+
 def test_final_bar_partial_entry_remainder_is_terminally_canceled() -> None:
     frame = _fixture("partial_entry.csv").iloc[:612]
     result = run_backtest(
