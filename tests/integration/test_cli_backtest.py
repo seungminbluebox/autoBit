@@ -379,6 +379,39 @@ def test_backtest_command_runs_one_enriched_scenario_and_writes_bundle(tmp_path:
     assert len((output / "trades.csv").read_text(encoding="utf-8").splitlines()) == 2
 
 
+@pytest.mark.parametrize("use_dot_segment", [False, True])
+def test_backtest_rejects_report_output_that_overlaps_canonical_provenance(
+    tmp_path: Path, use_dot_segment: bool
+) -> None:
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    processed = canonical / "processed.csv"
+    processed.write_bytes((FIXTURES / "entry_next_open.csv").read_bytes())
+    sidecar = canonical / "quality.json"
+    _write_quality_sidecar(sidecar, _quality(total_bars=614), processed)
+    processed_before = processed.read_bytes()
+    sidecar_before = sidecar.read_bytes()
+    listing_before = tuple(sorted(path.name for path in canonical.iterdir()))
+    output = canonical / "unused" / ".." if use_dot_segment else canonical
+
+    with pytest.raises(ValueError, match="overlap"):
+        main(
+            [
+                "backtest",
+                "--input",
+                str(processed),
+                "--output",
+                str(output),
+                "--slippage",
+                "0",
+            ]
+        )
+
+    assert processed.read_bytes() == processed_before
+    assert sidecar.read_bytes() == sidecar_before
+    assert tuple(sorted(path.name for path in canonical.iterdir())) == listing_before
+
+
 def test_impossible_candle_quality_provenance_reaches_report_exactly(tmp_path: Path) -> None:
     timestamps = pd.date_range("2025-01-01", periods=614, freq="4h", tz="UTC")
     raw = pd.DataFrame(

@@ -62,9 +62,10 @@ def calculate_metrics(
     Exposure is the fraction of observed equity bars with a nonzero position.
     Order lifecycle records are de-duplicated into fill increments,
     so terminal open positions and partial fills contribute to exposure and
-    turnover without changing closed-trade statistics. Drawdown duration counts
-    consecutive underwater equity bars. All undefined ratios use ``0.0`` so
-    serialized reports never contain NaN or Infinity.
+    turnover without changing closed-trade statistics. Filled orders require
+    timestamped equity points unless exposure is explicit. Drawdown duration
+    counts consecutive underwater equity bars. All undefined ratios use ``0.0``
+    so serialized reports never contain NaN or Infinity.
     """
     if isinstance(periods_per_year, bool) or not isinstance(periods_per_year, int) or periods_per_year <= 0:
         raise ValueError("periods_per_year must be a positive integer")
@@ -94,9 +95,13 @@ def calculate_metrics(
     slippage_value = _finite_scalar(total_slippage, "total_slippage", nonnegative=True)
 
     if exposure is None:
+        if fill_events and not equity_times:
+            raise ValueError(
+                "order-derived exposure requires timestamped equity or explicit exposure"
+            )
         exposure_value = (
             _order_exposure(fill_events, equity_times)
-            if fill_events and equity_times
+            if fill_events
             else _derived_exposure(holding_values, len(equity_values))
         )
     else:
@@ -368,10 +373,9 @@ def _fill_turnover(
 
 
 def _derived_exposure(holding_bars: Sequence[float], equity_count: int) -> float:
-    intervals = max(0, equity_count - 1)
-    if intervals == 0:
+    if equity_count == 0:
         return 0.0
-    return min(1.0, sum(holding_bars) / intervals)
+    return min(1.0, sum(holding_bars) / equity_count)
 
 
 def _derived_turnover(trades: Sequence[TradeRecord], equity: Sequence[float]) -> float:

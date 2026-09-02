@@ -93,10 +93,87 @@ def test_real_trade_metadata_derives_holding_exposure_turnover_and_costs() -> No
     assert metrics.trade_count == 1
     assert metrics.mean_holding_bars == pytest.approx(2.0)
     assert metrics.median_holding_bars == pytest.approx(2.0)
-    assert metrics.exposure == pytest.approx(0.5)
+    assert metrics.exposure == pytest.approx(0.4)
     assert metrics.turnover == pytest.approx(110.0 / 106.0)
     assert metrics.total_fees == pytest.approx(1.0)
     assert metrics.total_slippage == pytest.approx(0.25)
+
+
+def test_closed_trade_exposure_is_identical_with_or_without_order_records() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    equity = tuple(
+        EquityPoint(start + timedelta(hours=4 * index), 100.0)
+        for index in range(5)
+    )
+    trade = TradeRecord(
+        entry_time=start + timedelta(hours=4),
+        exit_time=start + timedelta(hours=12),
+        quantity=0.5,
+        entry_price=100.0,
+        exit_price=110.0,
+        gross_pnl=5.0,
+        net_pnl=5.0,
+        fees=0.0,
+        exit_reason="CLOSE_EXIT",
+    )
+    orders = (
+        OrderRecord(
+            order_id="buy",
+            status=OrderStatus.COMPLETED,
+            side="BUY",
+            requested_quantity=0.5,
+            filled_quantity=0.5,
+            remainder_quantity=0.0,
+            occurred_at=start + timedelta(hours=4),
+            signal_time=start,
+            fill_time=start + timedelta(hours=4),
+            fill_price=100.0,
+        ),
+        OrderRecord(
+            order_id="sell",
+            status=OrderStatus.COMPLETED,
+            side="SELL",
+            requested_quantity=0.5,
+            filled_quantity=0.5,
+            remainder_quantity=0.0,
+            occurred_at=start + timedelta(hours=12),
+            signal_time=start + timedelta(hours=8),
+            fill_time=start + timedelta(hours=12),
+            fill_price=110.0,
+        ),
+    )
+
+    trades_only = calculate_metrics(equity_curve=equity, trades=[trade])
+    with_orders = calculate_metrics(
+        equity_curve=equity, trades=[trade], orders=orders
+    )
+
+    assert trades_only.exposure == pytest.approx(0.4)
+    assert with_orders.exposure == pytest.approx(0.4)
+
+
+def test_orders_with_numeric_equity_require_explicit_exposure() -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    order = OrderRecord(
+        order_id="buy",
+        status=OrderStatus.COMPLETED,
+        side="BUY",
+        requested_quantity=0.5,
+        filled_quantity=0.5,
+        remainder_quantity=0.0,
+        occurred_at=timestamp,
+        signal_time=timestamp,
+        fill_time=timestamp,
+        fill_price=100.0,
+    )
+
+    with pytest.raises(ValueError, match="explicit exposure"):
+        calculate_metrics(equity_curve=[100.0, 100.0], orders=[order])
+
+    metrics = calculate_metrics(
+        equity_curve=[100.0, 100.0], orders=[order], exposure=0.5
+    )
+    assert metrics.exposure == pytest.approx(0.5)
 
 
 def test_zero_trade_no_loss_and_flat_equity_conventions_are_finite() -> None:

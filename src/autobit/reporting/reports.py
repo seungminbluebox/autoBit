@@ -59,8 +59,7 @@ def write_report_bundle(
     source_root: Path = Path("src/autobit"),
 ) -> ReportBundle:
     """Write exactly six deterministic report files using atomic replacement."""
-    output = Path(output_dir)
-    data_file = Path(data_path)
+    output, data_file = _safe_report_paths(output_dir, data_path)
     code_root = Path(source_root)
     config_sha256 = hashlib.sha256(_canonical_json_bytes(config)).hexdigest()
     data_sha256 = hashlib.sha256(data_file.read_bytes()).hexdigest()
@@ -114,6 +113,18 @@ def write_report_bundle(
         data_sha256=data_sha256,
         source_code_sha256=source_code_sha256,
     )
+
+
+def _safe_report_paths(output_dir: Path, data_path: Path) -> tuple[Path, Path]:
+    output = Path(output_dir).resolve(strict=False)
+    data_file = Path(data_path).resolve(strict=False)
+    protected = {data_file, data_file.with_name("quality.json")}
+    report_targets = {output, *(output / name for name in REPORT_FILENAMES)}
+    if protected & report_targets:
+        raise ValueError(
+            "report output overlaps processed input or quality provenance"
+        )
+    return output, data_file
 
 
 def _json_bytes(value: object) -> bytes:
