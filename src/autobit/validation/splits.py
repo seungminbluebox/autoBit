@@ -13,9 +13,11 @@ def build_rolling_folds(
 ) -> list[FoldWindow]:
     """Build complete fixed-length folds without changing the caller's index.
 
-    The intervals are half-open.  The embargo is intentionally absent from both
-    returned performance indexes; callers may use its observations only as
-    pre-OOS indicator context.
+    The intervals are half-open. Every train window is derived backward from
+    its embargo-adjusted OOS boundary, and each adjacent fold reuses a single
+    calendar-quarter boundary from the first OOS anchor. The embargo is
+    intentionally absent from both returned performance indexes; callers may
+    use its observations only as pre-OOS indicator context.
     """
     timestamps = _validated_utc_copy(index)
     if not isinstance(config, WalkForwardConfig):
@@ -27,21 +29,16 @@ def build_rolling_folds(
         return []
 
     coverage_end = timestamps[-1] + _CANDLE_FREQUENCY
-    first_train_end = timestamps[0] + pd.DateOffset(years=config.train_years)
+    first_train_end = _first_complete_train_end(timestamps[0], config)
     first_test_start = first_train_end + pd.DateOffset(days=config.embargo_days)
     folds: list[FoldWindow] = []
+    fold_number = 0
+    test_start = first_test_start
 
     while True:
-        test_start = first_test_start + pd.DateOffset(
-            months=config.step_months * len(folds)
-        )
-        if folds:
-            train_end = test_start - pd.DateOffset(days=config.embargo_days)
-            train_start = train_end - pd.DateOffset(years=config.train_years)
-        else:
-            train_start = timestamps[0]
-            train_end = first_train_end
-        test_end = test_start + pd.DateOffset(months=config.test_months)
+        train_end = test_start - pd.DateOffset(days=config.embargo_days)
+        train_start = train_end - pd.DateOffset(years=config.train_years)
+        test_end = _quarter_boundary(first_test_start, fold_number + 1, config)
         if test_end > coverage_end:
             break
 
@@ -51,7 +48,7 @@ def build_rolling_folds(
             break
         folds.append(
             FoldWindow(
-                fold_id=f"fold-{len(folds):03d}",
+                fold_id=f"fold-{fold_number:03d}",
                 train_start=train_start,
                 train_end=train_end,
                 test_start=test_start,
@@ -60,8 +57,27 @@ def build_rolling_folds(
                 test_index=test_index,
             )
         )
+        test_start = test_end
+        fold_number += 1
 
     return folds
+
+
+def _first_complete_train_end(
+    coverage_start: pd.Timestamp, config: WalkForwardConfig
+) -> pd.Timestamp:
+    """Find the first grid boundary with a full backward calendar lookback."""
+    train_end = coverage_start + pd.DateOffset(years=config.train_years)
+    while train_end - pd.DateOffset(years=config.train_years) < coverage_start:
+        train_end += _CANDLE_FREQUENCY
+    return train_end
+
+
+def _quarter_boundary(
+    first_test_start: pd.Timestamp, ordinal: int, config: WalkForwardConfig
+) -> pd.Timestamp:
+    """Return one anchored OOS boundary without accumulating month-end clipping."""
+    return first_test_start + pd.DateOffset(months=ordinal * config.step_months)
 
 
 def _validated_utc_copy(index: pd.DatetimeIndex) -> pd.DatetimeIndex:

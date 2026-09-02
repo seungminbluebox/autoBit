@@ -41,8 +41,8 @@ def test_rolling_folds_use_fixed_calendar_windows_and_a_five_day_embargo() -> No
     assert all_oos_timestamps.is_unique
 
 
-def test_leap_day_schedule_keeps_every_oos_window_contiguous() -> None:
-    """Advancing a leap-clipped train start makes the second OOS window drift."""
+def test_leap_day_schedule_skips_the_clipped_partial_training_day() -> None:
+    """Forward year addition cannot define the train start on a leap-day anchor."""
     index = pd.date_range(
         "2020-02-29", "2022-12-06", freq="4h", inclusive="left", tz="UTC"
     )
@@ -51,16 +51,89 @@ def test_leap_day_schedule_keeps_every_oos_window_contiguous() -> None:
 
     assert [fold.fold_id for fold in folds[:3]] == ["fold-000", "fold-001", "fold-002"]
     assert [fold.test_start for fold in folds[:3]] == [
-        pd.Timestamp("2022-03-05T00:00:00Z"),
-        pd.Timestamp("2022-06-05T00:00:00Z"),
-        pd.Timestamp("2022-09-05T00:00:00Z"),
+        pd.Timestamp("2022-03-06T00:00:00Z"),
+        pd.Timestamp("2022-06-06T00:00:00Z"),
+        pd.Timestamp("2022-09-06T00:00:00Z"),
     ]
     assert [fold.train_start for fold in folds[:3]] == [
-        pd.Timestamp("2020-02-29T00:00:00Z"),
-        pd.Timestamp("2020-05-31T00:00:00Z"),
-        pd.Timestamp("2020-08-31T00:00:00Z"),
+        pd.Timestamp("2020-03-01T00:00:00Z"),
+        pd.Timestamp("2020-06-01T00:00:00Z"),
+        pd.Timestamp("2020-09-01T00:00:00Z"),
     ]
     assert all(current.test_start == previous.test_end for previous, current in zip(folds, folds[1:]))
+
+
+@pytest.mark.parametrize(
+    ("coverage_start", "expected_train_start", "expected_train_end", "expected_test_starts"),
+    [
+        (
+            "2020-02-29T00:00:00Z",
+            "2020-03-01T00:00:00Z",
+            "2022-03-01T00:00:00Z",
+            ["2022-03-06T00:00:00Z", "2022-06-06T00:00:00Z"],
+        ),
+        (
+            "2020-08-26T00:00:00Z",
+            "2020-08-26T00:00:00Z",
+            "2022-08-26T00:00:00Z",
+            ["2022-08-31T00:00:00Z", "2022-11-30T00:00:00Z"],
+        ),
+        (
+            "2020-08-31T00:00:00Z",
+            "2020-08-31T00:00:00Z",
+            "2022-08-31T00:00:00Z",
+            ["2022-09-05T00:00:00Z", "2022-12-05T00:00:00Z"],
+        ),
+    ],
+)
+def test_first_train_end_uses_the_earliest_complete_backward_lookback(
+    coverage_start: str,
+    expected_train_start: str,
+    expected_train_end: str,
+    expected_test_starts: list[str],
+) -> None:
+    """A clipped forward year end must advance until its backward lookback fits."""
+    index = pd.date_range(coverage_start, "2023-03-07T00:00:00Z", freq="4h", inclusive="left")
+
+    folds = build_rolling_folds(index, WalkForwardConfig())
+
+    assert folds[0].train_start == pd.Timestamp(expected_train_start)
+    assert folds[0].train_end == pd.Timestamp(expected_train_end)
+    assert [fold.test_start for fold in folds[:2]] == [
+        pd.Timestamp(value) for value in expected_test_starts
+    ]
+
+
+def test_all_daily_leap_year_anchors_keep_complete_seven_year_fold_invariants() -> None:
+    """A drift at any daily anchor can duplicate or gap an OOS quarter years later."""
+    for year in (2020, 2024):
+        for coverage_start in pd.date_range(
+            f"{year}-01-01", f"{year}-12-31", freq="D", tz="UTC"
+        ):
+            coverage_end = coverage_start + pd.DateOffset(years=7)
+            index = pd.date_range(coverage_start, coverage_end, freq="4h", inclusive="left")
+
+            folds = build_rolling_folds(index, WalkForwardConfig())
+
+            assert folds
+            first_test_start = folds[0].test_start
+            boundaries = [
+                first_test_start + pd.DateOffset(months=3 * ordinal)
+                for ordinal in range(len(folds) + 2)
+            ]
+            assert [fold.test_start for fold in folds] == boundaries[:-2]
+            assert [fold.test_end for fold in folds] == boundaries[1:-1]
+            assert folds[-1].test_end <= coverage_end < boundaries[-1]
+            oos = pd.DatetimeIndex([timestamp for fold in folds for timestamp in fold.test_index])
+            assert oos.is_unique
+            for ordinal, fold in enumerate(folds):
+                assert fold.test_start == boundaries[ordinal]
+                assert fold.test_end == boundaries[ordinal + 1]
+                assert fold.train_end == fold.test_start - pd.DateOffset(days=5)
+                assert fold.train_start == fold.train_end - pd.DateOffset(years=2)
+                assert fold.train_start >= coverage_start
+                assert fold.test_start - fold.train_end == pd.Timedelta(days=5)
+                assert fold.train_index.size and fold.test_index.size
 
 
 def test_january_month_end_schedule_does_not_drift_at_may_or_august() -> None:
