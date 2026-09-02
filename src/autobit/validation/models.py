@@ -23,6 +23,8 @@ class WalkForwardConfig:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{field_name} must be a positive integer")
+        if self.step_months != self.test_months:
+            raise ValueError("step_months must equal test_months")
 
 
 @dataclass(frozen=True, slots=True)

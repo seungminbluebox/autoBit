@@ -33,84 +33,85 @@ def test_rolling_folds_use_fixed_calendar_windows_and_a_five_day_embargo() -> No
         assert fold.test_index.min() >= fold.test_start
         assert fold.test_index.max() < fold.test_end
         assert fold.train_index.intersection(fold.test_index).empty
+    for previous, current in zip(folds, folds[1:]):
+        assert current.test_start == previous.test_end
+    all_oos_timestamps = pd.DatetimeIndex(
+        [timestamp for fold in folds for timestamp in fold.test_index]
+    )
+    assert all_oos_timestamps.is_unique
 
 
-def test_leap_year_and_month_end_boundaries_use_calendar_offsets() -> None:
-    """A 365-day year or 90-day month approximation shifts this February fold."""
-    index = pd.DatetimeIndex(
-        [
-            "2020-02-29T00:00:00Z",
-            "2021-02-28T00:00:00Z",
-            "2022-02-27T00:00:00Z",
-            "2022-03-05T00:00:00Z",
-            "2022-06-04T00:00:00Z",
-            "2022-06-05T00:00:00Z",
-        ]
+def test_leap_day_schedule_keeps_every_oos_window_contiguous() -> None:
+    """Advancing a leap-clipped train start makes the second OOS window drift."""
+    index = pd.date_range(
+        "2020-02-29", "2022-12-06", freq="4h", inclusive="left", tz="UTC"
     )
 
     folds = build_rolling_folds(index, WalkForwardConfig())
 
-    assert len(folds) == 1
-    fold = folds[0]
-    assert fold.train_end == pd.Timestamp("2022-02-28T00:00:00Z")
-    assert fold.test_start == pd.Timestamp("2022-03-05T00:00:00Z")
-    assert fold.test_end == pd.Timestamp("2022-06-05T00:00:00Z")
-    assert fold.train_index.tolist() == [
-        pd.Timestamp("2020-02-29T00:00:00Z"),
-        pd.Timestamp("2021-02-28T00:00:00Z"),
-        pd.Timestamp("2022-02-27T00:00:00Z"),
-    ]
-    assert fold.test_index.tolist() == [
+    assert [fold.fold_id for fold in folds[:3]] == ["fold-000", "fold-001", "fold-002"]
+    assert [fold.test_start for fold in folds[:3]] == [
         pd.Timestamp("2022-03-05T00:00:00Z"),
-        pd.Timestamp("2022-06-04T00:00:00Z"),
+        pd.Timestamp("2022-06-05T00:00:00Z"),
+        pd.Timestamp("2022-09-05T00:00:00Z"),
     ]
+    assert [fold.train_start for fold in folds[:3]] == [
+        pd.Timestamp("2020-02-29T00:00:00Z"),
+        pd.Timestamp("2020-05-31T00:00:00Z"),
+        pd.Timestamp("2020-08-31T00:00:00Z"),
+    ]
+    assert all(current.test_start == previous.test_end for previous, current in zip(folds, folds[1:]))
 
 
-def test_irregular_sorted_index_respects_half_open_boundaries_exactly() -> None:
-    """Changing either comparison to inclusive leaks a boundary observation."""
+def test_january_month_end_schedule_does_not_drift_at_may_or_august() -> None:
+    """Independently shifting a clipped January start moves the August OOS boundary."""
+    index = pd.date_range(
+        "2020-01-31", "2022-12-06", freq="4h", inclusive="left", tz="UTC"
+    )
+
+    folds = build_rolling_folds(index, WalkForwardConfig())
+
+    assert [fold.test_start for fold in folds[:3]] == [
+        pd.Timestamp("2022-02-05T00:00:00Z"),
+        pd.Timestamp("2022-05-05T00:00:00Z"),
+        pd.Timestamp("2022-08-05T00:00:00Z"),
+    ]
+    assert all(current.test_start == previous.test_end for previous, current in zip(folds, folds[1:]))
+
+
+def test_sparse_or_off_grid_canonical_data_is_rejected() -> None:
+    """Treating missing or off-grid candles as coverage makes OOS incomplete."""
+    sparse = pd.DatetimeIndex(["2020-01-01T00:00:00Z", "2020-01-01T08:00:00Z"])
+    off_grid = pd.DatetimeIndex(["2020-01-01T00:00:00Z", "2020-01-01T06:00:00Z"])
+
+    with pytest.raises(ValueError, match="4-hour"):
+        build_rolling_folds(sparse, WalkForwardConfig())
+    with pytest.raises(ValueError, match="4-hour"):
+        build_rolling_folds(off_grid, WalkForwardConfig())
+
+
+def test_coverage_end_includes_the_last_complete_half_open_fold() -> None:
+    """Using the final timestamp as coverage loses a valid final four-hour bar."""
     config = WalkForwardConfig(train_years=1, embargo_days=1, test_months=1, step_months=1)
-    index = pd.DatetimeIndex(
-        [
-            "2020-01-31T00:00:00Z",
-            "2020-11-15T00:00:00Z",
-            "2021-01-30T23:59:59Z",
-            "2021-01-31T00:00:00Z",
-            "2021-02-01T00:00:00Z",
-            "2021-02-15T00:00:00Z",
-            "2021-03-01T00:00:00Z",
-            "2021-03-01T23:59:59Z",
-            "2021-03-02T00:00:00Z",
-        ]
+    index = pd.date_range(
+        "2020-01-01T00:00:00Z",
+        "2021-02-02T00:00:00Z",
+        freq="4h",
+        inclusive="left",
     )
 
     folds = build_rolling_folds(index, config)
 
     assert len(folds) == 1
-    fold = folds[0]
-    assert fold.train_end == pd.Timestamp("2021-01-31T00:00:00Z")
-    assert fold.test_start == pd.Timestamp("2021-02-01T00:00:00Z")
-    assert fold.test_end == pd.Timestamp("2021-03-01T00:00:00Z")
-    assert fold.train_index.tolist() == [
-        pd.Timestamp("2020-01-31T00:00:00Z"),
-        pd.Timestamp("2020-11-15T00:00:00Z"),
-        pd.Timestamp("2021-01-30T23:59:59Z"),
-    ]
-    assert fold.test_index.tolist() == [
-        pd.Timestamp("2021-02-01T00:00:00Z"),
-        pd.Timestamp("2021-02-15T00:00:00Z"),
-    ]
+    assert folds[0].test_end == pd.Timestamp("2021-02-02T00:00:00Z")
+    assert folds[0].test_index.max() == pd.Timestamp("2021-02-01T20:00:00Z")
 
 
-def test_incomplete_last_test_window_is_not_emitted() -> None:
-    """Accepting a test end beyond the observed range creates partial OOS results."""
+def test_incomplete_final_four_hour_coverage_is_not_emitted() -> None:
+    """A final missing candle must prevent the otherwise matching OOS window."""
     config = WalkForwardConfig(train_years=1, embargo_days=1, test_months=1, step_months=1)
-    index = pd.DatetimeIndex(
-        [
-            "2020-01-01T00:00:00Z",
-            "2020-12-31T00:00:00Z",
-            "2021-01-02T00:00:00Z",
-            "2021-01-31T23:59:59Z",
-        ]
+    index = pd.date_range(
+        "2020-01-01T00:00:00Z", "2021-02-01T16:00:00Z", freq="4h"
     )
 
     assert build_rolling_folds(index, config) == []
@@ -135,14 +136,11 @@ def test_fold_indexes_are_distinct_copies_and_never_mutate_the_caller() -> None:
 def test_aware_non_utc_index_is_normalized_without_changing_the_caller() -> None:
     """Rejecting valid aware zones or mutating their timezone loses timestamp meaning."""
     config = WalkForwardConfig(train_years=1, embargo_days=1, test_months=1, step_months=1)
-    index = pd.DatetimeIndex(
-        [
-            "2020-01-01T00:00:00-05:00",
-            "2020-12-31T23:00:00-05:00",
-            "2021-01-02T00:00:00-05:00",
-            "2021-02-01T00:00:00-05:00",
-            "2021-02-02T00:00:00-05:00",
-        ]
+    index = pd.date_range(
+        "2020-01-01T09:00:00+09:00",
+        "2021-02-02T09:00:00+09:00",
+        freq="4h",
+        inclusive="left",
     )
     original = index.copy(deep=True)
 
@@ -150,8 +148,8 @@ def test_aware_non_utc_index_is_normalized_without_changing_the_caller() -> None
 
     assert index.equals(original)
     assert len(folds) == 1
-    assert folds[0].train_start == pd.Timestamp("2020-01-01T05:00:00Z")
-    assert folds[0].test_start == pd.Timestamp("2021-01-02T05:00:00Z")
+    assert folds[0].train_start == pd.Timestamp("2020-01-01T00:00:00Z")
+    assert folds[0].test_start == pd.Timestamp("2021-01-02T00:00:00Z")
 
 
 @pytest.mark.parametrize(
@@ -162,6 +160,7 @@ def test_aware_non_utc_index_is_normalized_without_changing_the_caller() -> None
         pd.DatetimeIndex(["2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"]),
         pd.DatetimeIndex(["2020-01-02T00:00:00Z", "2020-01-01T00:00:00Z"]),
         pd.DatetimeIndex([pd.NaT], tz="UTC"),
+        pd.DatetimeIndex([]),
     ],
 )
 def test_invalid_indexes_fail_closed(index: pd.Index) -> None:
@@ -193,12 +192,19 @@ def test_config_requires_positive_non_boolean_integers(field: str, value: object
         WalkForwardConfig(**values)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("step_months", [1, 4])
+def test_config_requires_the_oos_step_to_equal_the_oos_window(step_months: int) -> None:
+    """Any unequal step either overlaps or leaves a gap between OOS windows."""
+    with pytest.raises(ValueError, match="step_months"):
+        WalkForwardConfig(test_months=3, step_months=step_months)
+
+
 def test_empty_and_insufficient_valid_indexes_have_no_folds() -> None:
     """A fold needs a complete train, embargo, and OOS calendar span."""
     config = WalkForwardConfig(train_years=1, embargo_days=1, test_months=1, step_months=1)
     empty = pd.DatetimeIndex([], tz="UTC")
     insufficient = pd.DatetimeIndex(
-        ["2020-01-01T00:00:00Z", "2021-02-01T23:59:59Z"]
+        pd.date_range("2020-01-01T00:00:00Z", "2021-02-01T16:00:00Z", freq="4h")
     )
 
     assert build_rolling_folds(empty, config) == []
