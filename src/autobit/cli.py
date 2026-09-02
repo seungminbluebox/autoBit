@@ -15,9 +15,9 @@ from autobit.backtest.analyzers import calculate_metrics
 from autobit.backtest.benchmark import run_buy_and_hold
 from autobit.backtest.engine import BacktestConfig, run_backtest
 from autobit.config import CostConfig, DataConfig, ExchangeRulesConfig
-from autobit.data.collector import collect_range
+from autobit.data.collector import collect_evidence_range
 from autobit.data.quality import QualityReport, canonicalize_ohlcv
-from autobit.data.storage import _atomic_write, _canonical_json_bytes, save_snapshot
+from autobit.data.storage import _atomic_write, _canonical_json_bytes
 from autobit.data.upbit_public import UpbitPublicClient
 from autobit.indicators.trend import compute_trend_indicators
 from autobit.reporting.reports import SCHEMA_VERSION, write_report_bundle
@@ -64,14 +64,18 @@ def _run_data_download(arguments: argparse.Namespace) -> int:
     start = end - pd.DateOffset(years=arguments.years)
     with httpx.Client() as http_client:
         client = UpbitPublicClient(http_client, config)
-        frame = collect_range(
+        collection = collect_evidence_range(
             client,
             start_utc=_format_utc(start),
             end_utc=_format_utc(end),
+            evidence_root=arguments.output,
+            config=config,
         )
 
-    payload = frame.to_dict(orient="records")
-    snapshot = save_snapshot(arguments.output, payload, config=config)
+    frame = collection.frame
+    evidence = collection.evidence
+    if evidence.collection_snapshot_path is None or evidence.collection_snapshot_sha256 is None:
+        raise ValueError("completed collection evidence is missing its snapshot")
     exchange_rules = ExchangeRulesConfig()
     rules_bytes = _canonical_json_bytes(asdict(exchange_rules))
     _atomic_write(arguments.output / "exchange-rules.json", rules_bytes)
@@ -84,12 +88,22 @@ def _run_data_download(arguments: argparse.Namespace) -> int:
                 "years": arguments.years,
                 "start_utc": _format_utc(start),
                 "end_utc": _format_utc(end),
-                "source_url": snapshot.source_url,
-                "raw_snapshot": snapshot.path.name,
-                "raw_snapshot_sha256": snapshot.sha256,
+                "source_url": evidence.source_url,
+                "raw_pages": [
+                    {
+                        "path": page.path.name,
+                        "sha256": page.sha256,
+                        "request_to_utc": page.request_to_utc,
+                        "oldest_timestamp_utc": page.oldest_timestamp_utc,
+                        "row_count": page.row_count,
+                    }
+                    for page in evidence.pages
+                ],
+                "collection_snapshot": evidence.collection_snapshot_path.name,
+                "collection_snapshot_sha256": evidence.collection_snapshot_sha256,
                 "exchange_rules_sha256": hashlib.sha256(rules_bytes).hexdigest(),
-                "config_sha256": snapshot.config_hash,
-                "row_count": snapshot.row_count,
+                "config_sha256": evidence.config_sha256,
+                "row_count": len(frame),
             }
         ),
     )

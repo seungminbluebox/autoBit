@@ -272,13 +272,24 @@ def test_data_download_uses_public_client_writes_evidence_and_closes_http(
         ("GET", "/v1/candles/minutes/240"),
         ("GET", "/v1/candles/minutes/240"),
     ]
-    snapshots = list(output.glob("snapshot-*.json"))
-    assert len(snapshots) == 1
-    assert json.loads(snapshots[0].read_text(encoding="utf-8"))[0]["market"] == "KRW-BTC"
+    pages = list(output.glob("page-*.json"))
+    snapshots = [
+        path
+        for path in output.glob("collection-*.json")
+        if path.name != "collection-manifest.json"
+    ]
+    assert len(pages) == 2
+    assert len(snapshots) == 2
+    assert any(
+        payload and payload[0]["market"] == "KRW-BTC"
+        for payload in (json.loads(page.read_text(encoding="utf-8")) for page in pages)
+    )
     assert {
         path.name for path in output.iterdir()
     } == {
-        snapshots[0].name,
+        *(path.name for path in pages),
+        *(path.name for path in snapshots),
+        "collection-manifest.json",
         "checkpoint.json",
         "exchange-rules.json",
         "manifest.json",
@@ -287,7 +298,12 @@ def test_data_download_uses_public_client_writes_evidence_and_closes_http(
     assert manifest["schema_version"] == "1.0"
     assert manifest["years"] == 7
     assert manifest["end_utc"] == "2026-01-01T00:00:00Z"
-    assert len(manifest["raw_snapshot_sha256"]) == 64
+    assert "raw_snapshot" not in manifest
+    assert "raw_snapshot_sha256" not in manifest
+    assert sorted(page["path"] for page in manifest["raw_pages"]) == sorted(
+        page.name for page in pages
+    )
+    assert len(manifest["collection_snapshot_sha256"]) == 64
     assert len(manifest["exchange_rules_sha256"]) == 64
 
 

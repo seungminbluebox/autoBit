@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from pandas.testing import assert_series_equal
 
 from autobit.config import StrategyConfig
 from autobit.indicators.trend import compute_trend_indicators
@@ -76,5 +77,55 @@ def test_atr_baseline_uses_prior_252_completed_bars_per_segment() -> None:
     assert enriched.iloc[target]["baseline_atr_pct"] == np.median(
         atr_pct.iloc[target - 252 : target].to_numpy()
     )
+    assert pd.isna(enriched.iloc[280]["atr_14"])
     assert pd.isna(enriched.iloc[280]["baseline_atr_pct"])
-    assert enriched.iloc[281]["baseline_atr_pct"] == atr_pct.iloc[280]
+
+
+def test_each_segment_matches_its_standalone_indicator_calculation() -> None:
+    """A prior long-gap segment cannot seed any later segment's trend state."""
+    first = _frame(620)
+    second = _frame(620)
+    second.index = pd.date_range(
+        first.index[-1] + pd.Timedelta(hours=4),
+        periods=len(second),
+        freq="4h",
+        tz="UTC",
+    )
+    second.loc[:, ["open", "high", "low", "close"]] += 20_000.0
+    combined = pd.concat([first, second])
+    combined["segment_id"] = [0] * len(first) + [1] * len(second)
+
+    enriched = compute_trend_indicators(combined, StrategyConfig())
+
+    for segment in (first, second):
+        standalone = compute_trend_indicators(segment, StrategyConfig())
+        from_combined = enriched.loc[segment.index]
+        for column in (
+            "ema_200",
+            "atr_14",
+            "entry_high",
+            "exit_low",
+            "previous_close",
+            "previous_entry_high",
+            "baseline_atr_pct",
+            "warmup_complete",
+        ):
+            assert_series_equal(from_combined[column], standalone[column])
+
+
+def test_warmup_counts_only_prior_normal_completed_bars() -> None:
+    """Filled, quarantined, anomalous, and non-finite rows cannot satisfy warmup."""
+    frame = _frame(605)
+    frame["is_filled"] = False
+    frame["is_quarantined"] = False
+    frame["anomaly_spike"] = False
+    frame["anomaly_flat"] = False
+    frame.iloc[10, frame.columns.get_loc("is_filled")] = True
+    frame.iloc[20, frame.columns.get_loc("is_quarantined")] = True
+    frame.iloc[30, frame.columns.get_loc("anomaly_spike")] = True
+    frame.iloc[40, frame.columns.get_loc("close")] = np.nan
+
+    enriched = compute_trend_indicators(frame, StrategyConfig())
+
+    assert not bool(enriched.iloc[603]["warmup_complete"])
+    assert bool(enriched.iloc[604]["warmup_complete"])

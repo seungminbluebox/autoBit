@@ -129,6 +129,16 @@ def test_off_grid_timestamp_is_rejected_without_rounding_or_dropping() -> None:
     assert "2026-01-01T02:00:00+00:00" in str(error.value)
 
 
+@pytest.mark.parametrize("nanoseconds", [1, 999])
+def test_submicrosecond_offset_is_rejected_without_rounding(nanoseconds: int) -> None:
+    """Integer-nanosecond grid validation must not rely on microseconds."""
+    timestamp = pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(nanoseconds=nanoseconds)
+    raw = make_frame([timestamp.isoformat()])
+
+    with pytest.raises(ValueError, match="4-hour boundary"):
+        canonicalize_ohlcv(raw, datetime(2026, 1, 2, tzinfo=timezone.utc))
+
+
 def test_consistently_shifted_series_is_rejected_with_all_off_grid_timestamps() -> None:
     """A complete-looking 02:00/06:00 series must not establish a shifted cadence."""
     raw = make_frame(["2026-01-01T02:00:00Z", "2026-01-01T06:00:00Z"])

@@ -66,12 +66,7 @@ def _as_utc_index(index: pd.Index) -> pd.DatetimeIndex:
 
 
 def _validate_four_hour_boundaries(timestamps: pd.DatetimeIndex) -> None:
-    off_grid = timestamps[
-        (timestamps.hour % 4 != 0)
-        | (timestamps.minute != 0)
-        | (timestamps.second != 0)
-        | (timestamps.microsecond != 0)
-    ]
+    off_grid = timestamps[timestamps.asi8 % _FREQUENCY.value != 0]
     if len(off_grid):
         rendered = ", ".join(timestamp.isoformat() for timestamp in off_grid.unique())
         raise ValueError(f"OHLCV timestamps must align to a UTC 4-hour boundary: {rendered}")
