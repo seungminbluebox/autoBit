@@ -40,6 +40,117 @@ def _enter(
     return order, fill
 
 
+def _append_public_stop_fill(
+    store: SQLiteStore,
+    stop,
+    *,
+    trigger_at: str,
+    quantity: float,
+    reference_price: float,
+) -> str:
+    signal_at = stop.observed_at_utc.isoformat().replace("+00:00", "Z")
+    key = f"KRW-BTC:{signal_at}:SELL:{stop.reason}:{stop.stop_id}"
+    order_id = f"paper-order:{sha256(key.encode('utf-8')).hexdigest()}"
+    fill_price = reference_price * (1.0 - stop.slippage_rate)
+    fee = quantity * fill_price * stop.fee_rate
+    store.record_order_once(
+        key,
+        "SELL",
+        quantity,
+        order_id=order_id,
+        occurred_at=trigger_at,
+        status=OrderStatus.CREATED,
+    )
+    store.transition_order_status(
+        order_id,
+        f"{key}:submitted",
+        OrderStatus.SUBMITTED,
+        trigger_at,
+    )
+    store.transition_order_status(
+        order_id,
+        f"{key}:accepted",
+        OrderStatus.ACCEPTED,
+        trigger_at,
+    )
+    store.append_event(
+        f"paper-order-meta:{sha256(order_id.encode('utf-8')).hexdigest()}",
+        "PAPER_ORDER",
+        trigger_at,
+        {
+            "eligible_open_utc": trigger_at,
+            "fee_rate": stop.fee_rate,
+            "idempotency_key": key,
+            "order_id": order_id,
+            "order_kind": "STOP",
+            "parent_order_id": stop.stop_id,
+            "reason": stop.reason,
+            "requested_quantity": quantity,
+            "side": "SELL",
+            "signal_at_utc": signal_at,
+            "slippage_rate": stop.slippage_rate,
+        },
+    )
+    fill_material = "|".join((order_id, trigger_at, repr(quantity)))
+    fill_id = f"paper-fill:{sha256(fill_material.encode('utf-8')).hexdigest()}"
+    store.append_fill(
+        order_id,
+        "SELL",
+        quantity,
+        fill_price,
+        fee,
+        trigger_at,
+        fill_id=fill_id,
+    )
+    store.transition_order_status(
+        order_id,
+        f"{key}:completed:{trigger_at}",
+        OrderStatus.COMPLETED,
+        trigger_at,
+        reason=stop.reason,
+    )
+    slippage = abs(fill_price - reference_price) * quantity
+    store.append_event(
+        f"paper-fill-meta:{sha256(fill_id.encode('utf-8')).hexdigest()}",
+        "PAPER_FILL",
+        trigger_at,
+        {
+            "fee": fee,
+            "fee_rate": stop.fee_rate,
+            "fill_id": fill_id,
+            "fill_price": fill_price,
+            "order_id": order_id,
+            "quantity": quantity,
+            "reason": stop.reason,
+            "reference_price": reference_price,
+            "side": "SELL",
+            "slippage": slippage,
+            "slippage_rate": stop.slippage_rate,
+        },
+    )
+    return order_id
+
+
+def _append_public_stop_terminal(
+    store: SQLiteStore,
+    stop,
+    order_id: str,
+    *,
+    action: str,
+    occurred_at: str,
+) -> None:
+    event_id = (
+        f"paper-stop-{action.lower()}:"
+        f"{sha256((stop.stop_id + '|' + order_id).encode('utf-8')).hexdigest()}"
+    )
+    store.append_event(
+        event_id,
+        "PAPER_STOP",
+        occurred_at,
+        {"action": action, "identity": order_id, "stop_id": stop.stop_id},
+    )
+
+
 @pytest.mark.parametrize(
     "costs",
     [
@@ -1170,6 +1281,91 @@ def test_reconcile_rejects_partial_stop_trigger_that_leaves_unprotected_btc(
     )
 
     with pytest.raises(PaperReconciliationError, match="full|inventory|residual"):
+        broker.reconcile()
+
+
+def test_reconcile_rejects_stop_cancellation_after_a_nonflattening_market_exit(
+    tmp_path: Path,
+) -> None:
+    store, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    stop = broker.set_stop(UTC_4, 95.0, reason="HARD_STOP")
+    exit_order = broker.submit_exit(
+        UTC_8,
+        quantity=0.1,
+        owned_quantity=0.2,
+        reason="CLOSE_EXIT",
+    )
+    broker.process_open(exit_order.order_id, UTC_12, open_price=100.0)
+    assert broker.reconcile().active_stop == stop
+    terminal_id = (
+        "paper-stop-canceled:"
+        f"{sha256((stop.stop_id + '|' + exit_order.order_id).encode('utf-8')).hexdigest()}"
+    )
+    store.append_event(
+        terminal_id,
+        "PAPER_STOP",
+        UTC_12,
+        {
+            "action": "CANCELED",
+            "identity": exit_order.order_id,
+            "stop_id": stop.stop_id,
+        },
+    )
+
+    with pytest.raises(PaperReconciliationError, match="flat|inventory|residual"):
+        broker.reconcile()
+
+
+def test_full_root_market_exit_cancels_stop_and_reconciles(tmp_path: Path) -> None:
+    _, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    broker.set_stop(UTC_4, 95.0, reason="HARD_STOP")
+    exit_order = broker.submit_exit(
+        UTC_8,
+        quantity=0.2,
+        owned_quantity=0.2,
+        reason="CLOSE_EXIT",
+    )
+    fill = broker.process_open(exit_order.order_id, UTC_12, open_price=100.0)
+
+    assert fill is not None
+    result = broker.reconcile()
+    assert result.btc_quantity == 0.0
+    assert result.position_state is PositionState.FLAT
+    assert result.active_stop is None
+
+
+def test_reconcile_rejects_triggering_a_stale_eligible_stop_version(
+    tmp_path: Path,
+) -> None:
+    store, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    old_stop = broker.set_stop(UTC_4, 95.0, reason="HARD_STOP")
+    new_stop = broker.set_stop(UTC_8, 97.0, reason="TRAILING_STOP")
+    order_id = _append_public_stop_fill(
+        store,
+        old_stop,
+        trigger_at=UTC_12,
+        quantity=0.2,
+        reference_price=95.0,
+    )
+    _append_public_stop_terminal(
+        store,
+        old_stop,
+        order_id,
+        action="TRIGGERED",
+        occurred_at=UTC_12,
+    )
+    _append_public_stop_terminal(
+        store,
+        new_stop,
+        order_id,
+        action="CANCELED",
+        occurred_at=UTC_12,
+    )
+
+    with pytest.raises(PaperReconciliationError, match="latest eligible"):
         broker.reconcile()
 
 

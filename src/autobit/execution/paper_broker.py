@@ -1085,11 +1085,37 @@ class PaperBroker:
                 )
             if event.occurred_at_utc != related_fill.occurred_at_utc:
                 raise PaperReconciliationError("paper stop terminal time is not causal")
+            if _inventory_before_sequence(
+                event.sequence,
+                snapshot.event_evidence,
+            ) != 0:
+                raise PaperReconciliationError(
+                    "paper stop terminal did not leave inventory exactly flat"
+                )
             action = _payload_text(event.payload, "action")
             stop_id = _payload_text(event.payload, "stop_id")
-            if action == "TRIGGERED" and related.parent_order_id != stop_id:
-                raise PaperReconciliationError("triggered stop exit ancestry is invalid")
             if action == "TRIGGERED":
+                if related.parent_order_id != stop_id:
+                    raise PaperReconciliationError(
+                        "triggered stop exit ancestry is invalid"
+                    )
+                earlier_terminal_ids = {
+                    _payload_text(terminal.payload, "stop_id")
+                    for terminal in stop_terminals
+                    if terminal.sequence < related_fill.sequence
+                }
+                eligible_versions = tuple(
+                    candidate.stop_id
+                    for candidate in known_stops.values()
+                    if stop_set_events[candidate.stop_id].sequence
+                    < related_fill.sequence
+                    and candidate.stop_id not in earlier_terminal_ids
+                    and candidate.active_after_utc <= related_fill.occurred_at_utc
+                )
+                if not eligible_versions or eligible_versions[-1] != stop_id:
+                    raise PaperReconciliationError(
+                        "triggered stop is not the latest eligible open version"
+                    )
                 triggered_orders.add(identity)
             if action == "CANCELED" and related.parent_order_id == stop_id:
                 raise PaperReconciliationError("canceled stop is bound to a trigger order")
