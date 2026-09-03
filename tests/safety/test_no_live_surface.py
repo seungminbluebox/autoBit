@@ -131,6 +131,36 @@ _BASE64_DECODERS = frozenset(
     {"a2b_base64", "b64decode", "decodebytes", "standard_b64decode", "urlsafe_b64decode"}
 )
 _HTTP_METHOD_NAMES = frozenset({"delete", "get", "patch", "post", "put"})
+_NETWORK_IMPORT_ROOTS = frozenset(
+    {
+        "aiohttp",
+        "http",
+        "httpx",
+        "requests",
+        "socket",
+        "urllib",
+        "urllib3",
+        "websocket",
+        "websockets",
+    }
+)
+_DATA_ADAPTER_PATH = "src/autobit/data/upbit_public.py"
+_NOTIFIER_ADAPTER_PATH = "src/autobit/alerts/notifier.py"
+_HTTPX_WIRING_PATH = "src/autobit/cli.py"
+_ALLOWED_HTTPX_IMPORT_PATHS = frozenset(
+    {_DATA_ADAPTER_PATH, _NOTIFIER_ADAPTER_PATH, _HTTPX_WIRING_PATH}
+)
+_UNAMBIGUOUS_HTTP_SINK_METHODS = frozenset(
+    {
+        "delete",
+        "patch",
+        "post",
+        "put",
+        "request",
+        "stream",
+        "urlopen",
+    }
+)
 
 
 def _git_paths(*arguments: str) -> tuple[Path, ...]:
@@ -152,6 +182,13 @@ def _is_repository_source(path: Path) -> bool:
         and path.parts
         and path.parts[0] not in _EXCLUDED_TOP_LEVEL
     )
+
+
+def _surface_path(label: str) -> str:
+    prefix, separator, path = label.partition(":")
+    if separator and prefix in {"index", "worktree"}:
+        return path.replace("\\", "/")
+    return label.replace("\\", "/")
 
 
 def _repository_source_surfaces() -> tuple[tuple[str, str], ...]:
@@ -460,6 +497,57 @@ def _network_contract(
     return method_value.upper(), url_value
 
 
+def _network_import_roots(aliases: dict[str, str]) -> frozenset[str]:
+    return frozenset(
+        target.lower().split(".", 1)[0]
+        for target in aliases.values()
+        if target.lower().split(".", 1)[0] in _NETWORK_IMPORT_ROOTS
+    )
+
+
+def _looks_like_url_argument(
+    node: ast.AST | None,
+    constants: dict[str, object],
+    aliases: dict[str, str],
+) -> bool:
+    if node is None:
+        return False
+    value = _constant_value(node, constants, aliases)
+    if isinstance(value, str):
+        return value.lower().startswith(("http://", "https://", "ws://", "wss://"))
+    names = {
+        child.id.lower()
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name)
+    }
+    return any(
+        marker in name
+        for name in names
+        for marker in ("endpoint", "host", "uri", "url")
+    )
+
+
+def _network_call_is_allowed(
+    path: str,
+    kind: str,
+    contract: tuple[str, str] | None,
+    call: ast.Call,
+) -> bool:
+    if kind == "client_constructor":
+        return path == _HTTPX_WIRING_PATH and not call.args and not call.keywords
+    if path == _DATA_ADAPTER_PATH:
+        return kind in {"request_constructor", "client_send"} and contract == (
+            "GET",
+            _PUBLIC_CANDLE_URL,
+        )
+    if path == _NOTIFIER_ADAPTER_PATH:
+        return kind == "client_verb" and contract == (
+            "POST",
+            _TELEGRAM_URL_TEMPLATE,
+        )
+    return False
+
+
 def _is_api_destination(value: str) -> bool:
     lowered = value.lower()
     return lowered.startswith(
@@ -482,12 +570,18 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
     except SyntaxError as error:
         return (f"{label}: invalid Python syntax: {error.msg}",), ()
 
+    path = _surface_path(label)
     aliases, import_violations = _imports(tree)
     constants = _constant_bindings(tree, aliases)
     clients, network_functions, httpx_modules, request_constructors = _network_symbols(
         tree, aliases
     )
     violations = [f"{label}: {item}" for item in import_violations]
+    for root in sorted(_network_import_roots(aliases)):
+        if root != "httpx" or path not in _ALLOWED_HTTPX_IMPORT_PATHS:
+            violations.append(
+                f"{label}: network import outside approved boundary: {root}"
+            )
     atoms: list[str] = []
     api_urls: set[str] = set()
     request_contracts: dict[str, tuple[str, str] | None] = {}
@@ -517,7 +611,11 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
             function = _dotted_name(node.func) or ""
             resolved = _resolve_alias(function, aliases)
             tail = resolved.lower().split(".")[-1]
-            if function in _DYNAMIC_CALLS or resolved in _DYNAMIC_CALLS:
+            if (
+                function in _DYNAMIC_CALLS
+                or resolved in _DYNAMIC_CALLS
+                or tail == "__import__"
+            ):
                 violations.append(f"{label}: dynamic execution/import call: {function}")
             if isinstance(node.func, ast.Attribute) and node.func.attr.lower() == "fromhex":
                 violations.append(f"{label}: constant decoder is forbidden: {function}")
@@ -574,8 +672,13 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
             continue
         function = _dotted_name(node.func) or ""
         resolved = _resolve_alias(function, aliases)
+        kind: str | None = None
         contract: tuple[str, str] | None | object = _UNKNOWN
-        if resolved == "httpx.Request" or function in request_constructors:
+        if resolved in {"httpx.Client", "httpx.AsyncClient"}:
+            kind = "client_constructor"
+            contract = None
+        elif resolved == "httpx.Request" or function in request_constructors:
+            kind = "request_constructor"
             contract = _network_contract(
                 _call_argument(node, 0, "method"),
                 _call_argument(node, 1, "url"),
@@ -587,6 +690,7 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
             base = _dotted_name(node.func.value) or ""
             method = node.func.attr.lower()
             if base in httpx_modules and method in _HTTP_METHOD_NAMES:
+                kind = "module_verb"
                 contract = _network_contract(
                     None,
                     _call_argument(node, 0, "url"),
@@ -595,6 +699,7 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     aliases=aliases,
                 )
             elif (base in httpx_modules or base in clients) and method == "request":
+                kind = "client_request" if base in clients else "module_request"
                 contract = _network_contract(
                     _call_argument(node, 0, "method"),
                     _call_argument(node, 1, "url"),
@@ -603,6 +708,7 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     aliases=aliases,
                 )
             elif base in clients and method in _HTTP_METHOD_NAMES:
+                kind = "client_verb"
                 contract = _network_contract(
                     None,
                     _call_argument(node, 0, "url"),
@@ -611,10 +717,57 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     aliases=aliases,
                 )
             elif base in clients and method == "send":
+                kind = "client_send"
                 request_node = _call_argument(node, 0, "request")
                 request_name = _dotted_name(request_node) if request_node is not None else None
                 contract = request_contracts.get(request_name or "")
+            elif base in httpx_modules and method == "stream":
+                kind = "module_stream"
+                contract = _network_contract(
+                    _call_argument(node, 0, "method"),
+                    _call_argument(node, 1, "url"),
+                    fixed_method=None,
+                    constants=constants,
+                    aliases=aliases,
+                )
+            elif method in _UNAMBIGUOUS_HTTP_SINK_METHODS:
+                kind = "unresolved_receiver"
+                method_node = (
+                    _call_argument(node, 0, "method")
+                    if method == "request"
+                    else None
+                )
+                url_node = _call_argument(
+                    node,
+                    1 if method == "request" else 0,
+                    "url",
+                )
+                contract = _network_contract(
+                    method_node,
+                    url_node,
+                    fixed_method=None if method == "request" else method.upper(),
+                    constants=constants,
+                    aliases=aliases,
+                )
+            elif method == "send" and path == _DATA_ADAPTER_PATH:
+                kind = "unresolved_receiver"
+                contract = None
+            elif method == "get" and (
+                (path in {_DATA_ADAPTER_PATH, _NOTIFIER_ADAPTER_PATH} and base != "response.headers")
+                or _looks_like_url_argument(
+                    _call_argument(node, 0, "url"), constants, aliases
+                )
+            ):
+                kind = "unresolved_receiver"
+                contract = _network_contract(
+                    None,
+                    _call_argument(node, 0, "url"),
+                    fixed_method="GET",
+                    constants=constants,
+                    aliases=aliases,
+                )
         elif isinstance(node.func, ast.Name) and node.func.id in network_functions:
+            kind = "function_alias"
             method = network_functions[node.func.id]
             if method == "REQUEST":
                 contract = _network_contract(
@@ -632,16 +785,33 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     constants=constants,
                     aliases=aliases,
                 )
+        elif resolved == "httpx.stream":
+            kind = "function_alias"
+            contract = _network_contract(
+                _call_argument(node, 0, "method"),
+                _call_argument(node, 1, "url"),
+                fixed_method=None,
+                constants=constants,
+                aliases=aliases,
+            )
 
-        if contract is _UNKNOWN:
+        if kind is None:
             continue
+        if contract is _UNKNOWN:
+            contract = None
         if contract is None:
-            violations.append(f"{label}: unresolved network request contract: {function}")
+            if not _network_call_is_allowed(path, kind, None, node):
+                violations.append(
+                    f"{label}: unresolved or unapproved network capability: {function}"
+                )
             continue
         method, url = contract
         if _is_api_destination(url):
             api_urls.add(url)
-        if contract not in _ALLOWED_NETWORK_CONTRACTS:
+        if (
+            contract not in _ALLOWED_NETWORK_CONTRACTS
+            or not _network_call_is_allowed(path, kind, contract, node)
+        ):
             violations.append(f"{label}: unapproved network request: {method} {url}")
 
     for atom in atoms:
@@ -866,6 +1036,66 @@ def test_cli_exposes_exactly_the_offline_public_commands_and_options() -> None:
             'import httpx as h\nclient = h.Client()\ndef send(host, path):\n    client.post(host + path)\n',
         ),
         (
+            "inline_sync_client_dynamic_url",
+            "index:src/autobit/alerts/notifier.py",
+            'import httpx as h\ndef send(url):\n    h.Client().post(url)\n',
+        ),
+        (
+            "inline_async_client_dynamic_url",
+            "worktree:src/autobit/data/upbit_public.py",
+            'import httpx as h\nasync def send(url):\n    await h.AsyncClient().post(url)\n',
+        ),
+        (
+            "factory_client_dynamic_url",
+            "index:src/autobit/alerts/notifier.py",
+            'import httpx as h\ndef factory():\n    return h.Client()\nclient = factory()\ndef send(url):\n    client.post(url)\n',
+        ),
+        (
+            "httpx_stream_dynamic_url",
+            "worktree:src/autobit/data/upbit_public.py",
+            'import httpx as h\ndef read(url):\n    return h.stream("GET", url)\n',
+        ),
+        (
+            "urllib_urlopen_dynamic_url",
+            "index:src/autobit/urllib_adapter.py",
+            'from urllib.request import urlopen as fetch\ndef read(url):\n    return fetch(url)\n',
+        ),
+        (
+            "builtins_dunder_import_alias_dynamic_url",
+            "worktree:src/autobit/alerts/notifier.py",
+            'import builtins as harmless\nh = harmless.__import__("httpx")\ndef send(url):\n    h.post(url)\n',
+        ),
+        (
+            "requests_dynamic_url",
+            "index:src/autobit/requests_adapter.py",
+            'import requests as r\ndef send(url):\n    r.post(url)\n',
+        ),
+        (
+            "aiohttp_dynamic_url",
+            "worktree:src/autobit/aiohttp_adapter.py",
+            'import aiohttp as a\nasync def send(url):\n    await a.ClientSession().post(url)\n',
+        ),
+        (
+            "http_client_dynamic_host",
+            "index:src/autobit/http_client_adapter.py",
+            'import http.client as h\ndef connect(host):\n    h.HTTPSConnection(host)\n',
+        ),
+        (
+            "socket_dynamic_address",
+            "worktree:src/autobit/socket_adapter.py",
+            'import socket as s\ndef connect(address):\n    s.socket().connect(address)\n',
+        ),
+        (
+            "websocket_dynamic_url",
+            "index:src/autobit/websocket_adapter.py",
+            'import websocket as ws\ndef connect(url):\n    ws.create_connection(url)\n',
+        ),
+        (
+            "websockets_dynamic_url",
+            "worktree:src/autobit/websockets_adapter.py",
+            'import websockets as ws\nasync def connect(url):\n    await ws.connect(url)\n',
+        ),
+        (
             "request_then_send",
             "worktree:src/autobit/request_alias.py",
             'import httpx as h\nclient = h.Client()\nURL = "https://" "api.upbit.com" "/v1/" "orders"\nrequest = h.Request("POST", URL)\nclient.send(request)\n',
@@ -928,12 +1158,16 @@ def test_scanner_rejects_private_constant_and_dynamic_bypasses(
     ("label", "source"),
     [
         (
-            "index:src/autobit/public_control.py",
-            'import httpx as h\nURL = "https://api.upbit.com/v1/candles/minutes/240"\nh.get(URL)\n',
+            "index:src/autobit/data/upbit_public.py",
+            'import httpx\nURL = "https://api.upbit.com/v1/candles/minutes/240"\nclass Adapter:\n    def __init__(self, client: httpx.Client):\n        self._client = client\n    def send(self):\n        request = httpx.Request("GET", URL)\n        return self._client.send(request, auth=None, follow_redirects=False)\n',
         ),
         (
-            "worktree:src/autobit/telegram_control.py",
-            'import httpx as h\ndef send(token):\n    h.post(f"https://api.telegram.org/bot{token}/sendMessage")\n',
+            "worktree:src/autobit/alerts/notifier.py",
+            'import httpx\nclass Adapter:\n    def __init__(self, client: httpx.Client):\n        self._client = client\n    def send(self, token):\n        return self._client.post(f"https://api.telegram.org/bot{token}/sendMessage", auth=None)\n',
+        ),
+        (
+            "index:src/autobit/cli.py",
+            'import httpx\ndef build():\n    with httpx.Client() as client:\n        return client\n',
         ),
     ],
 )
