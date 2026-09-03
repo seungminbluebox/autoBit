@@ -205,6 +205,7 @@ class PaperService:
 
             created_ids: list[str] = []
             filled_ids: list[str] = []
+            initial_stop_created = False
             reconciliation = self._broker.reconcile()
             for order in reconciliation.active_orders:
                 eligible = order.eligible_open_utc
@@ -222,6 +223,14 @@ class PaperService:
                         filled_ids.append(fill.order_id)
 
             reconciliation = self._broker.reconcile()
+            if (
+                reconciliation.btc_quantity > 0.0
+                and not reconciliation.active_orders
+                and reconciliation.active_stop is None
+            ):
+                self._ensure_stop(bar_at, row, reconciliation, enriched)
+                initial_stop_created = True
+                reconciliation = self._broker.reconcile()
             if reconciliation.btc_quantity > 0.0 and not reconciliation.active_orders:
                 stop_fill = self._broker.process_intrabar_stop(
                     bar_at,
@@ -257,7 +266,7 @@ class PaperService:
                         reason=exit_reason,
                     )
                     created_ids.append(order.order_id)
-                else:
+                elif not initial_stop_created:
                     self._ensure_stop(bar_at, row, reconciliation, enriched)
             elif (
                 reconciliation.btc_quantity == 0.0

@@ -7,6 +7,7 @@ from autobit.paper.scheduler import (
     latest_completed_end,
     next_cycle_at,
 )
+from autobit.paper.service import CycleResult, CycleStatus
 
 
 UTC = timezone.utc
@@ -83,22 +84,6 @@ def test_latest_completed_end_never_selects_an_unmatured_candle(
     assert latest_completed_end(now) == expected
 
 
-class _JumpClock:
-    def __init__(self, values: list[datetime]) -> None:
-        self._values = iter(values)
-
-    def now(self) -> datetime:
-        return next(self._values)
-
-
-class _RecordingSleeper:
-    def __init__(self) -> None:
-        self.delays: list[float] = []
-
-    def sleep(self, seconds: float) -> None:
-        self.delays.append(seconds)
-
-
 class _RecordingService:
     def __init__(self) -> None:
         self.ends: list[datetime] = []
@@ -108,66 +93,167 @@ class _RecordingService:
         return end_utc.isoformat()
 
 
-def test_run_once_catches_up_each_matured_end_after_a_late_wake() -> None:
-    clock = _JumpClock(
-        [
-            datetime(2026, 1, 1, 5, 23, tzinfo=UTC),
-            datetime(2026, 1, 1, 5, 23, tzinfo=UTC),
-            datetime(2026, 1, 1, 12, 15, tzinfo=UTC),
-        ]
-    )
-    sleeper = _RecordingSleeper()
-    service = _RecordingService()
+class _MutableClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
 
-    result = PaperScheduler(service, clock, sleeper).run_once()
+    def now(self) -> datetime:
+        return self.value
+
+
+class _AdvancingSleeper:
+    def __init__(self, clock: _MutableClock) -> None:
+        self._clock = clock
+        self.delays: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.delays.append(seconds)
+        self._clock.value += timedelta(seconds=seconds)
+
+
+class _QueuedWakeSleeper:
+    def __init__(self, clock: _MutableClock, wake_at: list[datetime]) -> None:
+        self._clock = clock
+        self._wake_at = iter(wake_at)
+        self.delays: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.delays.append(seconds)
+        self._clock.value = next(self._wake_at)
+
+
+class _StatusService:
+    def __init__(self, statuses: list[CycleStatus]) -> None:
+        self._statuses = iter(statuses)
+        self.ends: list[datetime] = []
+
+    def process_completed_candle(self, end_utc: datetime) -> CycleResult:
+        self.ends.append(end_utc)
+        return CycleResult(next(self._statuses), end_utc)
+
+
+def test_fresh_scheduler_processes_latest_matured_end_then_waits_for_the_next(
+) -> None:
+    clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
+    sleeper = _AdvancingSleeper(clock)
+    service = _RecordingService()
+    scheduler = PaperScheduler(service, clock, sleeper)
+
+    first = scheduler.run_once()
+    second = scheduler.run_once()
+
+    assert first == "2026-01-01T12:00:00+00:00"
+    assert second == "2026-01-01T16:00:00+00:00"
+    assert service.ends == [
+        datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 16, 0, tzinfo=UTC),
+    ]
+    assert sleeper.delays == [14_340.0, 14_400.0]
+
+
+def test_scheduler_retries_the_same_end_after_service_exception() -> None:
+    class FailOnceService(_RecordingService):
+        def process_completed_candle(self, end_utc: datetime) -> str:
+            self.ends.append(end_utc)
+            if len(self.ends) == 1:
+                raise RuntimeError("injected cycle failure")
+            return end_utc.isoformat()
+
+    clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
+    sleeper = _AdvancingSleeper(clock)
+    service = FailOnceService()
+    scheduler = PaperScheduler(service, clock, sleeper)
+
+    with pytest.raises(RuntimeError, match="injected cycle failure"):
+        scheduler.run_once()
+    result = scheduler.run_once()
+
+    assert result == "2026-01-01T08:00:00+00:00"
+    assert service.ends == [
+        datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
+    ]
+    assert sleeper.delays == []
+
+
+def test_scheduler_retries_lease_held_end_then_advances_after_completion() -> None:
+    clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
+    sleeper = _AdvancingSleeper(clock)
+    service = _StatusService(
+        [CycleStatus.LEASE_HELD, CycleStatus.ALREADY_PROCESSED, CycleStatus.PROCESSED]
+    )
+    scheduler = PaperScheduler(service, clock, sleeper)
+
+    first = scheduler.run_once()
+    second = scheduler.run_once()
+    third = scheduler.run_once()
+
+    assert first.status is CycleStatus.LEASE_HELD
+    assert second.status is CycleStatus.ALREADY_PROCESSED
+    assert third.status is CycleStatus.PROCESSED
+    assert service.ends == [
+        datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+    ]
+    assert sleeper.delays == [14_340.0]
+
+
+def test_run_once_catches_up_each_matured_end_after_a_late_wake() -> None:
+    clock = _MutableClock(datetime(2026, 1, 1, 5, 23, tzinfo=UTC))
+    sleeper = _QueuedWakeSleeper(
+        clock,
+        [datetime(2026, 1, 1, 12, 15, tzinfo=UTC)],
+    )
+    service = _RecordingService()
+    scheduler = PaperScheduler(service, clock, sleeper)
+
+    result = scheduler.run_once()
 
     assert sleeper.delays == [10_020.0]
     assert service.ends == [
+        datetime(2026, 1, 1, 4, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
     ]
     assert result == "2026-01-01T12:00:00+00:00"
 
 
-def test_two_scheduler_cycles_recompute_from_actual_clock_without_fixed_drift() -> None:
-    clock = _JumpClock(
-        [
-            datetime(2026, 1, 1, 5, 23, tzinfo=UTC),
-            datetime(2026, 1, 1, 5, 23, tzinfo=UTC),
-            datetime(2026, 1, 1, 8, 12, tzinfo=UTC),
-            datetime(2026, 1, 1, 9, 0, tzinfo=UTC),
-            datetime(2026, 1, 1, 9, 0, tzinfo=UTC),
-            datetime(2026, 1, 1, 12, 10, tzinfo=UTC),
-        ]
-    )
-    sleeper = _RecordingSleeper()
+def test_scheduler_cycles_recompute_from_actual_clock_without_fixed_drift() -> None:
+    clock = _MutableClock(datetime(2026, 1, 1, 5, 23, tzinfo=UTC))
+    sleeper = _AdvancingSleeper(clock)
     service = _RecordingService()
     scheduler = PaperScheduler(service, clock, sleeper)
 
     scheduler.run_once()
+    clock.value = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
     scheduler.run_once()
 
     assert sleeper.delays == [10_020.0, 11_400.0]
     assert service.ends == [
+        datetime(2026, 1, 1, 4, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
     ]
 
 
 def test_spurious_early_wake_recomputes_and_sleeps_the_remaining_time() -> None:
-    clock = _JumpClock(
+    clock = _MutableClock(datetime(2026, 1, 1, 5, 23, tzinfo=UTC))
+    sleeper = _QueuedWakeSleeper(
+        clock,
         [
-            datetime(2026, 1, 1, 5, 23, tzinfo=UTC),
-            datetime(2026, 1, 1, 5, 23, tzinfo=UTC),
-            datetime(2026, 1, 1, 8, 5, tzinfo=UTC),
             datetime(2026, 1, 1, 8, 5, tzinfo=UTC),
             datetime(2026, 1, 1, 8, 10, tzinfo=UTC),
-        ]
+        ],
     )
-    sleeper = _RecordingSleeper()
     service = _RecordingService()
+    scheduler = PaperScheduler(service, clock, sleeper)
 
-    PaperScheduler(service, clock, sleeper).run_once()
+    scheduler.run_once()
 
     assert sleeper.delays == [10_020.0, 300.0]
-    assert service.ends == [datetime(2026, 1, 1, 8, 0, tzinfo=UTC)]
+    assert service.ends == [
+        datetime(2026, 1, 1, 4, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
+    ]

@@ -10,6 +10,7 @@ import pytest
 from autobit.config import CostConfig, StrategyConfig
 from autobit.domain.models import PositionState
 from autobit.execution.paper_broker import PaperBroker
+from autobit.paper.scheduler import PaperScheduler
 from autobit.paper.service import CycleStatus, PaperService
 from autobit.persistence.sqlite_store import SQLiteStore
 
@@ -54,6 +55,16 @@ class _BlockingSource(_Source):
         self._entered.set()
         assert self._release.wait(timeout=5)
         return super().load_completed_candles(end_utc)
+
+
+class _ClockAdvancingSleeper:
+    def __init__(self, clock: _MutableClock) -> None:
+        self._clock = clock
+        self.delays: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.delays.append(seconds)
+        self._clock.value += timedelta(seconds=seconds)
 
 
 def _history(end_utc: datetime, bars: int = 601) -> pd.DataFrame:
@@ -763,4 +774,119 @@ def test_corrupt_risk_bookkeeping_fails_closed_without_completion_and_releases_l
         "other-token",
         now,
         now + timedelta(minutes=5),
+    )
+
+
+def test_restarted_scheduler_does_not_skip_a_pending_orders_eligible_open(
+    tmp_path: Path,
+) -> None:
+    class RangeSource:
+        def __init__(self) -> None:
+            self.calls: list[datetime] = []
+
+        def load_completed_candles(self, end_utc: datetime) -> pd.DataFrame:
+            self.calls.append(end_utc)
+            return _history(end_utc, bars=602)
+
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    bar_at = END - timedelta(hours=4)
+    pending = broker.submit_entry(bar_at - timedelta(hours=4), quantity=0.2)
+    store.close()
+
+    reopened_store = SQLiteStore(path)
+    reopened_store.initialize()
+    reopened_broker = PaperBroker(reopened_store, CostConfig(0.0, 0.0))
+    clock = _MutableClock(END + timedelta(minutes=11))
+    source = RangeSource()
+    service = PaperService(
+        source=source,
+        store=reopened_store,
+        broker=reopened_broker,
+        clock=clock,
+        lease_owner="restarted-worker",
+        lease_token="restarted-token",
+        costs=CostConfig(0.0, 0.0),
+    )
+    sleeper = _ClockAdvancingSleeper(clock)
+
+    result = PaperScheduler(service, clock, sleeper).run_once()
+
+    reconciliation = reopened_broker.reconcile()
+    assert result.status is CycleStatus.PROCESSED
+    assert result.end_utc == END + timedelta(hours=4)
+    assert source.calls == [END, END + timedelta(hours=4)]
+    assert sleeper.delays == [14_340.0]
+    assert len(reconciliation.fills) == 1
+    assert reconciliation.fills[0].order_id == pending.order_id
+    assert reconciliation.fills[0].fill_time == bar_at
+    assert reconciliation.active_stop is not None
+
+
+def test_entry_fill_is_protected_before_corrupt_risk_state_can_abort_cycle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    frame = _history(END)
+    frame.iloc[-1, frame.columns.get_loc("low")] = 90.0
+    source = _Source(frame)
+    store = SQLiteStore(path)
+    store.initialize()
+    store.append_event(
+        "bad-risk",
+        "BREAKER_STATE",
+        END - timedelta(hours=8),
+        {"version": True},
+    )
+    broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    bar_at = END - timedelta(hours=4)
+    pending = broker.submit_entry(bar_at - timedelta(hours=4), quantity=0.2)
+    _, service = _service(path, source, store=store, broker=broker)
+
+    with pytest.raises(Exception, match="breaker state"):
+        service.process_completed_candle(END)
+
+    after_failure = broker.reconcile()
+    assert after_failure.position_state is PositionState.LONG
+    assert len(after_failure.fills) == 1
+    assert after_failure.fills[0].order_id == pending.order_id
+    assert after_failure.active_stop is not None
+    assert after_failure.active_stop.stop_price == pytest.approx(95.0)
+    assert after_failure.active_stop.active_after_utc == END
+    assert not any(
+        event.event_type == "PAPER_CYCLE"
+        for event in store.replay_state().event_evidence
+    )
+    first_stop = after_failure.active_stop
+    store.close()
+
+    reopened_store = SQLiteStore(path)
+    reopened_store.initialize()
+    reopened_broker = PaperBroker(reopened_store, CostConfig(0.0, 0.0))
+    _, retry = _service(
+        path,
+        source,
+        store=reopened_store,
+        broker=reopened_broker,
+        owner="retry-worker",
+        token="retry-token",
+    )
+
+    with pytest.raises(Exception, match="breaker state"):
+        retry.process_completed_candle(END)
+
+    after_retry = reopened_broker.reconcile()
+    stop_sets = [
+        event
+        for event in reopened_store.replay_state().event_evidence
+        if event.event_type == "PAPER_STOP" and event.payload.get("action") == "SET"
+    ]
+    assert len(after_retry.fills) == 1
+    assert after_retry.active_stop == first_stop
+    assert len(stop_sets) == 1
+    assert not any(
+        event.event_type == "PAPER_CYCLE"
+        for event in reopened_store.replay_state().event_evidence
     )
