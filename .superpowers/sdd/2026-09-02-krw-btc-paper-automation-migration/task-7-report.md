@@ -74,3 +74,59 @@ The runbook contains parser-matching PowerShell commands for start, status, Ctrl
 ## Commit
 
 Implementation commit: `7ab96cddfc060119727ada183375181a6b97f7fb` (`test: verify automated paper recovery end to end`).
+
+## Fix round 1: reviewer findings I1–I4
+
+### RED/GREEN sizing evidence
+
+RED command:
+
+```powershell
+& '.\.venv\Scripts\python.exe' -m pytest tests/integration/test_paper_acceptance.py -v -p no:cacheprovider --basetemp .task7-fix-red.tmp
+```
+
+Result: expected causal failure — the captured real `PaperService.calculate_size` call supplied `risk_rate=0.02`, not the required reduced value. This proved that the old entry occurred before recovery.
+
+The scenario now has no pre-outage entry. It closes and reopens the same ledger, records exactly three failed public requests, obtains three valid public responses, processes its single high-volatility breakout entry while health is `REDUCED`, fills it on the next completed candle, and triggers one later hard stop. The real service sizing capture asserts `risk_rate=0.005`, `exposure_cap=0.175`, and an ATR ratio greater than 2.0. The submitted and filled BUY quantities must equal the direct production sizer result built from those captured arguments; they must also be smaller than normal-health risk at the same high ATR and reduced-health risk at baseline ATR.
+
+The permanent adversarial test replaces `autobit.paper.service.calculate_size` with a risk/ATR-agnostic constant `SizeDecision(0.5, ...)` and requires the causal sizing assertions to fail. It would fail closed if the scenario stopped routing the health-adjusted/volatility inputs to the actual service sizer. The harness also now compares the first closed ledger snapshot before restart and closes the final live store before independently reopening it for replay equality.
+
+GREEN command:
+
+```powershell
+& '.\.venv\Scripts\python.exe' -m pytest tests/integration/test_paper_acceptance.py -v -p no:cacheprovider --basetemp .task7-fix-green.tmp
+```
+
+Result: `2 passed in 12.46s`.
+
+### Runbook corrections
+
+- API-outage text now says stop evidence remains durable but candle-dependent stop evaluation/filling waits for a valid completed public candle; `HALTED` then blocks entries without blocking protective processing.
+- Recovery now requires every health reason to clear, expressly including a valid fill reconciliation within the configured 5% deviation, and directs operators to `breaker_health_reasons` and `health_recovery_progress`.
+- Backup/restore treats only the main SQLite DB plus optional WAL as durable. Restore verification creates a new GUID-named directory, fails if it exists or is nonempty, restores only the selected DB/WAL pair, and runs `paper-status` on that candidate.
+
+### Regression evidence
+
+```powershell
+& '.\.venv\Scripts\python.exe' -m pytest tests/integration/test_paper_acceptance.py tests/integration/test_paper_auto_recovery.py tests/integration/test_paper_cli.py tests/integration/test_paper_service.py tests/safety/test_no_live_surface.py -v -p no:cacheprovider --basetemp .task7-fix-focused.tmp
+```
+
+Result: `186 passed in 39.65s`.
+
+Final compile/CLI/safety/diff commands and the separate fix-commit hash are recorded after the final verification.
+
+Final verification commands:
+
+```powershell
+& '.\.venv\Scripts\python.exe' -m compileall -q src tests
+& '.\.venv\Scripts\python.exe' -m autobit.cli --help
+& '.\.venv\Scripts\python.exe' -m autobit.cli paper-once --db reports/paper-smoke.sqlite3 --data-dir data/processed
+& '.\.venv\Scripts\python.exe' -m autobit.cli paper-status --db reports/paper-smoke.sqlite3
+rg -n "buy_market_order|sell_market_order|UPBIT_ACCESS_KEY|UPBIT_SECRET_KEY|create_upbit" -g "*.py" .
+rg -n "FILL_DEVIATION|5%|breaker_health_reasons|health_recovery_progress|attempt-|shm" docs/paper-trading-runbook.md
+git diff --check
+```
+
+Exact outcomes: compilation 0; CLI help 0 with the same seven commands; safe smoke `paper-once` 2 (`SAFE_OPERATION_ERROR`) and readable `paper-status` 0; private-surface scan 1 with no matches; required runbook content scan 0; and `git diff --check` 0.
+
+Fix implementation commit: `27d031e33326710eadb9e2bcc80ac59bdd18eea9` (`test: prove reduced paper sizing in acceptance`).
