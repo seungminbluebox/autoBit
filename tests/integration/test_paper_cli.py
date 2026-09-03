@@ -19,7 +19,12 @@ from autobit.cli import (
 from autobit.config import CostConfig, DataConfig
 from autobit.execution.paper_broker import PaperBroker
 from autobit.paper.health import HealthMonitor, HealthStage
-from autobit.paper.service import CycleStatus
+from autobit.paper.service import (
+    CycleStatus,
+    PaperService,
+    _RiskState,
+    _risk_state_payload,
+)
 from autobit.persistence.sqlite_store import SQLiteStore
 
 
@@ -77,6 +82,13 @@ def _history(end: datetime, bars: int = 601) -> pd.DataFrame:
     )
 
 
+def _breakout_history(end: datetime) -> pd.DataFrame:
+    frame = _history(end)
+    frame.iloc[-1, frame.columns.get_loc("high")] = 111.0
+    frame.iloc[-1, frame.columns.get_loc("close")] = 110.0
+    return frame
+
+
 def _raw_row(at: datetime) -> dict[str, object]:
     return {
         "market": "KRW-BTC",
@@ -87,6 +99,43 @@ def _raw_row(at: datetime) -> dict[str, object]:
         "trade_price": 100.0,
         "candle_acc_trade_volume": 1.0,
     }
+
+
+def _append_cycle(
+    store: SQLiteStore,
+    end: datetime,
+    *,
+    status: str = "PROCESSED",
+) -> None:
+    end_text = end.isoformat().replace("+00:00", "Z")
+    store.append_event(
+        f"cycle:{end_text}",
+        "PAPER_CYCLE",
+        end,
+        {
+            "created_order_ids": [],
+            "end_utc": end_text,
+            "filled_order_ids": [],
+            "reason_codes": [],
+            "status": status,
+        },
+    )
+
+
+def _process_cycle(
+    store: SQLiteStore,
+    frame: pd.DataFrame,
+    end: datetime = END,
+) -> None:
+    PaperService(
+        source=_FrameSource([frame]),
+        store=store,
+        broker=PaperBroker(store, CostConfig(0.0, 0.0)),
+        clock=_Clock(end + timedelta(minutes=10)),
+        lease_owner="status-worker",
+        lease_token=f"status-token-{end.isoformat()}",
+        costs=CostConfig(0.0, 0.0),
+    ).process_completed_candle(end)
 
 
 class _PublicClient:
@@ -175,6 +224,9 @@ def test_paper_status_is_byte_and_metadata_read_only_with_stable_json(
     assert payload["mode"] == "normalized-paper"
     assert payload["normalized_cash"] == 100.0
     assert payload["normalized_equity"] == 100.0
+    assert payload["equity_as_of_utc"] is None
+    assert payload["equity_status"] == "UNAVAILABLE"
+    assert payload["equity_provenance"] == "INITIAL_EQUITY"
     assert payload["btc_quantity"] == 0.0
     assert payload["position_state"] == "FLAT"
     assert payload["health_stage"] == "NORMAL"
@@ -185,6 +237,125 @@ def test_paper_status_is_byte_and_metadata_read_only_with_stable_json(
     assert path.stat().st_size == before_stat.st_size
     assert path.stat().st_mtime_ns == before_stat.st_mtime_ns
     assert tuple(sorted(item.name for item in tmp_path.iterdir())) == before_files
+
+
+def test_paper_status_reports_flat_completed_close_mtm_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: END + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    _process_cycle(store, _history(END))
+
+    before = _ledger_file_image(path)
+    assert main(["paper-status", "--db", str(path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["normalized_equity"] == 100.0
+    assert payload["equity_as_of_utc"] == END.isoformat().replace("+00:00", "Z")
+    assert payload["equity_status"] == "CURRENT"
+    assert payload["equity_provenance"] == "COMPLETED_CLOSE_MTM"
+    assert _ledger_file_image(path) == before
+
+
+def test_paper_status_uses_active_wal_completed_close_mtm_after_no_fill_price_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: END + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    order = broker.submit_entry(
+        END - timedelta(hours=12),
+        quantity=0.2,
+        reason="ENTRY_BREAKOUT",
+    )
+    broker.process_open(order.order_id, END - timedelta(hours=8), open_price=100.0)
+    frame = _history(END)
+    frame.iloc[-1, frame.columns.get_loc("open")] = 75.0
+    frame.iloc[-1, frame.columns.get_loc("high")] = 76.0
+    frame.iloc[-1, frame.columns.get_loc("low")] = 69.0
+    frame.iloc[-1, frame.columns.get_loc("close")] = 70.0
+    _process_cycle(store, frame)
+    assert broker.reconcile().equity == 100.0
+
+    before = _ledger_file_image(path)
+    assert main(["paper-status", "--db", str(path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["normalized_cash"] == 80.0
+    assert payload["btc_quantity"] == 0.2
+    assert payload["normalized_equity"] == 94.0
+    assert payload["equity_as_of_utc"] == END.isoformat().replace("+00:00", "Z")
+    assert payload["equity_status"] == "CURRENT"
+    assert payload["equity_provenance"] == "COMPLETED_CLOSE_MTM"
+    assert _ledger_file_image(path) == before
+
+
+def test_paper_status_labels_latest_cycle_without_mark_as_stale_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: END + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    _append_cycle(store, END)
+    store.close()
+    before = _ledger_file_image(path)
+
+    assert main(["paper-status", "--db", str(path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["normalized_equity"] == 100.0
+    assert payload["equity_as_of_utc"] is None
+    assert payload["equity_status"] == "STALE"
+    assert payload["equity_provenance"] == "INITIAL_EQUITY"
+    assert _ledger_file_image(path) == before
+
+
+def test_paper_status_rejects_completed_close_risk_that_contradicts_flat_broker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: END + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    bar_at = END - timedelta(hours=4)
+    forged = _RiskState(
+        equity_peak=100.0,
+        daily_date=bar_at.date(),
+        daily_baseline_equity=100.0,
+        equity_history=((bar_at, 99.0),),
+        risk_started_at=bar_at,
+        last_equity=99.0,
+        last_risk_at=bar_at,
+    )
+    store.append_event(
+        f"risk:{bar_at.isoformat().replace('+00:00', 'Z')}",
+        "BREAKER_STATE",
+        bar_at,
+        _risk_state_payload(forged),
+    )
+    _append_cycle(store, END)
+    store.close()
+    before = _ledger_file_image(path)
+
+    assert main(["paper-status", "--db", str(path)]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "paper-status failed: INVALID_OR_MISSING_LEDGER\n"
+    assert _ledger_file_image(path) == before
 
 
 def test_paper_status_corrupt_db_is_nonzero_and_byte_unchanged(
@@ -287,6 +458,10 @@ def test_paper_status_reports_live_wal_pending_long_stop_and_recovery_stages(
     assert halted["btc_quantity"] == 0.2
     assert halted["active_stop"]["stop_price"] == stop.stop_price
     assert halted["health_stage"] == "HALTED"
+    assert halted["normalized_equity"] == 100.0
+    assert halted["equity_as_of_utc"] == END.isoformat().replace("+00:00", "Z")
+    assert halted["equity_status"] == "STALE"
+    assert halted["equity_provenance"] == "LAST_FILL_BROKER_EQUITY"
     assert halted["health_recovery_progress"]["successes_observed"] == 0
     assert _ledger_file_image(path) == before_halted
 
@@ -545,6 +720,149 @@ def test_application_persists_three_failures_three_successes_and_auto_promotes(
     ]
     assert [event.occurred_at_utc for event in cycles] == [END, next_end]
     assert PaperBroker(store, CostConfig(0.0, 0.0)).reconcile().active_orders == ()
+
+
+def test_first_api_failure_survives_rollover_and_restart_before_newer_cycle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    attempted_end = END + timedelta(hours=4)
+    newer_end = attempted_end + timedelta(hours=4)
+    first_store = SQLiteStore(path)
+    first_store.initialize()
+    first_clock = _Clock(attempted_end + timedelta(minutes=10))
+    first_source = _FrameSource([RuntimeError("first-cycle outage")])
+    first = _PaperApplication(
+        source=first_source,
+        store=first_store,
+        clock=first_clock,
+        sleeper=_Sleeper(first_clock),
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="first-attempt-worker",
+        lease_token="first-attempt-token",
+    )
+
+    with pytest.raises(RuntimeError, match="first-cycle outage"):
+        first.run_once()
+
+    attempts_after_failure = tuple(
+        event
+        for event in first_store.replay_state().event_evidence
+        if event.event_type == "PAPER_CYCLE_ATTEMPT"
+    )
+    assert len(attempts_after_failure) == 1
+    assert attempts_after_failure[0].payload == {
+        "end_utc": attempted_end.isoformat().replace("+00:00", "Z"),
+        "version": 1,
+    }
+    assert first_source.calls == [attempted_end]
+    first_store.close()
+
+    reopened = SQLiteStore(path)
+    reopened.initialize()
+    restart_clock = _Clock(newer_end + timedelta(minutes=10))
+    restart_source = _FrameSource(
+        [_breakout_history(attempted_end), _history(newer_end)]
+    )
+    restarted = _PaperApplication(
+        source=restart_source,
+        store=reopened,
+        clock=restart_clock,
+        sleeper=_Sleeper(restart_clock),
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="restart-attempt-worker",
+        lease_token="restart-attempt-token",
+    )
+
+    first_result = restarted.run_once()
+    second_result = restarted.run_once()
+
+    snapshot = reopened.replay_state()
+    reconciliation = PaperBroker(reopened, CostConfig(0.0, 0.0)).reconcile()
+    assert [first_result.end_utc, second_result.end_utc] == [attempted_end, newer_end]
+    assert restart_source.calls == [attempted_end, newer_end]
+    assert [
+        event.occurred_at_utc
+        for event in snapshot.event_evidence
+        if event.event_type == "PAPER_CYCLE"
+    ] == [attempted_end, newer_end]
+    assert len(
+        [
+            event
+            for event in snapshot.event_evidence
+            if event.event_type == "PAPER_CYCLE_ATTEMPT"
+        ]
+    ) == 2
+    assert len(
+        [event for event in snapshot.event_evidence if event.event_type == "ORDER_CREATED"]
+    ) == 1
+    assert len(reconciliation.fills) == 1
+    assert reconciliation.fills[0].fill_time == attempted_end
+
+
+@pytest.mark.parametrize(
+    ("event_id", "event_type", "occurred_at", "payload"),
+    [
+        (
+            "paper-cycle-attempt:forged",
+            "PAPER_CYCLE_ATTEMPT",
+            END - timedelta(hours=4),
+            {"end_utc": END.isoformat().replace("+00:00", "Z"), "version": 1},
+        ),
+        (
+            f"paper-cycle-attempt:{END.isoformat().replace('+00:00', 'Z')}",
+            "PAPER_CYCLE_ATTEMPT",
+            END - timedelta(hours=4),
+            {"end_utc": END.isoformat(), "version": 1},
+        ),
+        (
+            f"paper-cycle-attempt:{(END + timedelta(hours=4)).isoformat().replace('+00:00', 'Z')}",
+            "PAPER_CYCLE_ATTEMPT",
+            END,
+            {
+                "end_utc": (END + timedelta(hours=4)).isoformat().replace("+00:00", "Z"),
+                "version": 1,
+            },
+        ),
+        (
+            f"paper-cycle-attempt:{END.isoformat().replace('+00:00', 'Z')}",
+            "UNKNOWN_EVIDENCE",
+            END - timedelta(hours=4),
+            {"end_utc": END.isoformat().replace("+00:00", "Z"), "version": 1},
+        ),
+    ],
+)
+def test_application_rejects_forged_malformed_or_future_attempt_before_source(
+    tmp_path: Path,
+    event_id: str,
+    event_type: str,
+    occurred_at: datetime,
+    payload: dict[str, object],
+) -> None:
+    store = SQLiteStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    store.append_event(event_id, event_type, occurred_at, payload)
+    before_sequence = store.replay_state().last_sequence
+    clock = _Clock(END + timedelta(minutes=10))
+    source = _FrameSource([_history(END)])
+    app = _PaperApplication(
+        source=source,
+        store=store,
+        clock=clock,
+        sleeper=_Sleeper(clock),
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="invalid-attempt-worker",
+        lease_token="invalid-attempt-token",
+    )
+
+    with pytest.raises(RuntimeError, match="attempt"):
+        app.run_once()
+
+    assert source.calls == []
+    assert store.replay_state().last_sequence == before_sequence
 
 
 def test_health_only_cursor_compatibility_does_not_accept_arbitrary_events(

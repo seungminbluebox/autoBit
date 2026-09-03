@@ -1,7 +1,7 @@
 """Offline, public-data-only research command line interface."""
 
 import argparse
-from dataclasses import asdict, fields
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 import hashlib
 from itertools import combinations
@@ -36,12 +36,19 @@ from autobit.paper.service import (
     CycleResult,
     CycleStatus,
     PaperService,
+    _ValidatedRiskChain,
     _completed_cycle_ends,
     _has_completed_cycle,
+    _validated_cycle_attempts,
     _validate_health_and_risk_chain,
     _validate_operational_alert_chain,
 )
-from autobit.persistence.sqlite_store import SQLiteStore, StoreError, StoredEvent
+from autobit.persistence.sqlite_store import (
+    PaperSnapshot,
+    SQLiteStore,
+    StoreError,
+    StoredEvent,
+)
 from autobit.reporting.reports import SCHEMA_VERSION, write_report_bundle
 from autobit.reporting.validation import (
     BenchmarkComparisonRow,
@@ -77,6 +84,14 @@ _TRIAL_IDS = tuple(trial.trial_id for trial in registered_trials())
 _COST_IDS = tuple(cost.cost_id for cost in registered_cost_scenarios())
 _PAPER_HISTORY_BARS = 601
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass(frozen=True, slots=True)
+class _StatusEquity:
+    value: float
+    as_of_utc: datetime | None
+    status: str
+    provenance: str
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -478,19 +493,6 @@ class _ObservedCandleSource:
             return
 
 
-class _OperationalPaperService:
-    def __init__(self, service: PaperService, source: _ObservedCandleSource) -> None:
-        self._service = service
-        self._source = source
-
-    def oldest_required_end(self, latest_matured: datetime) -> datetime:
-        return self._service.oldest_required_end(latest_matured)
-
-    def process_completed_candle(self, end_utc: datetime) -> CycleResult:
-        self._source.prepare(end_utc)
-        return self._service.process_completed_candle(end_utc)
-
-
 class _PaperApplication:
     """Production wiring around the proven one-candle service and scheduler."""
 
@@ -523,7 +525,7 @@ class _PaperApplication:
             lease_token=lease_token,
             costs=costs,
         )
-        self._service = _OperationalPaperService(service, self._source)
+        self._service = service
 
     def run_once(self) -> CycleResult:
         self._retry_delay_applied = False
@@ -576,10 +578,9 @@ class _PaperApplication:
         return self._retry_delay_applied
 
     def _preflight(self) -> None:
-        snapshot = self._store.replay_state()
-        _validate_health_and_risk_chain(snapshot)
-        _validate_operational_alert_chain(snapshot.event_evidence)
-        self._broker.reconcile()
+        self._service.oldest_required_end(
+            latest_completed_end(_clock_now(self._clock))
+        )
 
     def _sleep_failsafe_retry(self) -> None:
         try:
@@ -732,6 +733,67 @@ def _run_paper_run(arguments: argparse.Namespace) -> int:
             store.close()
 
 
+def _status_equity(
+    snapshot: PaperSnapshot,
+    chain: _ValidatedRiskChain,
+    reconciliation: PaperReconciliation,
+    completed: frozenset[datetime],
+) -> _StatusEquity:
+    if reconciliation.fills:
+        fallback = _StatusEquity(
+            value=reconciliation.equity,
+            as_of_utc=max(fill.fill_time for fill in reconciliation.fills),
+            status="STALE",
+            provenance="LAST_FILL_BROKER_EQUITY",
+        )
+    else:
+        fallback = _StatusEquity(
+            value=reconciliation.equity,
+            as_of_utc=None,
+            status=("STALE" if snapshot.event_evidence else "UNAVAILABLE"),
+            provenance="INITIAL_EQUITY",
+        )
+    if not completed:
+        return fallback
+
+    latest_end = max(completed)
+    matches = tuple(
+        event
+        for event in snapshot.event_evidence
+        if event.event_type == "PAPER_CYCLE"
+        and event.occurred_at_utc == latest_end
+    )
+    if len(matches) != 1:
+        raise StoreError("latest completed cycle evidence is ambiguous")
+    cycle = matches[0]
+    expected_risk_at = latest_end - timedelta(hours=4)
+    risk = chain.latest_base
+    risk_event = chain.latest_base_event
+    if risk.last_risk_at != expected_risk_at or risk_event is None:
+        return fallback
+    if cycle.payload["status"] != CycleStatus.PROCESSED.value:
+        raise StoreError("unsafe cycle contradicts a completed-close risk mark")
+    if risk_event.sequence >= cycle.sequence:
+        raise StoreError("completed-close risk mark is not prior to its terminal cycle")
+
+    equity = chain.projection.last_equity
+    cash = reconciliation.cash
+    quantity = reconciliation.btc_quantity
+    if quantity == 0.0:
+        if not math.isclose(equity, cash, rel_tol=0.0, abs_tol=1e-12):
+            raise StoreError("completed-close equity contradicts flat broker cash")
+    else:
+        implied_mark = (equity - cash) / quantity
+        if not math.isfinite(implied_mark) or implied_mark <= 0.0:
+            raise StoreError("completed-close equity contradicts broker inventory")
+    return _StatusEquity(
+        value=equity,
+        as_of_utc=latest_end,
+        status="CURRENT",
+        provenance="COMPLETED_CLOSE_MTM",
+    )
+
+
 def _run_paper_status(arguments: argparse.Namespace) -> int:
     store: SQLiteStore | None = None
     try:
@@ -749,6 +811,12 @@ def _run_paper_status(arguments: argparse.Namespace) -> int:
             reconciliation,
             latest_completed_end(now),
         )
+        _validated_cycle_attempts(
+            snapshot,
+            completed,
+            latest_completed_end(now),
+        )
+        equity = _status_equity(snapshot, chain, reconciliation, completed)
         stop = reconciliation.active_stop
         combined = tuple(
             dict.fromkeys((*chain.projection.decision.reasons, *health.reasons))
@@ -765,6 +833,13 @@ def _run_paper_status(arguments: argparse.Namespace) -> int:
             ),
             "breaker_health_reasons": list(combined),
             "btc_quantity": reconciliation.btc_quantity,
+            "equity_as_of_utc": (
+                _format_utc(equity.as_of_utc)
+                if equity.as_of_utc is not None
+                else None
+            ),
+            "equity_provenance": equity.provenance,
+            "equity_status": equity.status,
             "health_recovery_progress": {
                 "remaining_gates": list(health.progress.remaining_gates),
                 "successes_observed": health.progress.successes_observed,
@@ -778,7 +853,7 @@ def _run_paper_status(arguments: argparse.Namespace) -> int:
             "mode": "normalized-paper",
             "next_scheduled_utc": _format_utc(next_cycle_at(now)),
             "normalized_cash": reconciliation.cash,
-            "normalized_equity": reconciliation.equity,
+            "normalized_equity": equity.value,
             "pending_orders": [order.order_id for order in reconciliation.active_orders],
             "position_state": reconciliation.position_state.value,
         }

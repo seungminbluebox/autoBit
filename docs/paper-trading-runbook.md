@@ -93,9 +93,9 @@ Get-ChildItem -LiteralPath $verifyDir | Get-FileHash -Algorithm SHA256
 
 ## 공개 API 장애와 오래된 캔들
 
-- 공개 캔들 요청이 세 번 연속 실패하면 health stage가 `HALTED`가 된다. 실패한 요청 동안 기존 stop evidence는 SQLite에 그대로 보존되고 안전한 재시도는 계속하지만, 유효한 확정 공개 캔들이 없으므로 캔들 의존적인 보호 stop 평가는 지연되며 체결될 수 없다. 유효한 완결봉을 다시 읽은 뒤에는 `HALTED`가 신규 진입만 막고, 기존 포지션의 보호 처리·stop 평가는 계속한다. `paper-run`은 제한된 지수 백오프로 재시도한다.
+- 공개 캔들 요청이 세 번 연속 실패하면 health stage가 `HALTED`가 된다. 요청 대상 4시간봉은 public API 접근 전에 SQLite attempt evidence로 남으므로 재시작이나 다음 4시간 경계 이후에도 더 오래된 미완료 대상을 먼저 재시도한다. 실패한 요청 동안 기존 stop evidence는 SQLite에 그대로 보존되고 안전한 재시도는 계속하지만, 유효한 확정 공개 캔들이 없으므로 캔들 의존적인 보호 stop 평가는 지연되며 체결될 수 없다. 유효한 완결봉을 다시 읽은 뒤에는 `HALTED`가 신규 진입만 막고, 기존 포지션의 보호 처리·stop 평가는 계속한다. `paper-run`은 제한된 지수 백오프로 재시도한다.
 - 종료된 4시간봉이 종료 뒤 10분이 지나도 없으면 `STALE_CANDLE`로 처리한다. 새 진입은 하지 않으며, 최신 완결봉이 확인될 때까지 임의의 진행봉을 사용하지 않는다.
-- `paper-status`의 `health_stage`, `breaker_health_reasons`, `health_recovery_progress`, `pending_orders`, `active_stop`를 기록한다. API 장애나 stale candle 동안 상태 파일을 수동 수정하거나 수동 재개 명령을 시도하지 않는다.
+- `paper-status`의 `health_stage`, `breaker_health_reasons`, `health_recovery_progress`, `pending_orders`, `active_stop`, `equity_status`, `equity_provenance`, `equity_as_of_utc`를 기록한다. `CURRENT`/`COMPLETED_CLOSE_MTM`이 아닌 equity는 마지막 체결가 또는 초기 100 fallback이며 최신 시장가가 아니다. API 장애나 stale candle 동안 상태 파일을 수동 수정하거나 수동 재개 명령을 시도하지 않는다.
 
 자동 복구에는 정상 공개 API 응답 3회, 미확인 주문 0건, 원장 잔고 대조 일치, 유효한 최신 완결봉·스키마·타임스탬프, 그리고 configured 5% 이내의 유효한 fill reconciliation이 필요하다. 즉 **모든** health reason이 해소되어야 하며 `FILL_DEVIATION`이 남아 있으면 앞 조건이 충족되어도 복구하지 않는다. 운영자는 `paper-status`의 `breaker_health_reasons`와 `health_recovery_progress`에서 남은 gate와 성공 횟수를 확인한다. 모두 충족되면 사람의 resume gate 없이 `HALTED`에서 `REDUCED`로 간다. 축소 상태의 정상 복구 사이클이 완료되고 다른 health 이유가 없으면 자동으로 `NORMAL`로 승격된다. 축소 상태에서는 정상 크기보다 작은 risk/exposure가 적용되며, ATR 비율이 높으면 position sizer도 수량을 추가로 줄인다.
 

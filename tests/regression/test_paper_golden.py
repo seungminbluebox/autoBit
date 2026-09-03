@@ -21,12 +21,20 @@ def _timestamp(value: object) -> str:
     return pd.Timestamp(value).isoformat().replace("+00:00", "Z")
 
 
-def _paper_golden(path: Path) -> tuple[object, ...]:
+def _paper_golden(
+    path: Path,
+    *,
+    entry_candle_breach: bool = False,
+) -> tuple[object, ...]:
     frame = pd.read_csv(
         FIXTURES / "core_golden.csv",
         parse_dates=["timestamp"],
         index_col="timestamp",
     )
+    if entry_candle_breach:
+        fill_at = pd.Timestamp("2025-01-05T04:00:00Z")
+        frame.loc[fill_at, "low"] = 99.0
+        frame = frame.loc[:fill_at].copy()
     costs = CostConfig(fee_rate=0.0, slippage_rate=0.0)
     config = StrategyConfig()
     store = SQLiteStore(path)
@@ -49,6 +57,7 @@ def _paper_golden(path: Path) -> tuple[object, ...]:
                     broker.set_stop(
                         candle_at,
                         fill.fill_price - config.initial_atr_mult * float(row["atr_14"]),
+                        active_after=candle_at,
                         reason="HARD_STOP",
                     )
 
@@ -131,3 +140,35 @@ def test_real_sqlite_candle_by_candle_paper_matches_core_golden(tmp_path: Path) 
     assert first[3] == pytest.approx(core.trades[0].exit_price)
     assert first[4] == core.trades[0].exit_reason
     assert first[5] == pytest.approx(core.final_equity)
+
+
+def test_real_sqlite_paper_matches_core_on_entry_candle_hard_stop(
+    tmp_path: Path,
+) -> None:
+    frame = pd.read_csv(
+        FIXTURES / "core_golden.csv",
+        parse_dates=["timestamp"],
+        index_col="timestamp",
+    )
+    fill_at = pd.Timestamp("2025-01-05T04:00:00Z")
+    frame.loc[fill_at, "low"] = 99.0
+    frame = frame.loc[:fill_at].copy()
+
+    core = run_backtest(
+        frame,
+        BacktestConfig(costs=CostConfig(fee_rate=0.0, slippage_rate=0.0)),
+    )
+    paper = _paper_golden(
+        tmp_path / "entry-candle-stop.sqlite3",
+        entry_candle_breach=True,
+    )
+
+    trade, = core.trades
+    assert paper[:2] == (
+        trade.entry_time.isoformat().replace("+00:00", "Z"),
+        trade.exit_time.isoformat().replace("+00:00", "Z"),
+    )
+    assert paper[2] == pytest.approx(trade.entry_price)
+    assert paper[3] == pytest.approx(trade.exit_price)
+    assert paper[4] == trade.exit_reason == "HARD_STOP"
+    assert paper[5] == pytest.approx(core.final_equity)

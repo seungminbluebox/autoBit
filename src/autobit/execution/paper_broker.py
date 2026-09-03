@@ -403,7 +403,7 @@ class PaperBroker:
         reason: str = "HARD_STOP",
         source_id: str | None = None,
     ) -> PaperStop:
-        """Persist a stop whose low-price trigger is effective after its source candle."""
+        """Persist an initial fill-boundary stop or a next-candle stop update."""
         observed_text, observed_time = _timestamp(observed_at)
         _require_boundary(observed_time, "stop observation")
         required_active = _next_boundary(observed_time)
@@ -412,8 +412,10 @@ class PaperBroker:
             active_text = _canonical_datetime(required_active)
         else:
             active_text, active_time = _timestamp(active_after)
-            if active_time != required_active:
-                raise ValueError("stop active time must be the next four-hour boundary")
+            if active_time not in {observed_time, required_active}:
+                raise ValueError(
+                    "stop active time must be the fill boundary or next four-hour boundary"
+                )
         price = _positive(stop_price, "stop price")
         normalized_reason = _reason(reason)
 
@@ -426,6 +428,21 @@ class PaperBroker:
             )
             if normalized_source != _open_entry_identity(ledger):
                 raise ValueError("stop source must be the currently open paper entry")
+            if active_time == observed_time:
+                source_fills = tuple(
+                    fill
+                    for fill in ledger.fills
+                    if fill.order_id == normalized_source and fill.side == "BUY"
+                )
+                if (
+                    normalized_reason != "HARD_STOP"
+                    or ledger.active_stop is not None
+                    or len(source_fills) != 1
+                    or source_fills[0].fill_time != observed_time
+                ):
+                    raise ValueError(
+                        "fill-boundary stop requires the current entry fill and initial hard stop"
+                    )
             identity_material = "|".join(
                 (_MARKET, normalized_source, observed_text, normalized_reason)
             )
@@ -1029,7 +1046,9 @@ class PaperBroker:
         if active_stop is not None and btc <= 0:
             raise PaperReconciliationError("active stop has no owned BTC")
 
-        paper_fills.sort(key=lambda item: (item.fill_time, item.fill_id))
+        paper_fills.sort(
+            key=lambda item: (item.fill_time, raw_fills[item.fill_id].sequence)
+        )
         trades = _completed_trades(tuple(paper_fills))
         if active_orders:
             derived_position = (
@@ -1061,6 +1080,23 @@ class PaperBroker:
                 orders,
             ) != stop.source_id:
                 raise PaperReconciliationError("paper stop source was not open when observed")
+            if stop.active_after_utc == stop.observed_at_utc:
+                source_fills = tuple(
+                    fill for fill in paper_fills if fill.order_id == stop.source_id
+                )
+                raw_source_fills = tuple(fills_by_order.get(stop.source_id, ()))
+                if (
+                    stop.reason != "HARD_STOP"
+                    or len(source_fills) != 1
+                    or source_fills[0].side != "BUY"
+                    or source_fills[0].fill_time != stop.observed_at_utc
+                    or len(raw_source_fills) != 1
+                    or fill_metadata[raw_source_fills[0].event_id].sequence
+                    >= stop_set_events[stop.stop_id].sequence
+                ):
+                    raise PaperReconciliationError(
+                        "fill-boundary stop lacks causal entry fill evidence"
+                    )
         triggered_orders: set[str] = set()
         for event in stop_terminals:
             identity = _payload_text(event.payload, "identity")
@@ -1215,8 +1251,8 @@ def _paper_order_from_evidence(
     else:
         if side != "SELL" or parent is None or not parent.startswith("paper-stop:"):
             raise PaperReconciliationError("stop order identity is invalid")
-        if eligible_time < _next_boundary(signal_time):
-            raise PaperReconciliationError("stop order fill is not after observation")
+        if eligible_time < signal_time:
+            raise PaperReconciliationError("stop order fill predates its observation")
         if creation.occurred_at_utc != eligible_time:
             raise PaperReconciliationError("stop order creation is not trigger time")
     expected_key, expected_order_id = _order_identity(
@@ -1257,7 +1293,9 @@ def _paper_order_from_evidence(
         raise PaperReconciliationError("paper order has more than one fill")
     raw_fill = raw_fill_events[0] if raw_fill_events else None
     if raw_fill is not None:
-        if raw_fill.occurred_at_utc <= signal_time:
+        if raw_fill.occurred_at_utc < signal_time or (
+            order_kind == "MARKET" and raw_fill.occurred_at_utc == signal_time
+        ):
             raise PaperReconciliationError("paper fill is not strictly after its signal")
         if raw_fill.occurred_at_utc != eligible_time:
             raise PaperReconciliationError("paper fill is outside its eligible open")
@@ -1584,8 +1622,10 @@ def _stop_from_event(event: StoredEvent) -> PaperStop:
     except ValueError as error:
         raise PaperReconciliationError(str(error)) from error
     _, active_after = _evidence_timestamp(_payload_text(payload, "active_after_utc"))
-    if active_after != _next_boundary(observed):
-        raise PaperReconciliationError("stop active time is not the next four-hour boundary")
+    if active_after not in {observed, _next_boundary(observed)}:
+        raise PaperReconciliationError(
+            "stop active time is neither the fill boundary nor next four-hour boundary"
+        )
     identity_material = "|".join(
         (_MARKET, source_id, _canonical_datetime(observed), reason)
     )

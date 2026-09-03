@@ -50,6 +50,28 @@ class _Source:
         return self.frame.copy()
 
 
+class _HalfEntryBroker(PaperBroker):
+    """Use the real broker lifecycle while injecting a half-sized BUY fill."""
+
+    def process_open(
+        self,
+        order_id: str,
+        candle_at: str | datetime,
+        *,
+        open_price: float,
+        actual_quantity: float | None = None,
+    ):
+        order = self.order(order_id)
+        if order.side == "BUY":
+            actual_quantity = order.remainder_quantity / 2.0
+        return super().process_open(
+            order_id,
+            candle_at,
+            open_price=open_price,
+            actual_quantity=actual_quantity,
+        )
+
+
 class _BlockingSource(_Source):
     def __init__(self, frame: pd.DataFrame, entered: Event, release: Event) -> None:
         super().__init__(frame)
@@ -518,7 +540,17 @@ def test_source_failure_releases_lease_and_does_not_mark_the_cycle_complete(
     with pytest.raises(RuntimeError, match="unavailable"):
         service.process_completed_candle(END)
 
-    assert store.replay_state().last_sequence == 0
+    snapshot = store.replay_state()
+    assert snapshot.last_sequence == 1
+    attempt, = snapshot.event_evidence
+    assert attempt.event_type == "PAPER_CYCLE_ATTEMPT"
+    assert attempt.payload == {
+        "end_utc": END.isoformat().replace("+00:00", "Z"),
+        "version": 1,
+    }
+    assert not any(
+        event.event_type == "PAPER_CYCLE" for event in snapshot.event_evidence
+    )
     competitor = SQLiteStore(path)
     competitor.initialize()
     now = END + timedelta(minutes=10)
@@ -713,7 +745,7 @@ def test_service_rechecks_completion_after_an_expired_lease_was_taken_over(
     assert len([event for event in events if event.event_type == "BREAKER_STATE"]) == 1
 
 
-def test_pending_entry_fills_only_at_current_open_and_gets_next_bar_protection(
+def test_pending_entry_fills_only_at_current_open_and_gets_fill_boundary_protection(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "paper.sqlite3"
@@ -736,31 +768,183 @@ def test_pending_entry_fills_only_at_current_open_and_gets_next_bar_protection(
     assert reconciliation.position_state is PositionState.LONG
     assert reconciliation.active_stop is not None
     assert reconciliation.active_stop.observed_at_utc == bar_at
-    assert reconciliation.active_stop.active_after_utc == END
+    assert reconciliation.active_stop.active_after_utc == bar_at
 
 
-def test_newly_persisted_stop_does_not_trigger_on_the_entry_fill_bar(tmp_path: Path) -> None:
+def test_fill_derived_initial_stop_protects_the_entry_bar_with_complete_cost_ledgers(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "paper.sqlite3"
     frame = _history(END)
-    frame.iloc[-1, frame.columns.get_loc("low")] = 90.0
+    frame.iloc[-1, frame.columns.get_loc("low")] = 94.0
     source = _Source(frame)
+    store = SQLiteStore(path)
+    store.initialize()
+    fee_rate = 0.0005
+    slippage_rate = 0.001
+    broker = PaperBroker(store, CostConfig(fee_rate, slippage_rate))
+    bar_at = END - timedelta(hours=4)
+    entry_order = broker.submit_entry(bar_at - timedelta(hours=4), quantity=0.2)
+    _, service = _service(path, source, store=store, broker=broker)
+
+    result = service.process_completed_candle(END)
+
+    reconciliation = broker.reconcile()
+    assert reconciliation.position_state is PositionState.FLAT
+    assert reconciliation.active_orders == ()
+    assert reconciliation.active_stop is None
+    entry_fill, stop_fill = reconciliation.fills
+    assert entry_fill.order_id == entry_order.order_id
+    assert entry_fill.fill_time == bar_at
+    assert entry_fill.reference_price == 100.0
+    assert entry_fill.fill_price == pytest.approx(100.1)
+    assert stop_fill.fill_time == bar_at
+    assert stop_fill.reason == "HARD_STOP"
+    assert stop_fill.reference_price == pytest.approx(entry_fill.fill_price - 2.5 * 2.0)
+    assert stop_fill.fill_price == pytest.approx(stop_fill.reference_price * (1.0 - slippage_rate))
+    assert stop_fill.quantity == pytest.approx(entry_fill.quantity)
+    assert result.filled_order_ids == (entry_fill.order_id, stop_fill.order_id)
+
+    entry_fee = entry_fill.quantity * entry_fill.fill_price * fee_rate
+    exit_fee = stop_fill.quantity * stop_fill.fill_price * fee_rate
+    expected_slippage = entry_fill.quantity * (entry_fill.fill_price - 100.0)
+    expected_slippage += stop_fill.quantity * (stop_fill.reference_price - stop_fill.fill_price)
+    assert entry_fill.fee == pytest.approx(entry_fee)
+    assert stop_fill.fee == pytest.approx(exit_fee)
+    assert reconciliation.total_fees == pytest.approx(entry_fee + exit_fee)
+    assert reconciliation.total_slippage == pytest.approx(expected_slippage)
+    assert reconciliation.equity == pytest.approx(
+        100.0
+        + stop_fill.quantity * (stop_fill.fill_price - entry_fill.fill_price)
+        - entry_fee
+        - exit_fee
+    )
+    trade, = reconciliation.completed_trades
+    assert trade.entry_time == bar_at
+    assert trade.exit_time == bar_at
+    assert trade.quantity == pytest.approx(entry_fill.quantity)
+    assert trade.exit_reason == "HARD_STOP"
+
+    evidence = store.replay_state().event_evidence
+
+    def lifecycle(order_id: str) -> list[str]:
+        return [
+            str(event.payload["status"])
+            for event in evidence
+            if event.event_type in {"ORDER_CREATED", "ORDER_STATUS"}
+            and event.payload.get("order_id") == order_id
+        ]
+
+    assert lifecycle(entry_fill.order_id) == ["CREATED", "SUBMITTED", "ACCEPTED", "COMPLETED"]
+    assert lifecycle(stop_fill.order_id) == ["CREATED", "SUBMITTED", "ACCEPTED", "COMPLETED"]
+
+
+def test_partial_entry_remainder_is_canceled_before_same_bar_initial_stop_exit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    frame = _history(END)
+    frame.iloc[-1, frame.columns.get_loc("low")] = 94.0
+    store = SQLiteStore(path)
+    store.initialize()
+    broker = _HalfEntryBroker(store, CostConfig(0.0, 0.0))
+    bar_at = END - timedelta(hours=4)
+    entry_order = broker.submit_entry(bar_at - timedelta(hours=4), quantity=0.4)
+    _, service = _service(path, _Source(frame), store=store, broker=broker)
+
+    first = service.process_completed_candle(END)
+    before_retry = store.replay_state()
+    second = service.process_completed_candle(END)
+
+    reconciliation = broker.reconcile()
+    assert first.status is CycleStatus.PROCESSED
+    assert second.status is CycleStatus.ALREADY_PROCESSED
+    assert store.replay_state() == before_retry
+    assert reconciliation.position_state is PositionState.FLAT
+    assert reconciliation.active_orders == ()
+    assert reconciliation.active_stop is None
+    entry_fill, stop_fill = reconciliation.fills
+    assert entry_fill.order_id == entry_order.order_id
+    assert entry_fill.quantity == pytest.approx(0.2)
+    assert broker.order(entry_order.order_id).status.value == "CANCELED"
+    assert broker.order(entry_order.order_id).remainder_quantity == pytest.approx(0.2)
+    assert stop_fill.quantity == pytest.approx(0.2)
+    assert stop_fill.fill_time == bar_at
+    assert first.filled_order_ids == (entry_fill.order_id, stop_fill.order_id)
+    trade, = reconciliation.completed_trades
+    assert trade.quantity == pytest.approx(0.2)
+    assert trade.exit_reason == "HARD_STOP"
+
+    lifecycle = [
+        str(event.payload["status"])
+        for event in store.replay_state().event_evidence
+        if event.event_type in {"ORDER_CREATED", "ORDER_STATUS"}
+        and event.payload.get("order_id") == entry_order.order_id
+    ]
+    assert lifecycle == ["CREATED", "SUBMITTED", "ACCEPTED", "PARTIAL", "CANCELED"]
+
+    store.close()
+    reopened_store = SQLiteStore(path)
+    reopened_store.initialize()
+    reopened = PaperBroker(reopened_store, CostConfig(0.0, 0.0)).reconcile()
+    assert reopened.position_state is PositionState.FLAT
+    assert reopened.active_orders == ()
+    assert len(reopened.fills) == 2
+
+
+def test_crash_between_entry_fill_and_initial_stop_rolls_back_the_fill(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    frame = _history(END)
+    frame.iloc[-1, frame.columns.get_loc("low")] = 94.0
     store = SQLiteStore(path)
     store.initialize()
     broker = PaperBroker(store, CostConfig(0.0, 0.0))
     bar_at = END - timedelta(hours=4)
-    broker.submit_entry(bar_at - timedelta(hours=4), quantity=0.2)
-    _, service = _service(path, source, store=store, broker=broker)
+    entry = broker.submit_entry(bar_at - timedelta(hours=4), quantity=0.2)
 
-    service.process_completed_candle(END)
+    def crash(boundary: str) -> None:
+        if boundary == "after_pending_open":
+            raise RuntimeError("crash before initial stop")
 
-    reconciliation = broker.reconcile()
-    assert reconciliation.position_state is PositionState.LONG
-    assert len(reconciliation.fills) == 1
-    assert reconciliation.active_stop is not None
-    assert reconciliation.active_stop.active_after_utc == END
+    _, crashing = _service(
+        path,
+        _Source(frame),
+        store=store,
+        broker=broker,
+        fault_hook=crash,
+    )
+
+    with pytest.raises(RuntimeError, match="before initial stop"):
+        crashing.process_completed_candle(END)
+
+    rolled_back = broker.reconcile()
+    assert rolled_back.fills == ()
+    assert rolled_back.active_stop is None
+    assert rolled_back.active_orders == (entry,)
+    store.close()
+
+    reopened_store = SQLiteStore(path)
+    reopened_store.initialize()
+    reopened_broker = PaperBroker(reopened_store, CostConfig(0.0, 0.0))
+    _, retry = _service(
+        path,
+        _Source(frame),
+        store=reopened_store,
+        broker=reopened_broker,
+        owner="retry-worker",
+        token="retry-token",
+    )
+
+    result = retry.process_completed_candle(END)
+
+    assert result.status is CycleStatus.PROCESSED
+    assert reopened_broker.reconcile().position_state is PositionState.FLAT
+    assert len(reopened_broker.reconcile().fills) == 2
 
 
-def test_gap_down_entry_persists_fill_price_based_stop_for_next_bar(
+def test_gap_down_entry_persists_fill_price_based_stop_from_the_fill_boundary(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "paper.sqlite3"
@@ -783,7 +967,7 @@ def test_gap_down_entry_persists_fill_price_based_stop_for_next_bar(
     assert reconciliation.active_stop is not None
     assert reconciliation.active_stop.stop_price == pytest.approx(85.0)
     assert reconciliation.active_stop.stop_price < reconciliation.fills[0].fill_price
-    assert reconciliation.active_stop.active_after_utc == END
+    assert reconciliation.active_stop.active_after_utc == bar_at
 
 
 def test_prior_stop_uses_current_gap_or_low_before_close_decisions(tmp_path: Path) -> None:
@@ -1151,6 +1335,68 @@ def test_restarted_scheduler_replays_clean_pending_open_and_contiguous_backlog(
         for event in reopened_store.replay_state().event_evidence
         if event.event_type == "PAPER_CYCLE"
     ] == [previous_end, END, END + timedelta(hours=4)]
+
+
+def test_crash_after_cycle_attempt_retries_original_target_without_source_access(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+
+    def crash_after_attempt(boundary: str) -> None:
+        if boundary == "after_cycle_attempt":
+            raise RuntimeError("injected post-attempt crash")
+
+    first_source = _Source(_history(END))
+    store, crashing = _service(
+        path,
+        first_source,
+        fault_hook=crash_after_attempt,
+    )
+
+    with pytest.raises(RuntimeError, match="post-attempt"):
+        crashing.process_completed_candle(END)
+
+    attempts = [
+        event
+        for event in store.replay_state().event_evidence
+        if event.event_type == "PAPER_CYCLE_ATTEMPT"
+    ]
+    assert len(attempts) == 1
+    assert first_source.calls == []
+    store.close()
+
+    reopened = SQLiteStore(path)
+    reopened.initialize()
+    broker = PaperBroker(reopened, CostConfig(0.0, 0.0))
+    clock = _MutableClock(END + timedelta(hours=4, minutes=10))
+    retry_source = _Source(_history(END))
+    retry = PaperService(
+        source=retry_source,
+        store=reopened,
+        broker=broker,
+        clock=clock,
+        lease_owner="post-attempt-restart",
+        lease_token="post-attempt-restart-token",
+        costs=CostConfig(0.0, 0.0),
+    )
+
+    result = PaperScheduler(retry, clock, _ClockAdvancingSleeper(clock)).run_once()
+
+    snapshot = reopened.replay_state()
+    assert result.end_utc == END
+    assert retry_source.calls == [END]
+    assert len(
+        [
+            event
+            for event in snapshot.event_evidence
+            if event.event_type == "PAPER_CYCLE_ATTEMPT"
+        ]
+    ) == 1
+    assert [
+        event.occurred_at_utc
+        for event in snapshot.event_evidence
+        if event.event_type == "PAPER_CYCLE"
+    ] == [END]
 
 
 def test_crash_after_acceptance_restarts_oldest_cycle_then_exact_open(

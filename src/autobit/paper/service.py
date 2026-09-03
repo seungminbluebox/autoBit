@@ -50,6 +50,7 @@ _FOUR_HOURS = timedelta(hours=4)
 _MATURITY_DELAY = timedelta(minutes=10)
 _DEFAULT_LEASE_TTL = timedelta(minutes=5)
 _RISK_STATE_VERSION = 1
+_CYCLE_ATTEMPT_VERSION = 1
 _UTC = timezone.utc
 _ALERT_SOURCE_TYPES = frozenset({"HEALTH_STATE", "PAPER_CYCLE"})
 
@@ -182,6 +183,7 @@ class PaperService:
             reconciliation,
             latest,
         )
+        attempted = _validated_cycle_attempts(snapshot, completed, latest)
 
         if not snapshot.event_evidence:
             return latest
@@ -190,6 +192,7 @@ class PaperService:
         obligations: set[datetime] = set()
         if completed:
             obligations.add(_first_uncompleted_after_cycle_chain(completed))
+        obligations.update(attempted - completed)
 
         risk_state = risk_chain.projection
         if risk_state.last_risk_at is not None:
@@ -260,7 +263,7 @@ class PaperService:
                 latest,
                 "stop observation",
             )
-            if stop.active_after_utc != observed_cycle:
+            if stop.active_after_utc not in {stop.observed_at_utc, observed_cycle}:
                 raise PaperServiceError("stop timing evidence is contradictory")
             observed.add(observed_cycle)
             obligations.add(
@@ -296,6 +299,7 @@ class PaperService:
                 "HEALTH_STATE",
                 "ALERT_ATTEMPT",
                 "ALERT_FAILURE",
+                "PAPER_CYCLE_ATTEMPT",
             }
             if all(
                 event.event_type in operational_only
@@ -310,12 +314,26 @@ class PaperService:
         now = _clock_utc(self._clock)
         if now < end + _MATURITY_DELAY:
             raise ValueError("completed candle must be at least ten minutes old")
+        latest_matured = _latest_matured_end(now)
         event_id = f"cycle:{_canonical_datetime(end)}"
         initial_snapshot = self._store.replay_state()
         _validate_health_and_risk_chain(initial_snapshot)
         _validate_operational_alert_chain(initial_snapshot.event_evidence)
-        if _has_completed_cycle(initial_snapshot, event_id, end, self._broker):
+        initial_reconciliation = self._broker.reconcile()
+        initial_completed = _completed_cycle_ends(
+            initial_snapshot,
+            self._broker,
+            initial_reconciliation,
+            latest_matured,
+        )
+        initial_attempted = _validated_cycle_attempts(
+            initial_snapshot,
+            initial_completed,
+            latest_matured,
+        )
+        if end in initial_completed:
             return CycleResult(CycleStatus.ALREADY_PROCESSED, end)
+        _require_attempt_target(end, initial_attempted, initial_completed)
 
         expires = _safe_add(now, self._lease_ttl, "lease expiry is outside datetime range")
         if not self._store.acquire_cycle_lease(
@@ -330,13 +348,24 @@ class PaperService:
             leased_snapshot = self._store.replay_state()
             _validate_health_and_risk_chain(leased_snapshot)
             _validate_operational_alert_chain(leased_snapshot.event_evidence)
-            if _has_completed_cycle(
+            leased_reconciliation = self._broker.reconcile()
+            leased_completed = _completed_cycle_ends(
                 leased_snapshot,
-                event_id,
-                end,
                 self._broker,
-            ):
+                leased_reconciliation,
+                latest_matured,
+            )
+            leased_attempted = _validated_cycle_attempts(
+                leased_snapshot,
+                leased_completed,
+                latest_matured,
+            )
+            if end in leased_completed:
                 return CycleResult(CycleStatus.ALREADY_PROCESSED, end)
+            _require_attempt_target(end, leased_attempted, leased_completed)
+
+            self._record_attempt(end, leased_attempted)
+            self._fault("after_cycle_attempt")
 
             raw = self._source.load_completed_candles(end)
             if not isinstance(raw, pd.DataFrame):
@@ -388,39 +417,50 @@ class PaperService:
             created_ids: list[str] = []
             filled_ids: list[str] = []
             initial_stop_created = False
-            reconciliation = self._broker.reconcile()
-            for order in reconciliation.active_orders:
-                eligible = order.eligible_open_utc
-                if eligible is None:
-                    raise PaperServiceError("active market order has no eligible open")
-                if eligible < bar_at:
-                    raise PaperServiceError("active market order missed its eligible open")
-                if eligible == bar_at:
-                    fill = self._broker.process_open(
-                        order.order_id,
+            with self._store.transaction():
+                reconciliation = self._broker.reconcile()
+                filled_entry_this_bar = False
+                for order in reconciliation.active_orders:
+                    eligible = order.eligible_open_utc
+                    if eligible is None:
+                        raise PaperServiceError("active market order has no eligible open")
+                    if eligible < bar_at:
+                        raise PaperServiceError("active market order missed its eligible open")
+                    if eligible == bar_at:
+                        fill = self._broker.process_open(
+                            order.order_id,
+                            bar_at,
+                            open_price=float(row["open"]),
+                        )
+                        if fill is not None:
+                            filled_ids.append(fill.order_id)
+                            filled_entry_this_bar = fill.side == "BUY"
+
+                if filled_entry_this_bar:
+                    self._fault("after_pending_open")
+                reconciliation = self._broker.reconcile()
+                if (
+                    reconciliation.btc_quantity > 0.0
+                    and not reconciliation.active_orders
+                    and reconciliation.active_stop is None
+                ):
+                    self._ensure_stop(
+                        bar_at,
+                        row,
+                        reconciliation,
+                        enriched,
+                        active_after=(bar_at if filled_entry_this_bar else None),
+                    )
+                    initial_stop_created = True
+                    reconciliation = self._broker.reconcile()
+                if reconciliation.btc_quantity > 0.0 and not reconciliation.active_orders:
+                    stop_fill = self._broker.process_intrabar_stop(
                         bar_at,
                         open_price=float(row["open"]),
+                        low_price=float(row["low"]),
                     )
-                    if fill is not None:
-                        filled_ids.append(fill.order_id)
-
-            reconciliation = self._broker.reconcile()
-            if (
-                reconciliation.btc_quantity > 0.0
-                and not reconciliation.active_orders
-                and reconciliation.active_stop is None
-            ):
-                self._ensure_stop(bar_at, row, reconciliation, enriched)
-                initial_stop_created = True
-                reconciliation = self._broker.reconcile()
-            if reconciliation.btc_quantity > 0.0 and not reconciliation.active_orders:
-                stop_fill = self._broker.process_intrabar_stop(
-                    bar_at,
-                    open_price=float(row["open"]),
-                    low_price=float(row["low"]),
-                )
-                if stop_fill is not None:
-                    filled_ids.append(stop_fill.order_id)
+                    if stop_fill is not None:
+                        filled_ids.append(stop_fill.order_id)
 
             reconciliation = self._broker.reconcile()
             equity = _mark_to_market(reconciliation, float(row["close"]))
@@ -605,6 +645,7 @@ class PaperService:
         row: pd.Series,
         reconciliation: PaperReconciliation,
         enriched: pd.DataFrame,
+        active_after: datetime | None = None,
     ) -> None:
         position = _open_position(
             self._broker,
@@ -618,6 +659,7 @@ class PaperService:
             self._broker.set_stop(
                 bar_at,
                 position.initial_stop,
+                active_after=active_after,
                 reason="HARD_STOP",
                 source_id=position.order.order_id,
             )
@@ -651,6 +693,27 @@ class PaperService:
                 "filled_order_ids": list(result.filled_order_ids),
                 "reason_codes": list(result.reasons),
                 "status": result.status.value,
+            },
+        )
+
+    def _record_attempt(
+        self,
+        end: datetime,
+        attempted: frozenset[datetime],
+    ) -> None:
+        if end in attempted:
+            return
+        try:
+            observed_at = end - _FOUR_HOURS
+        except OverflowError as error:
+            raise ValueError("cycle attempt is outside datetime range") from error
+        self._store.append_event(
+            _cycle_attempt_id(end),
+            "PAPER_CYCLE_ATTEMPT",
+            observed_at,
+            {
+                "end_utc": _canonical_datetime(end),
+                "version": _CYCLE_ATTEMPT_VERSION,
             },
         )
 
@@ -798,6 +861,77 @@ def _completed_cycle_ends(
     if any(current - previous != _FOUR_HOURS for previous, current in zip(ordered, ordered[1:])):
         raise StoreCorruptionError("cycle completion chronology is not contiguous")
     return frozenset(completed)
+
+
+def _cycle_attempt_id(end: datetime) -> str:
+    return f"paper-cycle-attempt:{_canonical_datetime(end)}"
+
+
+def _validated_cycle_attempts(
+    snapshot: PaperSnapshot,
+    completed: frozenset[datetime],
+    latest_matured: datetime,
+) -> frozenset[datetime]:
+    latest = _require_cycle_end(latest_matured)
+    attempts: dict[datetime, StoredEvent] = {}
+    reserved_prefix = "paper-cycle-attempt:"
+    for event in snapshot.event_evidence:
+        if event.event_type != "PAPER_CYCLE_ATTEMPT":
+            if event.event_id.startswith(reserved_prefix):
+                raise StoreCorruptionError("cycle attempt identity has the wrong event type")
+            continue
+        payload = event.payload
+        if (
+            set(payload) != {"end_utc", "version"}
+            or type(payload.get("version")) is not int
+            or payload["version"] != _CYCLE_ATTEMPT_VERSION
+        ):
+            raise StoreCorruptionError("cycle attempt payload is invalid")
+        try:
+            target = _require_cycle_end(_strict_stored_datetime(payload["end_utc"]))
+            observed_at = target - _FOUR_HOURS
+        except (TypeError, ValueError, OverflowError) as error:
+            raise StoreCorruptionError("cycle attempt target is invalid") from error
+        if event.event_id != _cycle_attempt_id(target):
+            raise StoreCorruptionError("cycle attempt identity is inconsistent")
+        if event.occurred_at_utc != observed_at:
+            raise StoreCorruptionError("cycle attempt envelope is inconsistent")
+        if target > latest:
+            raise StoreCorruptionError("cycle attempt target is not yet mature")
+        if target in attempts:
+            raise StoreCorruptionError("cycle attempt target is duplicated")
+        attempts[target] = event
+
+    cycle_events = {
+        event.occurred_at_utc: event
+        for event in snapshot.event_evidence
+        if event.event_type == "PAPER_CYCLE"
+    }
+    for target, attempt in attempts.items():
+        if target not in completed:
+            continue
+        terminal = cycle_events.get(target)
+        if terminal is None or attempt.sequence >= terminal.sequence:
+            raise StoreCorruptionError("cycle attempt is not prior to its terminal cycle")
+
+    unfinished = sorted(set(attempts) - completed)
+    if len(unfinished) > 1:
+        raise StoreCorruptionError("cycle attempts contain multiple unfinished targets")
+    if completed and unfinished:
+        expected = _first_uncompleted_after_cycle_chain(completed)
+        if unfinished[0] != expected:
+            raise StoreCorruptionError("cycle attempt contradicts completed chronology")
+    return frozenset(attempts)
+
+
+def _require_attempt_target(
+    requested: datetime,
+    attempted: frozenset[datetime],
+    completed: frozenset[datetime],
+) -> None:
+    unfinished = attempted - completed
+    if unfinished and requested != min(unfinished):
+        raise PaperServiceError("requested cycle skips the durable cycle attempt")
 
 
 def _first_uncompleted_after_cycle_chain(
@@ -1461,6 +1595,19 @@ def _clock_utc(clock: Clock) -> datetime:
         return value.astimezone(_UTC)
     except (OverflowError, ValueError) as error:
         raise ValueError("clock returned an invalid datetime") from error
+
+
+def _latest_matured_end(now: datetime) -> datetime:
+    try:
+        eligible = now - _MATURITY_DELAY
+        return eligible.replace(
+            hour=eligible.hour - eligible.hour % 4,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    except (OverflowError, ValueError) as error:
+        raise ValueError("clock is outside the supported cycle range") from error
 
 
 def _safe_add(value: datetime, duration: timedelta, message: str) -> datetime:

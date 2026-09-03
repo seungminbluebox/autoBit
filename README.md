@@ -48,7 +48,7 @@ py -3.12 -m venv .venv
 
 `paper-run`은 데이터 지연, API 오류, 원장 불일치 같은 비정상 증거가 있으면 신규 진입만 안전하게 멈춥니다. 상태 확인과 기존 포지션 보호는 계속하며 제한된 지수 백오프로 자동 재시도합니다. 모든 복구 조건이 충족되면 사람의 재개 명령 없이 `REDUCED` 크기로 다시 시작하고, 정상 복구 사이클을 통과하면 `NORMAL`로 돌아갑니다.
 
-`paper-status`는 기존 SQLite 원장을 변경하지 않고 정규화 현금·자산, BTC 모의수량, 포지션, 활성 손절, 미처리 모의주문, 안전 상태와 다음 UTC 실행 시각을 JSON으로 출력합니다.
+`paper-status`는 기존 SQLite 원장을 변경하지 않고 정규화 현금·자산, BTC 모의수량, 포지션, 활성 손절, 미처리 모의주문, 안전 상태와 다음 UTC 실행 시각을 JSON으로 출력합니다. `equity_status=CURRENT`와 `equity_provenance=COMPLETED_CLOSE_MTM`일 때만 `normalized_equity`가 `equity_as_of_utc` 확정봉 종가 기준의 최신 MTM입니다. `STALE` 또는 `UNAVAILABLE`이면 출처가 마지막 체결가 또는 초기 100인 fallback이므로 최신 시장가로 해석하지 않습니다.
 
 시작·상태 확인·정상 종료·SQLite backup/restore 검증·장애 자동 복구·증거 확인·모의매매 졸업 기준은 [정규화 모의매매 운영 Runbook](docs/paper-trading-runbook.md)을 따르십시오. 이 문서는 최소 2주와 30회 거래 관찰 기간을 아직 완료했다고 주장하지 않습니다. `PASS`는 paper evaluation 지속만 허용하며, 실거래를 켜거나 매수를 추천하지 않습니다.
 

@@ -860,6 +860,41 @@ def test_backdated_or_non_next_boundary_stop_activation_is_rejected(tmp_path: Pa
     assert store.replay_state() == before
 
 
+def test_fill_boundary_activation_requires_the_current_buy_fill_and_initial_stop(
+    tmp_path: Path,
+) -> None:
+    store, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    before = store.replay_state()
+
+    with pytest.raises(ValueError, match="current entry fill"):
+        broker.set_stop(
+            UTC_4,
+            95.0,
+            active_after=UTC_4,
+            reason="TRAILING_STOP",
+        )
+    with pytest.raises(ValueError, match="current entry fill"):
+        broker.set_stop(
+            UTC_8,
+            95.0,
+            active_after=UTC_8,
+            reason="HARD_STOP",
+        )
+
+    assert store.replay_state() == before
+    stop = broker.set_stop(
+        UTC_4,
+        95.0,
+        active_after=UTC_4,
+        reason="HARD_STOP",
+    )
+    assert stop.active_after_utc.isoformat() == "2026-01-01T04:00:00+00:00"
+    fill = broker.process_intrabar_stop(UTC_4, open_price=100.0, low_price=94.0)
+    assert fill is not None
+    assert fill.fill_time.isoformat() == "2026-01-01T04:00:00+00:00"
+
+
 def test_stop_rejects_a_noncurrent_source_before_mutation(tmp_path: Path) -> None:
     store, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
     _enter(broker, quantity=0.2)
