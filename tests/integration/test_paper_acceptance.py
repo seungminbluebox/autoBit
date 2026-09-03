@@ -9,12 +9,11 @@ import pandas as pd
 import pytest
 
 from autobit.cli import _PaperApplication
-from autobit.config import CostConfig, StrategyConfig
 from autobit.execution.paper_broker import PaperBroker
-from autobit.indicators.trend import compute_trend_indicators
+from autobit.paper import service as paper_service
 from autobit.paper.health import HealthMonitor, HealthStage
 from autobit.persistence.sqlite_store import SQLiteStore
-from autobit.risk.position_sizer import calculate_size
+from autobit.risk.position_sizer import SizeDecision, calculate_size
 
 
 UTC = timezone.utc
@@ -62,10 +61,8 @@ class _AcceptanceResult:
     entry_orders: int
     hard_stops: int
     stages: tuple[str, ...]
-    volatility_size: float
-    normal_size: float
-    volatility_binding: str
-    volatility_ratio: float
+    entry_submitted_quantity: float
+    entry_filled_quantity: float
 
 
 class _AcceptanceHarness:
@@ -76,19 +73,23 @@ class _AcceptanceHarness:
         fixture = json.loads(Path(fixture_path).read_text(encoding="utf-8"))
         start = datetime.fromisoformat(fixture["start_end"].replace("Z", "+00:00"))
         restart_end = start + _FOUR_HOURS
-        stop_end = restart_end + _FOUR_HOURS
-        recovery_end = stop_end + _FOUR_HOURS
+        outage_end = restart_end + _FOUR_HOURS
+        entry_end = outage_end + _FOUR_HOURS
+        fill_end = entry_end + _FOUR_HOURS
+        stop_end = fill_end + _FOUR_HOURS
         clock = _Clock(start + timedelta(minutes=10))
-        stop_history = _history(stop_end, hard_stop=True)
+        entry_history = _history(entry_end, breakout=True, high_volatility=True)
         source = _SyntheticPublicCandleSource(
             [
-                _history(start, breakout=True),
+                _history(start),
                 _history(restart_end),
                 *[RuntimeError("synthetic public API outage") for _ in range(fixture["api_failures"])],
-                stop_history,
-                stop_history,
-                stop_history,
-                _history(recovery_end),
+                _history(outage_end),
+                _history(outage_end),
+                _history(outage_end),
+                entry_history,
+                _history(fill_end),
+                _history(stop_end, hard_stop=True),
             ]
         )
         path = self._tmp_path / "paper.sqlite3"
@@ -96,10 +97,12 @@ class _AcceptanceHarness:
         store.initialize(initial_equity=fixture["initial_equity"])
         first = _application(store, source, clock, "first")
         first.run_once()
+        before_restart = store.replay_state()
         store.close()
 
         store = SQLiteStore(path)
         store.initialize(initial_equity=fixture["initial_equity"])
+        assert store.replay_state() == before_restart
         restarted = _application(store, source, clock, "restarted")
         clock.value = restart_end + timedelta(minutes=10)
         restarted.run_once()
@@ -116,13 +119,16 @@ class _AcceptanceHarness:
             stages.append(HealthMonitor.from_store(store).current_action().stage.value)
         assert stages == ["HALTED", "HALTED", "HALTED", "REDUCED"]
 
-        clock.value = recovery_end + timedelta(minutes=10)
+        clock.value = entry_end + timedelta(minutes=10)
         restarted.run_once()
         stages.append(HealthMonitor.from_store(store).current_action().stage.value)
+        clock.value = fill_end + timedelta(minutes=10)
+        restarted.run_once()
+        clock.value = stop_end + timedelta(minutes=10)
+        restarted.run_once()
         live = store.replay_state()
         broker = PaperBroker(store)
         reconciliation = broker.reconcile()
-        reopened_state = _reopen(path, fixture["initial_equity"])
 
         orders = [
             event.payload["order_id"]
@@ -146,39 +152,6 @@ class _AcceptanceHarness:
             if cash < -1e-12:
                 negative_cash_events += 1
 
-        risk_events = [
-            event.payload
-            for event in live.event_evidence
-            if event.event_type == "BREAKER_STATE"
-        ]
-        reduced_risk = next(
-            payload for payload in risk_events if payload["decision_reasons"] == ("health_recovery_reduced",)
-        )
-        stop_row = compute_trend_indicators(stop_history, StrategyConfig()).iloc[-1]
-        current_atr_pct = float(stop_row["atr_14"] / stop_row["close"])
-        baseline_atr_pct = float(stop_row["baseline_atr_pct"])
-        volatility_size = calculate_size(
-            equity=100.0,
-            cash=100.0,
-            entry=100.0,
-            stop=95.0,
-            current_atr_pct=current_atr_pct,
-            baseline_atr_pct=baseline_atr_pct,
-            risk_rate=float(reduced_risk["decision_risk_rate"]),
-            exposure_cap=float(reduced_risk["decision_exposure_cap"]),
-            costs=CostConfig(),
-        )
-        normal_size = calculate_size(
-            equity=100.0,
-            cash=100.0,
-            entry=100.0,
-            stop=95.0,
-            current_atr_pct=baseline_atr_pct,
-            baseline_atr_pct=baseline_atr_pct,
-            risk_rate=0.02,
-            exposure_cap=0.70,
-            costs=CostConfig(),
-        ).quantity
         halt_reasons = sorted(
             {
                 reason
@@ -187,6 +160,14 @@ class _AcceptanceHarness:
                 for reason in event.payload["reasons"]
             }
         )
+        entry_order = next(order for order in reconciliation.fills if order.side == "BUY")
+        submitted_entry = next(
+            event.payload
+            for event in live.event_evidence
+            if event.event_type == "PAPER_ORDER" and event.payload["side"] == "BUY"
+        )
+        store.close()
+        reopened_state = _reopen(path, fixture["initial_equity"])
 
         return _AcceptanceResult(
             duplicate_orders=len(orders) - len(set(orders)),
@@ -202,10 +183,8 @@ class _AcceptanceHarness:
             entry_orders=sum(fill.side == "BUY" for fill in fills),
             hard_stops=sum(fill.reason == "HARD_STOP" for fill in fills),
             stages=tuple(stages),
-            volatility_size=volatility_size.quantity,
-            normal_size=normal_size,
-            volatility_binding=volatility_size.binding_constraint,
-            volatility_ratio=current_atr_pct / baseline_atr_pct,
+            entry_submitted_quantity=float(submitted_entry["requested_quantity"]),
+            entry_filled_quantity=entry_order.quantity,
         )
 
 
@@ -226,7 +205,13 @@ def _application(
     )
 
 
-def _history(end: datetime, *, breakout: bool = False, hard_stop: bool = False) -> pd.DataFrame:
+def _history(
+    end: datetime,
+    *,
+    breakout: bool = False,
+    high_volatility: bool = False,
+    hard_stop: bool = False,
+) -> pd.DataFrame:
     index = pd.date_range(
         end=pd.Timestamp(end) - pd.Timedelta(hours=4),
         periods=601,
@@ -246,6 +231,10 @@ def _history(end: datetime, *, breakout: bool = False, hard_stop: bool = False) 
     if breakout:
         frame.iloc[-1, frame.columns.get_loc("close")] = 102.0
         frame.iloc[-1, frame.columns.get_loc("high")] = 103.0
+    if high_volatility:
+        frame.iloc[-1, frame.columns.get_loc("close")] = 124.0
+        frame.iloc[-1, frame.columns.get_loc("high")] = 124.0
+        frame.iloc[-1, frame.columns.get_loc("low")] = 80.0
     if hard_stop:
         frame.iloc[-1, frame.columns.get_loc("high")] = 120.0
         frame.iloc[-1, frame.columns.get_loc("low")] = 80.0
@@ -260,12 +249,47 @@ def _reopen(path: Path, initial_equity: float):
     return state
 
 
+def _assert_causal_entry_sizing(
+    result: _AcceptanceResult,
+    calls: list[dict[str, object]],
+) -> None:
+    assert len(calls) == 1
+    actual = calls[0]
+    assert actual["risk_rate"] == pytest.approx(0.005)
+    assert actual["exposure_cap"] == pytest.approx(0.175)
+    assert float(actual["current_atr_pct"]) / float(actual["baseline_atr_pct"]) > 2.0
+
+    expected = calculate_size(**actual)
+    normal_risk_high_volatility = calculate_size(
+        **{**actual, "risk_rate": 0.01, "exposure_cap": 0.35}
+    )
+    reduced_risk_baseline_volatility = calculate_size(
+        **{**actual, "current_atr_pct": actual["baseline_atr_pct"]}
+    )
+    assert result.entry_submitted_quantity == pytest.approx(expected.quantity)
+    assert result.entry_filled_quantity == pytest.approx(expected.quantity)
+    assert expected.binding_constraint == "volatility"
+    assert expected.quantity < normal_risk_high_volatility.quantity
+    assert expected.quantity < reduced_risk_baseline_volatility.quantity
+
+
 @pytest.fixture
 def app_harness(tmp_path: Path) -> _AcceptanceHarness:
     return _AcceptanceHarness(tmp_path)
 
 
-def test_paper_acceptance_scenario(app_harness: _AcceptanceHarness) -> None:
+def test_paper_acceptance_scenario(
+    app_harness: _AcceptanceHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    production_size = paper_service.calculate_size
+
+    def capture_size(**kwargs: object):
+        calls.append(kwargs)
+        return production_size(**kwargs)
+
+    monkeypatch.setattr(paper_service, "calculate_size", capture_size)
     result = app_harness.run("tests/fixtures/paper_acceptance.json")
 
     assert result.duplicate_orders == 0
@@ -278,6 +302,21 @@ def test_paper_acceptance_scenario(app_harness: _AcceptanceHarness) -> None:
     assert result.entry_orders == 1
     assert result.hard_stops == 1
     assert result.stages == ("HALTED", "HALTED", "HALTED", "REDUCED", "NORMAL")
-    assert result.volatility_size < result.normal_size
-    assert result.volatility_binding == "volatility"
-    assert result.volatility_ratio > 2.0
+    _assert_causal_entry_sizing(result, calls)
+
+
+def test_paper_acceptance_rejects_risk_agnostic_service_sizing(
+    app_harness: _AcceptanceHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def constant_size(**kwargs: object) -> SizeDecision:
+        calls.append(kwargs)
+        return SizeDecision(quantity=0.5, binding_constraint="constant", estimated_loss=0.0)
+
+    monkeypatch.setattr(paper_service, "calculate_size", constant_size)
+    result = app_harness.run("tests/fixtures/paper_acceptance.json")
+
+    with pytest.raises(AssertionError):
+        _assert_causal_entry_sizing(result, calls)
