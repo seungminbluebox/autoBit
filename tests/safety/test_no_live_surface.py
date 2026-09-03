@@ -121,6 +121,7 @@ _FORBIDDEN_IMPORT_ROOTS = frozenset(
         "market_mode",
         "pyupbit",
         "strategy_loader",
+        "subprocess",
         "telegram_alert",
         "trade",
         "upbit_api",
@@ -130,10 +131,13 @@ _DYNAMIC_CALLS = frozenset({"__import__", "compile", "eval", "exec"})
 _BASE64_DECODERS = frozenset(
     {"a2b_base64", "b64decode", "decodebytes", "standard_b64decode", "urlsafe_b64decode"}
 )
-_HTTP_METHOD_NAMES = frozenset({"delete", "get", "patch", "post", "put"})
+_HTTP_METHOD_NAMES = frozenset(
+    {"delete", "get", "head", "options", "patch", "post", "put"}
+)
 _NETWORK_IMPORT_ROOTS = frozenset(
     {
         "aiohttp",
+        "asyncio",
         "http",
         "httpx",
         "requests",
@@ -153,6 +157,8 @@ _ALLOWED_HTTPX_IMPORT_PATHS = frozenset(
 _UNAMBIGUOUS_HTTP_SINK_METHODS = frozenset(
     {
         "delete",
+        "head",
+        "options",
         "patch",
         "post",
         "put",
@@ -161,6 +167,11 @@ _UNAMBIGUOUS_HTTP_SINK_METHODS = frozenset(
         "urlopen",
     }
 )
+_HTTP_SINK_METHODS = frozenset((*_HTTP_METHOD_NAMES, "request", "send", "stream"))
+_HTTPX_NETWORK_ATTRIBUTES = frozenset(
+    (*_HTTP_METHOD_NAMES, "request", "stream", "Client", "AsyncClient", "Request")
+)
+_PROCESS_EXECUTION_REFERENCES = frozenset({"os.popen", "os.system"})
 
 
 def _git_paths(*arguments: str) -> tuple[Path, ...]:
@@ -189,6 +200,38 @@ def _surface_path(label: str) -> str:
     if separator and prefix in {"index", "worktree"}:
         return path.replace("\\", "/")
     return label.replace("\\", "/")
+
+
+def _parent_nodes(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    return {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+
+def _httpx_import_form_violations(tree: ast.AST, path: str) -> tuple[str, ...]:
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                if item.name.lower().split(".", 1)[0] != "httpx":
+                    continue
+                if item.name != "httpx" or path not in _ALLOWED_HTTPX_IMPORT_PATHS:
+                    violations.append(f"unapproved httpx module import: {item.name}")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.lower().split(".", 1)[0] == "httpx":
+                violations.append(f"httpx from-import is forbidden: {module}")
+    return tuple(violations)
+
+
+def _has_approved_httpx_import(tree: ast.AST, path: str) -> bool:
+    return path in _ALLOWED_HTTPX_IMPORT_PATHS and any(
+        isinstance(node, ast.Import)
+        and any(item.name == "httpx" for item in node.names)
+        for node in ast.walk(tree)
+    )
 
 
 def _repository_source_surfaces() -> tuple[tuple[str, str], ...]:
@@ -505,6 +548,80 @@ def _network_import_roots(aliases: dict[str, str]) -> frozenset[str]:
     )
 
 
+def _httpx_primitive_reference_is_allowed(
+    node: ast.Attribute,
+    path: str,
+    aliases: dict[str, str],
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    resolved = _resolve_alias(_dotted_name(node) or "", aliases)
+    if not resolved.startswith("httpx."):
+        return True
+    primitive = resolved.removeprefix("httpx.")
+    if primitive not in _HTTPX_NETWORK_ATTRIBUTES:
+        return True
+    if primitive in _HTTP_METHOD_NAMES or primitive in {"request", "stream"}:
+        return False
+
+    parent = parents.get(node)
+    if isinstance(parent, ast.Call) and parent.func is node:
+        return True
+    return (
+        primitive == "Client"
+        and path in {_DATA_ADAPTER_PATH, _NOTIFIER_ADAPTER_PATH}
+        and isinstance(parent, ast.arg)
+        and parent.annotation is node
+    )
+
+
+def _is_exact_benign_http_named_call(
+    path: str,
+    call: ast.Call,
+    constants: dict[str, object],
+    aliases: dict[str, str],
+) -> bool:
+    if not isinstance(call.func, ast.Attribute) or call.keywords:
+        return False
+    base = _dotted_name(call.func.value) or ""
+    method = call.func.attr.lower()
+
+    if path == _DATA_ADAPTER_PATH:
+        return (
+            base == "response.headers"
+            and method == "get"
+            and len(call.args) == 1
+            and _constant_value(call.args[0], constants, aliases) == "Remaining-Req"
+        )
+    if path == _NOTIFIER_ADAPTER_PATH and method == "send" and len(call.args) == 1:
+        argument = call.args[0]
+        return (
+            base == "self._adapter"
+            and isinstance(argument, ast.Name)
+            and argument.id == "event"
+        ) or (base == "notifier" and isinstance(argument, ast.Dict))
+    if path != _HTTPX_WIRING_PATH or method != "get":
+        return False
+    if base == "fills":
+        return (
+            len(call.args) == 1
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "order_id"
+        )
+    if base == "os.environ":
+        return (
+            len(call.args) == 2
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id in {"chat_name", "token_name"}
+            and _constant_value(call.args[1], constants, aliases) == ""
+        )
+    return (
+        base == "payload"
+        and len(call.args) == 1
+        and _constant_value(call.args[0], constants, aliases)
+        in {"processed_sha256", "quality", "schema_version"}
+    )
+
+
 def _looks_like_url_argument(
     node: ast.AST | None,
     constants: dict[str, object],
@@ -571,12 +688,21 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
         return (f"{label}: invalid Python syntax: {error.msg}",), ()
 
     path = _surface_path(label)
+    parents = _parent_nodes(tree)
     aliases, import_violations = _imports(tree)
+    has_approved_httpx_import = _has_approved_httpx_import(tree, path)
     constants = _constant_bindings(tree, aliases)
     clients, network_functions, httpx_modules, request_constructors = _network_symbols(
         tree, aliases
     )
-    violations = [f"{label}: {item}" for item in import_violations]
+    violations = [
+        f"{label}: {item}"
+        for item in (*import_violations, *_httpx_import_form_violations(tree, path))
+    ]
+    for target in sorted(set(aliases.values()) & _PROCESS_EXECUTION_REFERENCES):
+        violations.append(
+            f"{label}: process execution import is forbidden: {target}"
+        )
     for root in sorted(_network_import_roots(aliases)):
         if root != "httpx" or path not in _ALLOWED_HTTPX_IMPORT_PATHS:
             violations.append(
@@ -591,6 +717,19 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
             atoms.append(node.id)
         elif isinstance(node, ast.Attribute):
             atoms.append(node.attr)
+            resolved_reference = _resolve_alias(_dotted_name(node) or "", aliases)
+            if not _httpx_primitive_reference_is_allowed(
+                node, path, aliases, parents
+            ):
+                violations.append(
+                    f"{label}: direct httpx network primitive reference: "
+                    f"{resolved_reference}"
+                )
+            if resolved_reference in _PROCESS_EXECUTION_REFERENCES:
+                violations.append(
+                    f"{label}: process execution capability is forbidden: "
+                    f"{resolved_reference}"
+                )
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             atoms.append(node.name)
         elif isinstance(node, ast.arg):
@@ -617,6 +756,10 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                 or tail == "__import__"
             ):
                 violations.append(f"{label}: dynamic execution/import call: {function}")
+            if resolved in _PROCESS_EXECUTION_REFERENCES:
+                violations.append(
+                    f"{label}: process execution call is forbidden: {resolved}"
+                )
             if isinstance(node.func, ast.Attribute) and node.func.attr.lower() == "fromhex":
                 violations.append(f"{label}: constant decoder is forbidden: {function}")
             if tail in _BASE64_DECODERS:
@@ -674,8 +817,11 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
         resolved = _resolve_alias(function, aliases)
         kind: str | None = None
         contract: tuple[str, str] | None | object = _UNKNOWN
-        if resolved in {"httpx.Client", "httpx.AsyncClient"}:
+        if resolved == "httpx.Client":
             kind = "client_constructor"
+            contract = None
+        elif resolved == "httpx.AsyncClient":
+            kind = "async_client_constructor"
             contract = None
         elif resolved == "httpx.Request" or function in request_constructors:
             kind = "request_constructor"
@@ -689,7 +835,11 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
         elif isinstance(node.func, ast.Attribute):
             base = _dotted_name(node.func.value) or ""
             method = node.func.attr.lower()
-            if base in httpx_modules and method in _HTTP_METHOD_NAMES:
+            if has_approved_httpx_import and _is_exact_benign_http_named_call(
+                path, node, constants, aliases
+            ):
+                pass
+            elif base in httpx_modules and method in _HTTP_METHOD_NAMES:
                 kind = "module_verb"
                 contract = _network_contract(
                     None,
@@ -727,6 +877,31 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     _call_argument(node, 0, "method"),
                     _call_argument(node, 1, "url"),
                     fixed_method=None,
+                    constants=constants,
+                    aliases=aliases,
+                )
+            elif has_approved_httpx_import and method in _HTTP_SINK_METHODS:
+                kind = "unresolved_receiver"
+                if method == "request":
+                    method_node = _call_argument(node, 0, "method")
+                    url_node = _call_argument(node, 1, "url")
+                    fixed_method = None
+                elif method == "stream":
+                    method_node = _call_argument(node, 0, "method")
+                    url_node = _call_argument(node, 1, "url")
+                    fixed_method = None
+                elif method == "send":
+                    method_node = None
+                    url_node = None
+                    fixed_method = None
+                else:
+                    method_node = None
+                    url_node = _call_argument(node, 0, "url")
+                    fixed_method = method.upper()
+                contract = _network_contract(
+                    method_node,
+                    url_node,
+                    fixed_method=fixed_method,
                     constants=constants,
                     aliases=aliases,
                 )
@@ -1148,6 +1323,126 @@ def test_scanner_rejects_private_constant_and_dynamic_bypasses(
         sys.modules[__name__],
         "_repository_source_surfaces",
         lambda: ((label, source),),
+    )
+
+    with pytest.raises(AssertionError):
+        test_repository_source_has_no_private_upbit_or_live_order_surface()
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "index:src/autobit/cli.py",
+        "worktree:src/autobit/data/upbit_public.py",
+        "index:src/autobit/alerts/notifier.py",
+    ],
+)
+@pytest.mark.parametrize(
+    ("case", "body"),
+    [
+        (
+            "dictionary_subscript",
+            'methods = {"send": httpx.post}\ndef go(target):\n    return methods["send"](target)\n',
+        ),
+        (
+            "default_argument",
+            "def go(target, send=httpx.post):\n    return send(target)\n",
+        ),
+        (
+            "tuple_alias",
+            "(send,) = (httpx.post,)\ndef go(target):\n    return send(target)\n",
+        ),
+    ],
+)
+def test_scanner_rejects_httpx_callable_capture_in_every_approved_context(
+    case: str,
+    body: str,
+    label: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del case
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_repository_source_surfaces",
+        lambda: ((label, "import httpx\n" + body),),
+    )
+
+    with pytest.raises(AssertionError):
+        test_repository_source_has_no_private_upbit_or_live_order_surface()
+
+
+@pytest.mark.parametrize(
+    ("case", "source"),
+    [
+        (
+            "inline_client_get",
+            "import httpx\ndef go(target):\n    return httpx.Client().get(target)\n",
+        ),
+        (
+            "inline_async_client_get",
+            "import httpx\nasync def go(target):\n    return await httpx.AsyncClient().get(target)\n",
+        ),
+        (
+            "factory_client_get",
+            "import httpx\ndef factory():\n    return httpx.Client()\ndef go(target):\n    return factory().get(target)\n",
+        ),
+    ],
+)
+def test_scanner_rejects_chained_get_in_cli_wiring(
+    case: str,
+    source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del case
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_repository_source_surfaces",
+        lambda: (("index:src/autobit/cli.py", source),),
+    )
+
+    with pytest.raises(AssertionError):
+        test_repository_source_has_no_private_upbit_or_live_order_surface()
+
+
+@pytest.mark.parametrize(
+    ("case", "source"),
+    [
+        (
+            "asyncio_open_connection",
+            "import asyncio\nasync def go(host):\n    return await asyncio.open_connection(host, 443)\n",
+        ),
+        (
+            "subprocess_run_curl",
+            'import subprocess\ndef go(target):\n    return subprocess.run(["curl", target])\n',
+        ),
+        (
+            "subprocess_popen_wget",
+            'import subprocess\ndef go(target):\n    return subprocess.Popen(["wget", target])\n',
+        ),
+        (
+            "subprocess_check_call_powershell",
+            'from subprocess import check_call\ndef go(target):\n    return check_call(["powershell", "Invoke-WebRequest", target])\n',
+        ),
+        (
+            "os_system_curl",
+            'import os\ndef go(target):\n    return os.system("curl " + target)\n',
+        ),
+        (
+            "os_popen_wget",
+            'import os\ndef go(target):\n    return os.popen("wget " + target)\n',
+        ),
+    ],
+)
+def test_scanner_rejects_raw_network_and_process_escape_hatches(
+    case: str,
+    source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del case
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_repository_source_surfaces",
+        lambda: (("worktree:src/autobit/escape_hatch.py", source),),
     )
 
     with pytest.raises(AssertionError):
