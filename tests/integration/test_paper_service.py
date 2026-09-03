@@ -261,7 +261,7 @@ def test_cursor_rejects_a_future_risk_observation(tmp_path: Path) -> None:
         ),
     )
 
-    with pytest.raises((StoreCorruptionError, ValueError), match="risk|future"):
+    with pytest.raises((StoreCorruptionError, ValueError), match="risk|future|breaker"):
         service.oldest_required_end(END)
 
     assert source.calls == []
@@ -1220,7 +1220,7 @@ def test_crash_after_acceptance_restarts_oldest_cycle_then_exact_open(
     ] == [END, END + timedelta(hours=4), END + timedelta(hours=8)]
 
 
-def test_entry_fill_is_protected_before_corrupt_risk_state_can_abort_cycle(
+def test_corrupt_risk_state_blocks_pending_fill_before_any_service_mutation(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "paper.sqlite3"
@@ -1239,22 +1239,21 @@ def test_entry_fill_is_protected_before_corrupt_risk_state_can_abort_cycle(
     bar_at = END - timedelta(hours=4)
     pending = broker.submit_entry(bar_at - timedelta(hours=4), quantity=0.2)
     _, service = _service(path, source, store=store, broker=broker)
+    before_sequence = store.replay_state().last_sequence
 
     with pytest.raises(Exception, match="breaker state"):
         service.process_completed_candle(END)
 
     after_failure = broker.reconcile()
-    assert after_failure.position_state is PositionState.LONG
-    assert len(after_failure.fills) == 1
-    assert after_failure.fills[0].order_id == pending.order_id
-    assert after_failure.active_stop is not None
-    assert after_failure.active_stop.stop_price == pytest.approx(95.0)
-    assert after_failure.active_stop.active_after_utc == END
+    assert after_failure.position_state is PositionState.ENTRY_PENDING
+    assert after_failure.active_orders == (pending,)
+    assert after_failure.fills == ()
+    assert after_failure.active_stop is None
+    assert store.replay_state().last_sequence == before_sequence
     assert not any(
         event.event_type == "PAPER_CYCLE"
         for event in store.replay_state().event_evidence
     )
-    first_stop = after_failure.active_stop
     store.close()
 
     reopened_store = SQLiteStore(path)
@@ -1278,9 +1277,12 @@ def test_entry_fill_is_protected_before_corrupt_risk_state_can_abort_cycle(
         for event in reopened_store.replay_state().event_evidence
         if event.event_type == "PAPER_STOP" and event.payload.get("action") == "SET"
     ]
-    assert len(after_retry.fills) == 1
-    assert after_retry.active_stop == first_stop
-    assert len(stop_sets) == 1
+    assert after_retry.position_state is PositionState.ENTRY_PENDING
+    assert after_retry.active_orders == (pending,)
+    assert after_retry.fills == ()
+    assert after_retry.active_stop is None
+    assert len(stop_sets) == 0
+    assert reopened_store.replay_state().last_sequence == before_sequence
     assert not any(
         event.event_type == "PAPER_CYCLE"
         for event in reopened_store.replay_state().event_evidence

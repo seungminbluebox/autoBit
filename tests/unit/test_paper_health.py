@@ -414,7 +414,7 @@ def test_snapshot_canonical_round_trip_is_immutable_and_restart_exact() -> None:
     "mutate",
     [
         lambda p: p.__setitem__("extra", 1),
-        lambda p: p.__setitem__("version", 2),
+        lambda p: p.__setitem__("version", 3),
         lambda p: p.__setitem__("retry_attempts", True),
         lambda p: p.__setitem__("api_failures", -1),
         lambda p: p.__setitem__("ledger_cash_difference", inf),
@@ -469,6 +469,82 @@ def test_strict_snapshot_rejects_impossible_two_failure_latch() -> None:
 
     with pytest.raises(ValueError):
         HealthSnapshot.from_mapping(payload)
+
+
+def test_strict_snapshot_rejects_forged_latch_provenance_without_partial_success() -> None:
+    monitor = HealthMonitor()
+    monitor.record_api_failure(NOW)
+    monitor.record_api_failure(NOW + timedelta(seconds=1))
+    payload = dict(monitor.snapshot().to_mapping())
+    payload.update(
+        {
+            "api_failure_latched": True,
+            "api_latch_activated_at_utc": "2026-01-01T00:00:00Z",
+            "halt_entries": True,
+            "reasons": ["API_FAILURES"],
+            "retry_attempts": 1,
+            "stage": "HALTED",
+        },
+    )
+
+    with pytest.raises(ValueError, match="provenance|recovery"):
+        HealthSnapshot.from_mapping(payload)
+
+
+def test_strict_snapshot_rejects_zero_counter_latch_without_partial_success() -> None:
+    payload = dict(HealthMonitor().snapshot().to_mapping())
+    payload.update(
+        {
+            "api_failure_latched": True,
+            "api_latch_activated_at_utc": "2026-01-01T00:00:00Z",
+            "last_failure_at_utc": "2026-01-01T00:00:00Z",
+            "last_observation_at_utc": "2026-01-01T00:00:00Z",
+            "halt_entries": True,
+            "reasons": ["API_FAILURES"],
+            "retry_attempts": 1,
+            "stage": "HALTED",
+        },
+    )
+
+    with pytest.raises(ValueError, match="provenance|recovery"):
+        HealthSnapshot.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    ("partial_successes", "renewed_failures"),
+    [(1, 1), (1, 2), (2, 1), (2, 2)],
+)
+def test_active_api_latch_provenance_round_trips_reachable_partial_recovery(
+    partial_successes: int,
+    renewed_failures: int,
+) -> None:
+    monitor = HealthMonitor()
+    for second in range(3):
+        monitor.record_api_failure(NOW + timedelta(seconds=second))
+    for second in range(partial_successes):
+        monitor.record_api_success(NOW + timedelta(seconds=10 + second))
+    for second in range(renewed_failures):
+        monitor.record_api_failure(NOW + timedelta(seconds=20 + second))
+
+    snapshot = monitor.snapshot()
+    restored = HealthMonitor.from_mapping(snapshot.to_mapping())
+
+    assert snapshot.api_latch_activated_at_utc == NOW + timedelta(seconds=2)
+    assert restored.snapshot() == snapshot
+    assert restored.current_action().stage is HealthStage.HALTED
+    for second in range(3):
+        action = restored.record_api_success(NOW + timedelta(seconds=30 + second))
+    assert action.stage is HealthStage.REDUCED
+    assert action.resume_reduced
+
+
+def test_legacy_version_one_health_mapping_is_rejected_instead_of_inferred() -> None:
+    legacy = dict(HealthMonitor().snapshot().to_mapping())
+    legacy.pop("api_latch_activated_at_utc", None)
+    legacy["version"] = 1
+
+    with pytest.raises(ValueError, match="version|keys"):
+        HealthSnapshot.from_mapping(legacy)
 
 
 @pytest.mark.parametrize("cursor", ["last_success_at_utc", "last_failure_at_utc"])

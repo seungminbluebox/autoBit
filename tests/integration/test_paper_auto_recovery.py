@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +14,7 @@ from autobit.paper.service import _apply_health_action
 from autobit.persistence.sqlite_store import (
     IdempotencyConflictError,
     SQLiteStore,
+    StoreCorruptionError,
 )
 from autobit.risk.breakers import RiskDecision
 
@@ -116,6 +118,25 @@ def _persist(monitor: HealthMonitor, store: SQLiteStore, identity: str) -> int:
     )
 
 
+def _normal_breaker_payload(tmp_path: Path, identity: str) -> dict[str, object]:
+    store, _, service = _service(
+        tmp_path / f"normal-risk-{identity}.sqlite3",
+        _history(END),
+        owner=f"normal-risk-{identity}",
+    )
+    service.process_completed_candle(END)
+    return dict(store.replay_state().breaker_state)
+
+
+def _reduced_payload(payload: dict[str, object], *, halve: bool) -> dict[str, object]:
+    reduced = dict(payload)
+    reduced["decision_reasons"] = ["health_recovery_reduced"]
+    if halve:
+        reduced["decision_risk_rate"] = 0.01
+        reduced["decision_exposure_cap"] = 0.35
+    return reduced
+
+
 def test_health_snapshot_persists_reopens_and_exact_duplicate_is_noop(tmp_path: Path) -> None:
     path = tmp_path / "health.sqlite3"
     store = SQLiteStore(path)
@@ -176,6 +197,41 @@ def test_stale_success_duplicate_after_reopen_does_not_resume_early(tmp_path: Pa
     assert action.stage is HealthStage.HALTED
     assert not action.resume_reduced
     assert restored.record_api_success(BAR_AT + timedelta(seconds=12)).resume_reduced
+
+
+@pytest.mark.parametrize(
+    ("partial_successes", "renewed_failures"),
+    [(1, 1), (1, 2), (2, 1), (2, 2)],
+)
+def test_reachable_partial_recovery_outage_persists_and_reopens(
+    tmp_path: Path,
+    partial_successes: int,
+    renewed_failures: int,
+) -> None:
+    path = tmp_path / f"reachable-latch-{partial_successes}-{renewed_failures}.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    monitor = HealthMonitor()
+    for second in range(3):
+        monitor.record_api_failure(BAR_AT + timedelta(seconds=second))
+    for second in range(partial_successes):
+        monitor.record_api_success(BAR_AT + timedelta(seconds=10 + second))
+    for second in range(renewed_failures):
+        monitor.record_api_failure(BAR_AT + timedelta(seconds=20 + second))
+    monitor.persist(store, event_id="health:reachable-latch", logical_at=END)
+    store.close()
+
+    reopened = SQLiteStore(path)
+    reopened.initialize()
+    restored = HealthMonitor.from_store(reopened)
+
+    assert restored.snapshot().api_failure_latched
+    assert restored.snapshot().api_failures == renewed_failures
+    assert restored.current_action().stage is HealthStage.HALTED
+    for second in range(3):
+        action = restored.record_api_success(BAR_AT + timedelta(seconds=30 + second))
+    assert action.stage is HealthStage.REDUCED
+    assert action.resume_reduced
 
 
 def test_persisted_identity_reuse_with_different_health_fails_closed(tmp_path: Path) -> None:
@@ -370,6 +426,19 @@ def test_reduced_health_halves_existing_risk_once_and_restart_does_not_duplicate
     reduced_risk = after_restart.breaker_state
     assert reduced_risk["decision_risk_rate"] == pytest.approx(0.01)
     assert reduced_risk["decision_exposure_cap"] == pytest.approx(0.35)
+    risk_events = [
+        event
+        for event in after_restart.event_evidence
+        if event.event_type == "BREAKER_STATE"
+    ]
+    assert risk_events[0].event_id == "risk:2026-05-11T00:00:00Z"
+    assert "health_recovery_reduced" not in risk_events[0].payload["decision_reasons"]
+    reduced_digest = sha256("health:reduced".encode("utf-8")).hexdigest()
+    assert risk_events[1].event_id == (
+        "risk-health:2026-05-11T00:00:00Z:1:v2:"
+        f"{reduced_digest}"
+    )
+    assert risk_events[1].payload["decision_reasons"] == ("health_recovery_reduced",)
     assert duplicate.status is CycleStatus.ALREADY_PROCESSED
     assert after_restart.last_sequence == before_restart.last_sequence
     assert len(reopened_broker.reconcile().active_orders) == 1
@@ -468,8 +537,111 @@ def test_reduced_crash_restart_reuses_the_once_halved_persisted_decision(
     assert result.reasons == ("health_recovery_reduced",)
     assert same_order == accepted
     assert state.breaker_state["decision_risk_rate"] == pytest.approx(0.01)
-    assert len([e for e in state.event_evidence if e.event_type == "BREAKER_STATE"]) == 1
+    risk_events = [e for e in state.event_evidence if e.event_type == "BREAKER_STATE"]
+    assert len(risk_events) == 2
+    assert risk_events[0].event_id == "risk:2026-05-11T00:00:00Z"
+    assert risk_events[1].event_id.startswith("risk-health:2026-05-11T00:00:00Z:")
     assert len([e for e in state.event_evidence if e.event_type == "ORDER_CREATED"]) == 1
+
+
+@pytest.mark.parametrize(
+    "forged_event_id",
+    [
+        "breaker:forged-reduced",
+        "risk:2026-05-11T00:00:00Z",
+        "risk-health:forged",
+    ],
+)
+@pytest.mark.parametrize("public_path", ["process", "oldest"])
+def test_unbound_reduced_marker_fails_closed_before_public_service_mutation(
+    tmp_path: Path,
+    forged_event_id: str,
+    public_path: str,
+) -> None:
+    path = tmp_path / f"unbound-{public_path}-{forged_event_id.split(':')[0]}.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    _persist(_reduced_monitor(), store, "health:reduced")
+    payload = _reduced_payload(
+        _normal_breaker_payload(tmp_path, f"{public_path}-{forged_event_id.replace(':', '-')}"),
+        halve=False,
+    )
+    store.append_event(forged_event_id, "BREAKER_STATE", BAR_AT, payload)
+    _, broker, service = _service(path, _history(END, breakout=True), store=store)
+    before = store.replay_state().last_sequence
+
+    with pytest.raises(StoreCorruptionError):
+        if public_path == "process":
+            service.process_completed_candle(END)
+        else:
+            service.oldest_required_end(END)
+
+    after = store.replay_state()
+    assert after.last_sequence == before
+    assert broker.reconcile().active_orders == ()
+    assert not [event for event in after.event_evidence if event.event_type == "PAPER_CYCLE"]
+
+
+def test_reduced_followup_bound_to_old_health_evidence_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "old-health-binding.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    old_id = "health:old-reduced"
+    old_sequence = _persist(_reduced_monitor(), store, old_id)
+    latest = _reduced_monitor()
+    latest.persist(store, event_id="health:latest-reduced", logical_at=BAR_AT)
+    base = _normal_breaker_payload(tmp_path, "old-health-binding")
+    store.append_event("risk:2026-05-11T00:00:00Z", "BREAKER_STATE", BAR_AT, base)
+    old_version = latest.snapshot().version
+    old_digest = sha256(old_id.encode("utf-8")).hexdigest()
+    forged_id = (
+        "risk-health:2026-05-11T00:00:00Z:"
+        f"{old_sequence}:v{old_version}:{old_digest}"
+    )
+    store.append_event(
+        forged_id,
+        "BREAKER_STATE",
+        BAR_AT,
+        _reduced_payload(base, halve=True),
+    )
+    _, broker, service = _service(path, _history(END, breakout=True), store=store)
+    before = store.replay_state().last_sequence
+
+    with pytest.raises(StoreCorruptionError):
+        service.process_completed_candle(END)
+
+    assert store.replay_state().last_sequence == before
+    assert broker.reconcile().active_orders == ()
+
+
+def test_health_bound_reduced_followup_rejects_mismatched_payload(tmp_path: Path) -> None:
+    path = tmp_path / "mismatched-health-overlay.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    health_id = "health:latest-reduced"
+    monitor = _reduced_monitor()
+    health_sequence = _persist(monitor, store, health_id)
+    base = _normal_breaker_payload(tmp_path, "mismatched-health-overlay")
+    store.append_event("risk:2026-05-11T00:00:00Z", "BREAKER_STATE", BAR_AT, base)
+    health_digest = sha256(health_id.encode("utf-8")).hexdigest()
+    bound_id = (
+        "risk-health:2026-05-11T00:00:00Z:"
+        f"{health_sequence}:v{monitor.snapshot().version}:{health_digest}"
+    )
+    store.append_event(
+        bound_id,
+        "BREAKER_STATE",
+        BAR_AT,
+        _reduced_payload(base, halve=False),
+    )
+    _, broker, service = _service(path, _history(END, breakout=True), store=store)
+    before = store.replay_state().last_sequence
+
+    with pytest.raises(StoreCorruptionError):
+        service.process_completed_candle(END)
+
+    assert store.replay_state().last_sequence == before
+    assert broker.reconcile().active_orders == ()
 
 
 @pytest.mark.parametrize("late_stage", [HealthStage.HALTED, HealthStage.REDUCED])
@@ -550,7 +722,7 @@ def test_late_same_bar_health_change_persists_an_idempotent_risk_followup(
     assert len(risk_events) == 2
     assert len(followups) == 1
     assert followups[0].occurred_at_utc == END
-    assert ":v1:" in followups[0].event_id
+    assert ":v2:" in followups[0].event_id
     assert after.breaker_state["last_risk_at_utc"] == "2026-05-11T00:00:00Z"
     decision_keys = {
         "decision_exposure_cap",

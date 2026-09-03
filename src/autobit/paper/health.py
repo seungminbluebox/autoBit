@@ -37,7 +37,7 @@ HEALTH_REASON_ORDER = (
     "FILL_DEVIATION",
 )
 
-_VERSION = 1
+_VERSION = 2
 _API_SUCCESSES_REQUIRED = 3
 _LEDGER_TOLERANCE = 1e-10
 _FILL_DEVIATION_LIMIT = 0.05
@@ -54,6 +54,7 @@ _SNAPSHOT_KEYS = frozenset(
         "api_failures",
         "api_successes",
         "api_failure_latched",
+        "api_latch_activated_at_utc",
         "unresolved_orders",
         "ledger_matches",
         "ledger_cash_difference",
@@ -113,6 +114,7 @@ class HealthSnapshot:
     api_failures: int = 0
     api_successes: int = 0
     api_failure_latched: bool = False
+    api_latch_activated_at_utc: datetime | None = None
     unresolved_orders: int = 0
     ledger_matches: bool = True
     ledger_cash_difference: float = 0.0
@@ -132,7 +134,7 @@ class HealthSnapshot:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> HealthSnapshot:
-        """Parse only the canonical version-one snapshot shape.
+        """Parse only the canonical version-two snapshot shape.
 
         An empty mapping is the one compatibility exception: Task 3 databases
         predate health events and therefore begin healthy.
@@ -155,6 +157,10 @@ class HealthSnapshot:
         api_failure_latched = _strict_bool(
             payload["api_failure_latched"],
             "api_failure_latched",
+        )
+        api_latch_activated_at = _optional_canonical_datetime(
+            payload["api_latch_activated_at_utc"],
+            "api_latch_activated_at_utc",
         )
         unresolved_orders = _strict_int(
             payload["unresolved_orders"],
@@ -209,6 +215,7 @@ class HealthSnapshot:
             api_failures=api_failures,
             api_successes=api_successes,
             api_failure_latched=api_failure_latched,
+            api_latch_activated_at_utc=api_latch_activated_at,
             unresolved_orders=unresolved_orders,
             ledger_matches=ledger_matches,
             ledger_cash_difference=ledger_cash_difference,
@@ -239,6 +246,9 @@ class HealthSnapshot:
                 "api_failures": self.api_failures,
                 "api_successes": self.api_successes,
                 "api_failure_latched": self.api_failure_latched,
+                "api_latch_activated_at_utc": _optional_datetime(
+                    self.api_latch_activated_at_utc,
+                ),
                 "unresolved_orders": self.unresolved_orders,
                 "ledger_matches": self.ledger_matches,
                 "ledger_cash_difference": self.ledger_cash_difference,
@@ -302,14 +312,17 @@ class HealthMonitor:
         last_api = _last_api_observation(self._snapshot)
         if last_api is not None and observed <= last_api:
             return self.current_action()
+        failures = self._snapshot.api_failures + 1
+        latched = self._snapshot.api_failure_latched or failures >= 3
+        activation = self._snapshot.api_latch_activated_at_utc
+        if latched and activation is None:
+            activation = observed
         self._snapshot = replace(
             self._snapshot,
-            api_failures=self._snapshot.api_failures + 1,
+            api_failures=failures,
             api_successes=0,
-            api_failure_latched=(
-                self._snapshot.api_failure_latched
-                or self._snapshot.api_failures + 1 >= 3
-            ),
+            api_failure_latched=latched,
+            api_latch_activated_at_utc=activation,
             last_failure_at_utc=observed,
             last_observation_at_utc=_latest_observation(
                 self._snapshot.last_observation_at_utc,
@@ -324,13 +337,17 @@ class HealthMonitor:
         if last_api is not None and observed <= last_api:
             return self.current_action()
         successes = min(_API_SUCCESSES_REQUIRED, self._snapshot.api_successes + 1)
+        latched = (
+            self._snapshot.api_failure_latched
+            and successes < _API_SUCCESSES_REQUIRED
+        )
         self._snapshot = replace(
             self._snapshot,
             api_failures=0,
             api_successes=successes,
-            api_failure_latched=(
-                self._snapshot.api_failure_latched
-                and successes < _API_SUCCESSES_REQUIRED
+            api_failure_latched=latched,
+            api_latch_activated_at_utc=(
+                self._snapshot.api_latch_activated_at_utc if latched else None
             ),
             last_success_at_utc=observed,
             last_observation_at_utc=_latest_observation(
@@ -694,8 +711,28 @@ def _validate_snapshot_relationships(
         raise HealthStateError("API latch contradicts reasons")
     if snapshot.api_failure_latched and snapshot.api_successes >= 3:
         raise HealthStateError("API latch contradicts recovery successes")
-    if snapshot.api_failure_latched and 0 < snapshot.api_failures < 3:
-        raise HealthStateError("API latch contradicts the failure threshold")
+    if snapshot.api_failure_latched != (
+        snapshot.api_latch_activated_at_utc is not None
+    ):
+        raise HealthStateError("API latch lacks activation provenance")
+    if snapshot.api_latch_activated_at_utc is not None and (
+        snapshot.last_failure_at_utc is None
+        or snapshot.api_latch_activated_at_utc > snapshot.last_failure_at_utc
+    ):
+        raise HealthStateError("API latch activation contradicts failure evidence")
+    if snapshot.api_failure_latched and snapshot.api_failures < 3 and (
+        snapshot.last_success_at_utc is None
+        or snapshot.api_latch_activated_at_utc is None
+        or snapshot.last_success_at_utc <= snapshot.api_latch_activated_at_utc
+        or (
+            snapshot.api_failures > 0
+            and (
+                snapshot.last_failure_at_utc is None
+                or snapshot.last_failure_at_utc <= snapshot.last_success_at_utc
+            )
+        )
+    ):
+        raise HealthStateError("API latch provenance lacks partial recovery evidence")
     if snapshot.api_failures >= 3 and not snapshot.api_failure_latched:
         raise HealthStateError("API failures contradict the API latch")
     if snapshot.api_failures > 0 and snapshot.api_successes > 0:
@@ -710,6 +747,12 @@ def _validate_snapshot_relationships(
         or snapshot.last_observation_at_utc < last_api_observation
     ):
         raise HealthStateError("last observation predates an API observation cursor")
+    if (
+        snapshot.api_latch_activated_at_utc is not None
+        and snapshot.last_observation_at_utc is not None
+        and snapshot.api_latch_activated_at_utc > snapshot.last_observation_at_utc
+    ):
+        raise HealthStateError("API latch activation postdates the last observation")
     if snapshot.stage is HealthStage.NORMAL:
         if derived or snapshot.retry_attempts != 0:
             raise HealthStateError("NORMAL health state is contradictory")

@@ -123,6 +123,14 @@ class _HealthGate:
     evidence_version: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedRiskChain:
+    projection: _RiskState
+    latest_base: _RiskState
+    latest_base_event: StoredEvent | None
+    latest_risk_event: StoredEvent | None
+
+
 class PaperService:
     """Run exactly one restart-safe decision cycle for a completed candle."""
 
@@ -163,6 +171,7 @@ class PaperService:
         """Resolve the oldest unfinished cycle exclusively from durable evidence."""
         latest = _require_cycle_end(latest_matured)
         snapshot = self._store.replay_state()
+        risk_chain = _validate_health_and_risk_chain(snapshot)
         reconciliation = self._broker.reconcile()
         completed = _completed_cycle_ends(
             snapshot,
@@ -179,24 +188,8 @@ class PaperService:
         if completed:
             obligations.add(_first_uncompleted_after_cycle_chain(completed))
 
-        risk_state = _risk_state_from_payload(snapshot.breaker_state)
+        risk_state = risk_chain.projection
         if risk_state.last_risk_at is not None:
-            risk_events = tuple(
-                event
-                for event in snapshot.event_evidence
-                if event.event_type == "BREAKER_STATE"
-            )
-            if not risk_events:
-                raise StoreCorruptionError("risk cursor contradicts its event envelope")
-            for risk_event in risk_events:
-                if risk_event.event_id.startswith("risk-health:"):
-                    _validate_health_risk_followup(snapshot, risk_event)
-            last_risk_event = risk_events[-1]
-            if (
-                not last_risk_event.event_id.startswith("risk-health:")
-                and last_risk_event.occurred_at_utc != risk_state.last_risk_at
-            ):
-                raise StoreCorruptionError("risk cursor contradicts its event envelope")
             observed.add(
                 _observed_cycle_end(
                     risk_state.last_risk_at,
@@ -305,7 +298,9 @@ class PaperService:
         if now < end + _MATURITY_DELAY:
             raise ValueError("completed candle must be at least ten minutes old")
         event_id = f"cycle:{_canonical_datetime(end)}"
-        if _has_completed_cycle(self._store.replay_state(), event_id, end, self._broker):
+        initial_snapshot = self._store.replay_state()
+        _validate_health_and_risk_chain(initial_snapshot)
+        if _has_completed_cycle(initial_snapshot, event_id, end, self._broker):
             return CycleResult(CycleStatus.ALREADY_PROCESSED, end)
 
         expires = _safe_add(now, self._lease_ttl, "lease expiry is outside datetime range")
@@ -318,8 +313,10 @@ class PaperService:
             return CycleResult(CycleStatus.LEASE_HELD, end)
 
         try:
+            leased_snapshot = self._store.replay_state()
+            _validate_health_and_risk_chain(leased_snapshot)
             if _has_completed_cycle(
-                self._store.replay_state(),
+                leased_snapshot,
                 event_id,
                 end,
                 self._broker,
@@ -348,7 +345,7 @@ class PaperService:
             ):
                 return CycleResult(CycleStatus.LEASE_HELD, end)
             if _has_completed_cycle(
-                self._store.replay_state(),
+                self._validated_snapshot(),
                 event_id,
                 end,
                 self._broker,
@@ -481,6 +478,11 @@ class PaperService:
         finally:
             self._store.release_cycle_lease(self._lease_owner, self._lease_token)
 
+    def _validated_snapshot(self) -> PaperSnapshot:
+        snapshot = self._store.replay_state()
+        _validate_health_and_risk_chain(snapshot)
+        return snapshot
+
     def _risk_decision(
         self,
         bar_at: datetime,
@@ -488,25 +490,40 @@ class PaperService:
         equity: float,
         reconciliation: PaperReconciliation,
     ) -> RiskDecision:
-        health = _read_health_gate(self._store)
-        stored = _risk_state_from_payload(self._store.replay_state().breaker_state)
+        snapshot = self._store.replay_state()
+        chain = _validate_health_and_risk_chain(snapshot)
+        health = _health_gate_from_snapshot(snapshot)
+        stored = chain.projection
         if stored.last_risk_at is not None:
             if stored.last_risk_at > bar_at:
                 raise PaperServiceError("risk state timestamp is ahead of the current candle")
             if stored.last_risk_at == bar_at:
-                final = _apply_health_action(stored.decision, health.action)
-                if final != stored.decision:
+                base = chain.latest_base
+                if base.last_risk_at != bar_at:
+                    raise StoreCorruptionError("risk projection lacks its canonical base")
+                final = _apply_health_action(base.decision, health.action)
+                expected_overlay_id = None
+                if health.evidence_event_id is not None:
+                    expected_overlay_id = _health_risk_followup_id(bar_at, health)
+                current_is_bound = (
+                    chain.latest_risk_event is not None
+                    and chain.latest_risk_event.event_id == expected_overlay_id
+                    and stored.decision == final
+                )
+                if stored.decision != final or (
+                    final != base.decision and not current_is_bound
+                ):
                     _persist_health_risk_followup(
                         self._store,
                         bar_at=bar_at,
-                        stored=stored,
+                        stored=base,
                         final=final,
                         health=health,
                     )
                     self._fault("after_health_risk_followup")
                 return final
 
-        state = _advance_risk_state(
+        base = _advance_risk_state(
             stored,
             bar_at=bar_at,
             equity=equity,
@@ -517,17 +534,23 @@ class PaperService:
                 health.action is not None and not health.action.halt_entries
             ),
         )
-        state = replace(
-            state,
-            decision=_apply_health_action(state.decision, health.action),
-        )
         self._store.append_event(
             f"risk:{_canonical_datetime(bar_at)}",
             "BREAKER_STATE",
             bar_at,
-            _risk_state_payload(state),
+            _risk_state_payload(base),
         )
-        return state.decision
+        final = _apply_health_action(base.decision, health.action)
+        if final != base.decision:
+            _persist_health_risk_followup(
+                self._store,
+                bar_at=bar_at,
+                stored=base,
+                final=final,
+                health=health,
+            )
+            self._fault("after_health_risk_followup")
+        return final
 
     def _exit_reason(
         self,
@@ -1146,9 +1169,8 @@ def _forced_exit_reason(decision: RiskDecision) -> str | None:
     return None
 
 
-def _read_health_gate(store: SQLiteStore) -> _HealthGate:
+def _health_gate_from_snapshot(snapshot: PaperSnapshot) -> _HealthGate:
     """Bind strict typed health to the immutable event that supplied it."""
-    snapshot = store.replay_state()
     health_events = tuple(
         event
         for event in snapshot.event_evidence
@@ -1234,55 +1256,86 @@ def _health_risk_followup_id(bar_at: datetime, health: _HealthGate) -> str:
     )
 
 
-def _validate_health_risk_followup(
-    snapshot: PaperSnapshot,
-    event: StoredEvent,
-) -> None:
-    prior_risk_events = tuple(
-        candidate
-        for candidate in snapshot.event_evidence
-        if candidate.event_type == "BREAKER_STATE"
-        and candidate.sequence < event.sequence
-    )
-    if not prior_risk_events:
-        raise StoreCorruptionError("health risk followup lacks prior risk evidence")
-    prior = _risk_state_from_payload(prior_risk_events[-1].payload)
-    final = _risk_state_from_payload(event.payload)
-    if prior.last_risk_at is None or final.last_risk_at != prior.last_risk_at:
-        raise StoreCorruptionError("health risk followup changes the risk cursor")
+def _validate_health_and_risk_chain(snapshot: PaperSnapshot) -> _ValidatedRiskChain:
+    """Validate every breaker transition and its health evidence before mutation."""
+    _health_gate_from_snapshot(snapshot)
+    health_events: list[StoredEvent] = []
+    latest_base = _RiskState()
+    projection = _RiskState()
+    latest_base_event: StoredEvent | None = None
+    latest_risk_event: StoredEvent | None = None
+    previous_event: StoredEvent | None = None
 
-    prior_health_events = tuple(
-        health_event
-        for health_event in snapshot.event_evidence
-        if health_event.sequence < event.sequence
-        and health_event.event_type == "HEALTH_STATE"
-    )
-    gate = _health_gate_from_events(prior_health_events)
-    if (
-        gate.evidence_event_id is None
-        or _health_risk_followup_id(prior.last_risk_at, gate) != event.event_id
-    ):
-        raise StoreCorruptionError("health risk followup is not bound to one health event")
-    expected = replace(
-        prior,
-        decision=_apply_health_action(prior.decision, gate.action),
-    )
-    if final != expected or final.decision == prior.decision:
-        raise StoreCorruptionError("health risk followup decision is inconsistent")
+    for event in snapshot.event_evidence:
+        if event.event_type == "HEALTH_STATE":
+            health_events.append(event)
+        if event.event_type != "BREAKER_STATE":
+            previous_event = event
+            continue
 
-    preceding = tuple(
-        candidate
-        for candidate in snapshot.event_evidence
-        if candidate.sequence < event.sequence
+        candidate = _risk_state_from_payload(event.payload)
+        if event.event_id.startswith("risk-health:"):
+            if latest_base_event is None or latest_base.last_risk_at is None:
+                raise StoreCorruptionError("health risk followup lacks canonical base")
+            if candidate.last_risk_at != latest_base.last_risk_at:
+                raise StoreCorruptionError("health risk followup changes the risk cursor")
+            gate = _health_gate_from_events(tuple(health_events))
+            if (
+                gate.evidence_event_id is None
+                or _health_risk_followup_id(latest_base.last_risk_at, gate)
+                != event.event_id
+            ):
+                raise StoreCorruptionError(
+                    "health risk followup is not bound to the latest health event"
+                )
+            expected = replace(
+                latest_base,
+                decision=_apply_health_action(latest_base.decision, gate.action),
+            )
+            if candidate != expected:
+                raise StoreCorruptionError("health risk followup decision is inconsistent")
+            expected_occurred_at = latest_base.last_risk_at
+            if previous_event is not None:
+                expected_occurred_at = max(
+                    expected_occurred_at,
+                    previous_event.occurred_at_utc,
+                )
+            if event.occurred_at_utc != expected_occurred_at:
+                raise StoreCorruptionError("health risk followup timestamp is inconsistent")
+            projection = candidate
+        else:
+            if candidate.last_risk_at is None:
+                raise StoreCorruptionError("canonical risk event lacks its cursor")
+            expected_id = f"risk:{_canonical_datetime(candidate.last_risk_at)}"
+            if event.event_id != expected_id:
+                raise StoreCorruptionError("breaker event identity is not canonical")
+            if event.occurred_at_utc != candidate.last_risk_at:
+                raise StoreCorruptionError("risk cursor contradicts its event envelope")
+            if "health_recovery_reduced" in candidate.decision.reasons:
+                raise StoreCorruptionError("canonical risk event contains an unbound health marker")
+            if (
+                latest_base.last_risk_at is not None
+                and candidate.last_risk_at <= latest_base.last_risk_at
+            ):
+                raise StoreCorruptionError("canonical risk cursors are not strictly increasing")
+            latest_base = candidate
+            projection = candidate
+            latest_base_event = event
+
+        latest_risk_event = event
+        previous_event = event
+
+    if latest_risk_event is None:
+        if snapshot.breaker_state:
+            raise StoreCorruptionError("breaker projection has no event evidence")
+    elif _risk_state_from_payload(snapshot.breaker_state) != projection:
+        raise StoreCorruptionError("breaker projection contradicts event evidence")
+    return _ValidatedRiskChain(
+        projection=projection,
+        latest_base=latest_base,
+        latest_base_event=latest_base_event,
+        latest_risk_event=latest_risk_event,
     )
-    expected_occurred_at = prior.last_risk_at
-    if preceding:
-        expected_occurred_at = max(
-            expected_occurred_at,
-            preceding[-1].occurred_at_utc,
-        )
-    if event.occurred_at_utc != expected_occurred_at:
-        raise StoreCorruptionError("health risk followup timestamp is inconsistent")
 
 
 def _apply_health_action(
@@ -1294,8 +1347,6 @@ def _apply_health_action(
             return decision
         return RiskDecision(0.0, 0.0, None, ("system_unhealthy",))
     if not health.resume_reduced:
-        return decision
-    if "health_recovery_reduced" in decision.reasons:
         return decision
     if (
         decision.halted_until is not None
