@@ -4,6 +4,7 @@ import json
 import math
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -543,6 +544,195 @@ def test_two_store_instances_contend_safely_for_one_idempotency_key(tmp_path: Pa
     assert results == [False, True]
     assert first.replay_state() == second.replay_state()
     assert len(first.replay_state().pending_orders) == 1
+
+
+def test_two_store_instances_atomically_contend_for_one_cycle_lease(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    first = _open_store(path)
+    second = _open_store(path)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    expires = now + timedelta(minutes=5)
+
+    def acquire(candidate: tuple[SQLiteStore, str, str]) -> bool:
+        store, owner, token = candidate
+        return store.acquire_cycle_lease(owner, token, now, expires)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = sorted(
+            executor.map(
+                acquire,
+                ((first, "worker-a", "token-a"), (second, "worker-b", "token-b")),
+            )
+        )
+
+    assert results == [False, True]
+
+
+def test_cycle_lease_expires_renews_and_only_exact_holder_can_release(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    first = _open_store(path)
+    second = _open_store(path)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    assert first.acquire_cycle_lease("worker-a", "token-a", now, now + timedelta(minutes=5))
+    assert first.acquire_cycle_lease(
+        "worker-a",
+        "token-a",
+        now + timedelta(minutes=1),
+        now + timedelta(minutes=6),
+    )
+    assert not second.acquire_cycle_lease(
+        "worker-b",
+        "token-b",
+        now + timedelta(minutes=5),
+        now + timedelta(minutes=10),
+    )
+    assert not second.release_cycle_lease("worker-b", "token-b")
+    assert second.acquire_cycle_lease(
+        "worker-b",
+        "token-b",
+        now + timedelta(minutes=6),
+        now + timedelta(minutes=11),
+    )
+    assert not first.release_cycle_lease("worker-a", "token-a")
+    assert second.release_cycle_lease("worker-b", "token-b")
+    assert not second.release_cycle_lease("worker-b", "token-b")
+
+
+def test_expired_cycle_lease_is_recoverable_after_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first = _open_store(path)
+    assert first.acquire_cycle_lease("worker-a", "token-a", now, now + timedelta(minutes=5))
+    first.close()
+
+    reopened = _open_store(path)
+    assert reopened.acquire_cycle_lease(
+        "worker-b",
+        "token-b",
+        now + timedelta(minutes=5),
+        now + timedelta(minutes=10),
+    )
+
+
+@pytest.mark.parametrize(
+    ("owner", "token", "now", "expires"),
+    [
+        (
+            "",
+            "token",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, 4, tzinfo=timezone.utc),
+        ),
+        (
+            "worker",
+            "",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, 4, tzinfo=timezone.utc),
+        ),
+        (
+            "worker",
+            "token",
+            datetime(2026, 1, 1),
+            datetime(2026, 1, 1, 4, tzinfo=timezone.utc),
+        ),
+        (
+            "worker",
+            "token",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, 4),
+        ),
+        (
+            "worker",
+            "token",
+            datetime(2026, 1, 1, 4, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, 4, tzinfo=timezone.utc),
+        ),
+        (
+            "worker",
+            "token",
+            datetime(2026, 1, 1, 4, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_cycle_lease_rejects_invalid_identity_and_time_range(
+    tmp_path: Path,
+    owner: str,
+    token: str,
+    now: datetime,
+    expires: datetime,
+) -> None:
+    store = _open_store(tmp_path / "paper.sqlite3")
+
+    with pytest.raises(ValueError):
+        store.acquire_cycle_lease(owner, token, now, expires)
+
+
+def test_outer_transaction_rollback_restores_the_prior_cycle_lease(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    competing = _open_store(path)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    with pytest.raises(RuntimeError, match="injected crash"):
+        with store.transaction():
+            assert store.acquire_cycle_lease(
+                "worker-a",
+                "token-a",
+                now,
+                now + timedelta(minutes=5),
+            )
+            raise RuntimeError("injected crash")
+
+    assert competing.acquire_cycle_lease(
+        "worker-b",
+        "token-b",
+        now,
+        now + timedelta(minutes=5),
+    )
+
+
+@pytest.mark.parametrize(
+    "stored_value",
+    [
+        "{",
+        '{"owner":"worker","token":"token","expires_at_utc":"2026-01-01T04:00:00Z"}',
+        '{"expires_at_utc":"2026-01-01T04:00:00Z","extra":1,"owner":"worker","token":"token"}',
+        '{"expires_at_utc":"2026-01-01T04:00:00","owner":"worker","token":"token"}',
+        '{"expires_at_utc":"2026-01-01T04:00:00Z","owner":"","token":"token"}',
+    ],
+)
+def test_corrupt_cycle_lease_metadata_fails_closed_on_reopen(
+    tmp_path: Path,
+    stored_value: str,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO metadata (key, value) VALUES ('paper_cycle_lease', ?)",
+            (stored_value,),
+        )
+
+    reopened = SQLiteStore(path)
+    with pytest.raises(StoreCorruptionError, match="cycle lease"):
+        reopened.initialize()
+
+
+def test_unknown_metadata_key_remains_corruption_when_cycle_lease_is_allowed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("INSERT INTO metadata VALUES ('unexpected', 'value')")
+
+    reopened = SQLiteStore(path)
+    with pytest.raises(StoreCorruptionError, match="metadata keys"):
+        reopened.initialize()
 
 
 def test_corrupt_event_json_fails_closed(tmp_path: Path) -> None:

@@ -31,6 +31,7 @@ _INITIAL_EQUITY = 100.0
 _TOLERANCE = 1e-10
 _EPOCH = "1970-01-01T00:00:00Z"
 _EMPTY_EVENT_DIGEST = sha256(b"").hexdigest()
+_CYCLE_LEASE_KEY = "paper_cycle_lease"
 _UTC_Z_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$",
 )
@@ -333,6 +334,79 @@ class SQLiteStore:
         with self._transaction(require_initialized=True) as connection:
             yield _TransactionFacade(connection)
             self._replay_and_verify(connection)
+
+    def acquire_cycle_lease(
+        self,
+        owner: str,
+        token: str,
+        now_utc: datetime,
+        expires_at_utc: datetime,
+    ) -> bool:
+        """Atomically acquire or renew the one paper-cycle process lease."""
+        normalized_owner = _nonempty_text(owner, "lease owner must be non-empty")
+        normalized_token = _nonempty_text(token, "lease token must be non-empty")
+        _, now = _canonical_timestamp(now_utc)
+        expires_text, expires = _canonical_timestamp(expires_at_utc)
+        if expires <= now:
+            raise ValueError("lease expiry must be strictly after now")
+        value = _canonical_json_value(
+            {
+                "expires_at_utc": expires_text,
+                "owner": normalized_owner,
+                "token": normalized_token,
+            }
+        )
+
+        with self._mutation_transaction() as connection:
+            self._replay_and_verify(connection)
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (_CYCLE_LEASE_KEY,),
+            ).fetchone()
+            if row is not None:
+                current_owner, current_token, current_expiry = _cycle_lease_metadata(
+                    row["value"],
+                    corruption=True,
+                )
+                same_holder = (
+                    current_owner == normalized_owner and current_token == normalized_token
+                )
+                if not same_holder and current_expiry > now:
+                    return False
+                connection.execute(
+                    "UPDATE metadata SET value = ? WHERE key = ?",
+                    (value, _CYCLE_LEASE_KEY),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    (_CYCLE_LEASE_KEY, value),
+                )
+            return True
+
+    def release_cycle_lease(self, owner: str, token: str) -> bool:
+        """Release the paper-cycle lease only for its exact owner and token."""
+        normalized_owner = _nonempty_text(owner, "lease owner must be non-empty")
+        normalized_token = _nonempty_text(token, "lease token must be non-empty")
+        with self._mutation_transaction() as connection:
+            self._replay_and_verify(connection)
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (_CYCLE_LEASE_KEY,),
+            ).fetchone()
+            if row is None:
+                return False
+            current_owner, current_token, _ = _cycle_lease_metadata(
+                row["value"],
+                corruption=True,
+            )
+            if current_owner != normalized_owner or current_token != normalized_token:
+                return False
+            connection.execute(
+                "DELETE FROM metadata WHERE key = ?",
+                (_CYCLE_LEASE_KEY,),
+            )
+            return True
 
     def append_event(
         self,
@@ -888,7 +962,11 @@ class SQLiteStore:
                 "SELECT key, value FROM metadata ORDER BY key",
             ).fetchall()
             metadata = {str(row["key"]): str(row["value"]) for row in metadata_rows}
-            if set(metadata) != {"initial_equity", "market"}:
+            metadata_keys = set(metadata)
+            if metadata_keys not in (
+                {"initial_equity", "market"},
+                {"initial_equity", "market", _CYCLE_LEASE_KEY},
+            ):
                 raise StoreCorruptionError("metadata keys are inconsistent")
             if metadata["market"] != _MARKET:
                 raise StoreCorruptionError(
@@ -899,6 +977,8 @@ class SQLiteStore:
                 raise StoreCorruptionError(
                     f"stored initial equity is not 100: {metadata['initial_equity']}",
                 )
+            if _CYCLE_LEASE_KEY in metadata:
+                _cycle_lease_metadata(metadata[_CYCLE_LEASE_KEY], corruption=True)
         except StoreCorruptionError:
             raise
         except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError, KeyError) as error:
@@ -1794,6 +1874,34 @@ def _canonical_payload(
     normalized = _normalize_json(payload)
     assert isinstance(normalized, dict)
     return _canonical_json_value(normalized), normalized
+
+
+def _cycle_lease_metadata(
+    value: object,
+    *,
+    corruption: bool,
+) -> tuple[str, str, datetime]:
+    error_type: type[Exception] = StoreCorruptionError if corruption else ValueError
+    try:
+        if not isinstance(value, str):
+            raise ValueError("lease metadata must be text")
+        payload = json.loads(value)
+        if not isinstance(payload, dict) or set(payload) != {
+            "expires_at_utc",
+            "owner",
+            "token",
+        }:
+            raise ValueError("lease metadata has invalid fields")
+        if _canonical_json_value(payload) != value:
+            raise ValueError("lease metadata is not canonical")
+        owner = _nonempty_text(payload["owner"], "lease owner must be non-empty")
+        token = _nonempty_text(payload["token"], "lease token must be non-empty")
+        expires_text, expires = _canonical_timestamp(payload["expires_at_utc"])
+        if expires_text != payload["expires_at_utc"]:
+            raise ValueError("lease expiry must be canonical UTC")
+        return owner, token, expires
+    except (json.JSONDecodeError, TypeError, ValueError, OverflowError, KeyError) as error:
+        raise error_type("paper cycle lease metadata is invalid") from error
 
 
 def _canonical_json_value(value: object) -> str:
