@@ -228,6 +228,95 @@ def test_scheduler_reads_dynamic_health_delay_once_after_each_failure() -> None:
     assert sleeper.delays == [1.0, 2.0, 4.0, 8.0, 16.0, 300.0, 300.0]
 
 
+def test_scheduler_resolver_failures_have_one_retry_sleep_boundary() -> None:
+    class ResolverFailure(_RecordingService):
+        def oldest_required_end(self, latest_matured: datetime) -> datetime:
+            self.resolved_latest.append(latest_matured)
+            raise RuntimeError("resolver corruption")
+
+    delays = iter((1.0, 2.0, 4.0))
+    provider_calls = 0
+
+    def current_delay() -> float:
+        nonlocal provider_calls
+        provider_calls += 1
+        return next(delays)
+
+    clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
+    sleeper = _AdvancingSleeper(clock)
+    scheduler = PaperScheduler(
+        ResolverFailure(),
+        clock,
+        sleeper,
+        retry_delay_provider=current_delay,
+    )
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="resolver corruption"):
+            scheduler.run_once()
+
+    assert provider_calls == 3
+    assert sleeper.delays == [1.0, 2.0, 4.0]
+
+
+def test_scheduler_uses_one_300_second_failsafe_when_delay_provider_fails() -> None:
+    class ResolverFailure(_RecordingService):
+        def oldest_required_end(self, latest_matured: datetime) -> datetime:
+            del latest_matured
+            raise RuntimeError("original resolver failure")
+
+    provider_calls = 0
+
+    def unreadable_health_delay() -> float:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise RuntimeError("health store unreadable")
+
+    clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
+    sleeper = _AdvancingSleeper(clock)
+    scheduler = PaperScheduler(
+        ResolverFailure(),
+        clock,
+        sleeper,
+        retry_delay_provider=unreadable_health_delay,
+    )
+
+    with pytest.raises(RuntimeError, match="original resolver failure"):
+        scheduler.run_once()
+
+    assert provider_calls == 1
+    assert sleeper.delays == [300.0]
+
+
+def test_scheduler_process_failure_keeps_one_failsafe_sleep_if_provider_fails() -> None:
+    class ProcessFailure(_RecordingService):
+        def process_completed_candle(self, end_utc: datetime) -> str:
+            self.ends.append(end_utc)
+            raise RuntimeError("original process failure")
+
+    provider_calls = 0
+
+    def unreadable_health_delay() -> float:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise RuntimeError("health store unreadable")
+
+    clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
+    sleeper = _AdvancingSleeper(clock)
+    scheduler = PaperScheduler(
+        ProcessFailure(),
+        clock,
+        sleeper,
+        retry_delay_provider=unreadable_health_delay,
+    )
+
+    with pytest.raises(RuntimeError, match="original process failure"):
+        scheduler.run_once()
+
+    assert provider_calls == 1
+    assert sleeper.delays == [300.0]
+
+
 def test_scheduler_retries_lease_held_end_then_advances_after_completion() -> None:
     clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
     sleeper = _AdvancingSleeper(clock)

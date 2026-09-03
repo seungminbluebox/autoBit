@@ -12,6 +12,7 @@ import pytest
 from autobit.cli import (
     _PaperApplication,
     _PublicPaperCandleSource,
+    _validated_paper_frame,
     build_parser,
     main,
 )
@@ -356,6 +357,132 @@ def test_corrupt_public_cache_fails_before_network_and_is_not_replaced(
     assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
 
 
+def test_checkpointless_corrupt_collection_snapshot_fails_before_network(
+    tmp_path: Path,
+) -> None:
+    identity = sha256(END.isoformat().replace("+00:00", "Z").encode("utf-8")).hexdigest()
+    evidence_root = tmp_path / "KRW-BTC-240" / identity
+    evidence_root.mkdir(parents=True)
+    artifact = evidence_root / f"collection-{'0' * 64}.json"
+    artifact.write_bytes(b"{malformed")
+    before = _ledger_file_image(artifact)
+    client = _PublicClient([])
+
+    with pytest.raises(ValueError, match="evidence|snapshot|hash|malformed"):
+        _PublicPaperCandleSource(tmp_path, client=client).load_completed_candles(END)
+
+    assert client.calls == []
+    assert _ledger_file_image(artifact) == before
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "hash_mismatch",
+        "invalid_json",
+        "invalid_schema",
+        "range_mismatch",
+        "config_mismatch",
+        "source_mismatch",
+        "unknown_evidence",
+    ],
+)
+def test_checkpointless_invalid_or_unknown_paper_evidence_fails_closed(
+    tmp_path: Path,
+    defect: str,
+) -> None:
+    start = END - timedelta(hours=4 * 601)
+    rows = [_raw_row(start - timedelta(hours=4))]
+    rows.extend(_raw_row(start + timedelta(hours=4 * index)) for index in range(601))
+    _PublicPaperCandleSource(
+        tmp_path,
+        client=_PublicClient(list(reversed(rows))),
+    ).load_completed_candles(END)
+    evidence_root = next(path.parent for path in tmp_path.rglob("checkpoint.json"))
+    (evidence_root / "checkpoint.json").unlink()
+    valid_snapshot = sorted(evidence_root.glob("collection-*.json"))[-1]
+    state = json.loads(valid_snapshot.read_text(encoding="utf-8"))
+    if defect == "hash_mismatch":
+        valid_snapshot.write_bytes(b"{}")
+    elif defect == "invalid_json":
+        contents = b"{invalid-json"
+        digest = sha256(contents).hexdigest()
+        (evidence_root / f"collection-{digest}.json").write_bytes(contents)
+    elif defect == "unknown_evidence":
+        (evidence_root / "unknown-evidence.json").write_text("{}", encoding="utf-8")
+    else:
+        if defect == "invalid_schema":
+            state["unexpected"] = True
+        elif defect == "range_mismatch":
+            state["end_utc"] = "2026-05-11T08:00:00Z"
+        elif defect == "config_mismatch":
+            state["config"]["years"] = 8
+        else:
+            state["source_url"] = "https://example.invalid/candles"
+        contents = json.dumps(
+            state,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = sha256(contents).hexdigest()
+        (evidence_root / f"collection-{digest}.json").write_bytes(contents)
+    before = {
+        path: path.read_bytes() for path in evidence_root.iterdir() if path.is_file()
+    }
+    client = _PublicClient([])
+
+    with pytest.raises(ValueError, match="evidence|snapshot|hash|schema|collection"):
+        _PublicPaperCandleSource(tmp_path, client=client).load_completed_candles(END)
+
+    assert client.calls == []
+    assert {
+        path: path.read_bytes() for path in evidence_root.iterdir() if path.is_file()
+    } == before
+
+
+def test_checkpointless_valid_paper_snapshot_resumes_without_network(
+    tmp_path: Path,
+) -> None:
+    start = END - timedelta(hours=4 * 601)
+    rows = [_raw_row(start - timedelta(hours=4))]
+    rows.extend(_raw_row(start + timedelta(hours=4 * index)) for index in range(601))
+    first = _PublicClient(list(reversed(rows)))
+    expected = _PublicPaperCandleSource(tmp_path, client=first).load_completed_candles(END)
+    checkpoint = next(tmp_path.rglob("checkpoint.json"))
+    checkpoint.unlink()
+    second = _PublicClient([])
+
+    resumed = _PublicPaperCandleSource(tmp_path, client=second).load_completed_candles(END)
+
+    assert second.calls == []
+    pd.testing.assert_frame_equal(resumed, expected)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["missing_first", "duplicate", "eight_hour_gap", "end_row", "future_row"],
+)
+def test_paper_frame_rejects_nonexact_raw_601_bar_evidence(defect: str) -> None:
+    frame = _history(END)
+    if defect == "missing_first":
+        frame = frame.iloc[1:]
+    elif defect == "eight_hour_gap":
+        frame = frame.drop(frame.index[300])
+    else:
+        index = frame.index.to_list()
+        if defect == "duplicate":
+            index[300] = index[299]
+        elif defect == "end_row":
+            index[-1] = pd.Timestamp(END)
+        else:
+            index[-1] = pd.Timestamp(END + timedelta(hours=4))
+        frame.index = pd.DatetimeIndex(index)
+
+    with pytest.raises(ValueError, match="candle|history|timestamp|exclusive"):
+        _validated_paper_frame(frame, END)
+
+
 def test_application_persists_three_failures_three_successes_and_auto_promotes(
     tmp_path: Path,
 ) -> None:
@@ -373,7 +500,7 @@ def test_application_persists_three_failures_three_successes_and_auto_promotes(
             _history(END),
             _history(END),
             _history(END),
-            _history(next_end, 602),
+            _history(next_end),
         ]
     )
     app = _PaperApplication(
@@ -516,6 +643,59 @@ def test_health_cursor_rejects_forged_alert_identity_or_payload_chain(
     assert source.calls == []
 
 
+def test_halted_same_end_preflight_rejects_forged_alert_before_source_or_append(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    clock = _Clock(END + timedelta(minutes=10))
+    sleeper = _Sleeper(clock)
+    source = _FrameSource([_history(END), _history(END)])
+    app = _PaperApplication(
+        source=source,
+        store=store,
+        clock=clock,
+        sleeper=sleeper,
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="halted-worker",
+        lease_token="halted-token",
+    )
+    assert app.run_once().status is CycleStatus.PROCESSED
+    monitor = HealthMonitor.from_store(store)
+    for offset in (11, 12, 13):
+        observed = END + timedelta(minutes=offset)
+        monitor.record_api_failure(observed)
+        monitor.persist(
+            store,
+            event_id=f"health:halted:{offset}",
+            logical_at=observed,
+        )
+    source_event = store.replay_state().event_evidence[-1]
+    store.append_event(
+        "alert-attempt:forged",
+        "ALERT_ATTEMPT",
+        END + timedelta(minutes=14),
+        {
+            "source_event_id": source_event.event_id,
+            "source_event_type": "HEALTH_STATE",
+            "version": 1,
+        },
+    )
+    before_sequence = store.replay_state().last_sequence
+    before_image = _ledger_file_image(path)
+    before_source_calls = tuple(source.calls)
+
+    with pytest.raises(RuntimeError, match="alert evidence"):
+        app.run_once()
+
+    assert tuple(source.calls) == before_source_calls
+    assert store.replay_state().last_sequence == before_sequence
+    assert _ledger_file_image(path) == before_image
+    assert sleeper.delays == [1.0]
+
+
 @pytest.mark.parametrize(
     "broken",
     [
@@ -621,6 +801,7 @@ def test_paper_run_continues_recoverable_error_then_ctrl_c_rolls_back_active_bou
                 raise KeyboardInterrupt
 
     holder: dict[str, InterruptingApplication] = {}
+    fallback_delays: list[float] = []
 
     def factory(arguments, store, notifier):
         del arguments, notifier
@@ -628,6 +809,7 @@ def test_paper_run_continues_recoverable_error_then_ctrl_c_rolls_back_active_bou
         return holder["app"]
 
     monkeypatch.setattr("autobit.cli._new_paper_application", factory)
+    monkeypatch.setattr("autobit.cli.time.sleep", fallback_delays.append)
 
     assert main(
         ["paper-run", "--db", str(path), "--data-dir", str(tmp_path / "evidence")]
@@ -636,9 +818,46 @@ def test_paper_run_continues_recoverable_error_then_ctrl_c_rolls_back_active_bou
     captured = capsys.readouterr()
     assert "secret detail" not in captured.err
     assert holder["app"].calls == 2
+    assert fallback_delays == [300.0]
     reopened = SQLiteStore(path)
     reopened.initialize()
     assert not any(
         event.event_id == "must-roll-back"
         for event in reopened.replay_state().event_evidence
     )
+
+
+def test_paper_run_does_not_double_sleep_an_application_owned_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DelayedApplication:
+        calls = 0
+        retry_delay_applied = True
+
+        def run_once(self) -> object:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("already delayed")
+            raise KeyboardInterrupt
+
+    application = DelayedApplication()
+    fallback_delays: list[float] = []
+    monkeypatch.setattr(
+        "autobit.cli._new_paper_application",
+        lambda arguments, store, notifier: application,
+    )
+    monkeypatch.setattr("autobit.cli.time.sleep", fallback_delays.append)
+
+    assert main(
+        [
+            "paper-run",
+            "--db",
+            str(tmp_path / "paper.sqlite3"),
+            "--data-dir",
+            str(tmp_path / "evidence"),
+        ]
+    ) == 130
+
+    assert application.calls == 2
+    assert fallback_delays == []

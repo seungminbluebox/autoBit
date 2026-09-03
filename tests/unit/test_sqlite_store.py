@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -1199,6 +1200,89 @@ def test_read_only_open_sees_committed_wal_tail_without_mutating_database_or_wal
             blocked.append_event("forbidden", "CYCLE_EVIDENCE", UTC_4, {})
     finally:
         blocked.close()
+
+
+@pytest.mark.parametrize("alias_kind", ["hardlink", "symlink"])
+def test_read_only_open_rejects_database_alias_before_it_can_omit_target_wal(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    target_dir = tmp_path / "target"
+    alias_dir = tmp_path / "alias"
+    target_dir.mkdir()
+    alias_dir.mkdir()
+    target = target_dir / "paper.sqlite3"
+    writer = _open_store(target)
+    writer.append_event("health:wal-tail", "CYCLE_EVIDENCE", UTC_0, {"value": 1})
+    wal = Path(f"{target}-wal")
+    assert wal.exists()
+    alias = alias_dir / "paper.sqlite3"
+    if alias_kind == "hardlink":
+        os.link(target, alias)
+    else:
+        try:
+            alias.symlink_to(target)
+        except OSError as error:
+            pytest.skip(f"symbolic links are unavailable: {error}")
+    before = {
+        path: (path.read_bytes(), path.stat().st_size, path.stat().st_mtime_ns)
+        for path in (target, wal, alias)
+    }
+    before_files = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")))
+
+    with pytest.raises(StoreError, match="alias|regular"):
+        SQLiteStore.open_read_only(alias)
+
+    assert {
+        path: (path.read_bytes(), path.stat().st_size, path.stat().st_mtime_ns)
+        for path in (target, wal, alias)
+    } == before
+    assert tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))) == before_files
+
+
+def test_read_only_open_rejects_aliased_parent_chain(tmp_path: Path) -> None:
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target = target_dir / "paper.sqlite3"
+    store = _open_store(target)
+    store.close()
+    alias_parent = tmp_path / "alias-parent"
+    try:
+        alias_parent.symlink_to(target_dir, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symbolic links are unavailable: {error}")
+
+    with pytest.raises(StoreError, match="aliased parent"):
+        SQLiteStore.open_read_only(alias_parent / target.name)
+
+
+def test_read_only_open_detects_file_swap_between_identity_check_and_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.close()
+    original = path.read_bytes()
+    backup = tmp_path / "original.sqlite3"
+    original_read_bytes = Path.read_bytes
+    swapped = False
+
+    def swap_before_read(candidate: Path) -> bytes:
+        nonlocal swapped
+        if candidate == path and not swapped:
+            swapped = True
+            path.replace(backup)
+            path.symlink_to(backup)
+        return original_read_bytes(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", swap_before_read)
+
+    with pytest.raises(StoreError, match="alias|regular"):
+        SQLiteStore.open_read_only(path)
+
+    assert swapped
+    assert original_read_bytes(backup) == original
 
 
 def _table_names(path: Path) -> set[str]:

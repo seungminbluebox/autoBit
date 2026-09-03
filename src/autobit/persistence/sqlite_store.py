@@ -15,9 +15,11 @@ from decimal import Decimal
 from hashlib import sha256
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import tempfile
 import threading
 from types import MappingProxyType
@@ -269,9 +271,8 @@ class SQLiteStore:
     @classmethod
     def open_read_only(cls, path: str | Path) -> SQLiteStore:
         """Open and fully verify an existing ledger without initialization writes."""
-        resolved = Path(path)
-        if not resolved.is_file():
-            raise StoreError("read-only store requires an existing database file")
+        resolved = Path(os.path.abspath(path))
+        _literal_regular_file_identity(resolved, required=True)
         temporary = tempfile.TemporaryDirectory(prefix="autobit-status-")
         snapshot_path = Path(temporary.name) / resolved.name
         try:
@@ -1477,10 +1478,10 @@ def _copy_stable_sqlite_snapshot(source: Path, destination: Path) -> None:
     wal_source = Path(f"{source}-wal")
 
     def capture() -> tuple[bytes, bytes | None]:
-        main = source.read_bytes()
-        wal = wal_source.read_bytes() if wal_source.exists() else None
-        if wal_source.exists() != (wal is not None):
-            raise OSError("SQLite WAL changed while taking a read-only snapshot")
+        main = _read_literal_regular_file(source, required=True)
+        if main is None:  # Defensive: ``required=True`` rejects absence.
+            raise StoreError("read-only store requires an existing regular database file")
+        wal = _read_literal_regular_file(wal_source, required=False)
         return main, wal
 
     stable: tuple[bytes, bytes | None] | None = None
@@ -1499,6 +1500,65 @@ def _copy_stable_sqlite_snapshot(source: Path, destination: Path) -> None:
     destination.write_bytes(main)
     if wal is not None:
         Path(f"{destination}-wal").write_bytes(wal)
+
+
+def _read_literal_regular_file(path: Path, *, required: bool) -> bytes | None:
+    before = _literal_regular_file_identity(path, required=required)
+    if before is None:
+        return None
+    contents = path.read_bytes()
+    after = _literal_regular_file_identity(path, required=True)
+    if before != after:
+        raise OSError("SQLite source changed while taking a read-only snapshot")
+    return contents
+
+
+def _literal_regular_file_identity(
+    path: Path,
+    *,
+    required: bool,
+) -> tuple[int, int, int, int, int, int] | None:
+    _require_safe_parent_chain(path.parent)
+    try:
+        details = os.lstat(path)
+    except FileNotFoundError:
+        if required:
+            raise StoreError("read-only store requires an existing regular database file") from None
+        return None
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_nlink != 1
+        or _is_reparse_point(details)
+    ):
+        raise StoreError("read-only store rejects database aliases and non-regular files")
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_nlink,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+def _require_safe_parent_chain(parent: Path) -> None:
+    current = Path(os.path.abspath(parent))
+    while True:
+        try:
+            details = os.lstat(current)
+        except FileNotFoundError as error:
+            raise StoreError("read-only store parent path is missing") from error
+        if not stat.S_ISDIR(details.st_mode) or _is_reparse_point(details):
+            raise StoreError("read-only store rejects aliased parent paths")
+        if current.parent == current:
+            return
+        current = current.parent
+
+
+def _is_reparse_point(details: os.stat_result) -> bool:
+    attributes = getattr(details, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
 
 
 def _initial_snapshot() -> PaperSnapshot:

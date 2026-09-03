@@ -25,6 +25,7 @@ from autobit.alerts.notifier import Notifier, SafeNotifier, TelegramNotifier, de
 from autobit.config import CostConfig, DataConfig, ExchangeRulesConfig, StrategyConfig
 from autobit.data.collector import collect_evidence_range, load_completed_evidence_frame
 from autobit.data.quality import QualityReport, canonicalize_ohlcv
+from autobit.data import storage as data_storage
 from autobit.data.storage import _atomic_write, _canonical_json_bytes
 from autobit.data.upbit_public import PublicDataUnavailable, UpbitPublicClient
 from autobit.execution.paper_broker import PaperBroker, PaperReconciliation
@@ -319,23 +320,38 @@ class _PublicPaperCandleSource:
             not evidence_root.is_dir() or evidence_root.is_symlink()
         ):
             raise ValueError("paper candle evidence path is invalid")
+        paper_config = DataConfig()
         if self._client is None:
             with httpx.Client() as http_client:
-                client = UpbitPublicClient(http_client, DataConfig())
+                client = UpbitPublicClient(http_client, paper_config)
+                _validate_checkpointless_paper_evidence(
+                    evidence_root,
+                    source_url=client.source_url,
+                    start=_format_utc(start),
+                    end=_format_utc(end),
+                    config=paper_config,
+                )
                 collected = collect_evidence_range(
                     client,
                     _format_utc(start),
                     _format_utc(end),
                     evidence_root=evidence_root,
-                    config=DataConfig(),
+                    config=paper_config,
                 )
         else:
+            _validate_checkpointless_paper_evidence(
+                evidence_root,
+                source_url=self._client.source_url,
+                start=_format_utc(start),
+                end=_format_utc(end),
+                config=paper_config,
+            )
             collected = collect_evidence_range(
                 self._client,
                 _format_utc(start),
                 _format_utc(end),
                 evidence_root=evidence_root,
-                config=DataConfig(),
+                config=paper_config,
             )
         raw = collected.frame
         if "market" not in raw or not raw["market"].eq("KRW-BTC").all():
@@ -497,6 +513,7 @@ class _PaperApplication:
         self._costs = costs
         self._broker = PaperBroker(store, costs)
         self._source = _ObservedCandleSource(source, store, clock, notifier)
+        self._retry_delay_applied = False
         service = PaperService(
             source=self._source,
             store=store,
@@ -509,12 +526,19 @@ class _PaperApplication:
         self._service = _OperationalPaperService(service, self._source)
 
     def run_once(self) -> CycleResult:
+        self._retry_delay_applied = False
+        try:
+            self._preflight()
+        except Exception:
+            self._sleep_failsafe_retry()
+            raise
         now = _clock_now(self._clock)
         current_end = latest_completed_end(now)
         action = HealthMonitor.from_store(self._store).current_action()
         if action.stage is HealthStage.HALTED and self._is_completed(current_end):
             if action.retry_delay_seconds > 0:
                 self._sleeper.sleep(float(action.retry_delay_seconds))
+                self._retry_delay_applied = True
             self._source.prepare(current_end)
             self._record_reconciliation(current_end, ())
             refreshed = HealthMonitor.from_store(self._store).current_action()
@@ -531,13 +555,39 @@ class _PaperApplication:
             self._sleeper,
             retry_delay_provider=self._retry_delay,
         )
-        result = scheduler.run_once()
+        try:
+            result = scheduler.run_once()
+        except Exception:
+            self._retry_delay_applied = True
+            raise
         if result.status in {CycleStatus.PROCESSED, CycleStatus.ALREADY_PROCESSED}:
-            self._record_reconciliation(result.end_utc, result.filled_order_ids)
-            if result.status is CycleStatus.PROCESSED:
-                self._promote_after_reduced_cycle(result.end_utc)
-            self._notify_cycle(result.end_utc)
+            try:
+                self._record_reconciliation(result.end_utc, result.filled_order_ids)
+                if result.status is CycleStatus.PROCESSED:
+                    self._promote_after_reduced_cycle(result.end_utc)
+                self._notify_cycle(result.end_utc)
+            except Exception:
+                self._sleep_failsafe_retry()
+                raise
         return result
+
+    @property
+    def retry_delay_applied(self) -> bool:
+        return self._retry_delay_applied
+
+    def _preflight(self) -> None:
+        snapshot = self._store.replay_state()
+        _validate_health_and_risk_chain(snapshot)
+        _validate_operational_alert_chain(snapshot.event_evidence)
+        self._broker.reconcile()
+
+    def _sleep_failsafe_retry(self) -> None:
+        try:
+            delay = self._retry_delay()
+        except Exception:
+            delay = 300.0
+        self._sleeper.sleep(delay)
+        self._retry_delay_applied = True
 
     def _retry_delay(self) -> float:
         delay = HealthMonitor.from_store(self._store).current_action().retry_delay_seconds
@@ -667,6 +717,8 @@ def _run_paper_run(arguments: argparse.Namespace) -> int:
             except KeyboardInterrupt:
                 return 130
             except Exception:
+                if getattr(application, "retry_delay_applied", False) is not True:
+                    time.sleep(300.0)
                 print("paper-run retrying: RECOVERABLE_OPERATION_ERROR", file=sys.stderr)
                 continue
             print(_canonical_output(_cycle_output(result)))
@@ -783,6 +835,70 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _validate_checkpointless_paper_evidence(
+    root: Path,
+    *,
+    source_url: str,
+    start: str,
+    end: str,
+    config: DataConfig,
+) -> None:
+    """Reject every invalid artifact before collector recovery can ignore it."""
+    if not root.exists() or (root / "checkpoint.json").exists():
+        return
+    entries = tuple(root.iterdir())
+    if not entries:
+        return
+    identity = data_storage._collection_identity(
+        source_url=source_url,
+        start_utc=start,
+        end_utc=end,
+        config=config,
+    )
+    snapshots = []
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            raise ValueError("paper evidence namespace contains an invalid artifact")
+        snapshot_hash = data_storage._snapshot_hash_from_name(entry.name)
+        if snapshot_hash is not None:
+            snapshot = data_storage._read_hashed_json(
+                entry,
+                snapshot_hash,
+                "paper orphan collection snapshot evidence",
+            )
+            if not isinstance(snapshot, dict):
+                raise ValueError("paper orphan collection snapshot evidence is malformed")
+            snapshots.append(
+                data_storage._evidence_from_state_payload(
+                    root,
+                    snapshot,
+                    identity,
+                    snapshot_path=entry,
+                    snapshot_hash=snapshot_hash,
+                    label="paper orphan collection snapshot evidence",
+                )
+            )
+            continue
+        page_match = re.fullmatch(r"page-([0-9a-f]{64})\.json", entry.name)
+        if page_match is None:
+            raise ValueError("paper evidence namespace contains unknown evidence")
+        page = data_storage._read_hashed_json(
+            entry,
+            page_match.group(1),
+            "paper orphan page evidence",
+        )
+        if not isinstance(page, list) or not all(isinstance(row, dict) for row in page):
+            raise ValueError("paper orphan page evidence is malformed")
+
+    if snapshots:
+        tip = max(snapshots, key=lambda evidence: len(evidence.pages))
+        if any(
+            not data_storage._is_snapshot_prefix(candidate, tip)
+            for candidate in snapshots
+        ):
+            raise ValueError("paper collection evidence has ambiguous snapshot chains")
+
+
 def _validated_paper_frame(frame: object, end: datetime) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame):
         raise _CandleSchemaError("completed candle source must return a pandas DataFrame")
@@ -801,25 +917,28 @@ def _validated_paper_frame(frame: object, end: datetime) -> pd.DataFrame:
         raise _CandleTimestampError("completed candle timestamps must align to four hours")
     if any(timestamp.to_pydatetime() >= end for timestamp in index):
         raise _CandleLatestError("completed candle source crossed its exclusive end")
-    try:
-        canonical = canonicalize_ohlcv(frame, end).frame
-    except ValueError as error:
-        raise _CandleSchemaError("completed candle values are invalid") from error
     expected_latest = end - timedelta(hours=4)
-    if canonical.empty or canonical.index[-1].to_pydatetime() != expected_latest:
-        raise _CandleLatestError("exact latest completed candle is missing")
-    tail = canonical.iloc[-_PAPER_HISTORY_BARS:]
     expected_index = pd.date_range(
         end=pd.Timestamp(expected_latest),
         periods=_PAPER_HISTORY_BARS,
         freq="4h",
         tz="UTC",
     )
-    if len(tail) != _PAPER_HISTORY_BARS or not tail.index.equals(expected_index):
+    if len(index) != _PAPER_HISTORY_BARS or not index.equals(expected_index):
+        raise _CandleLatestError(
+            "paper candle history must contain exactly 601 contiguous completed bars"
+        )
+    try:
+        canonical = canonicalize_ohlcv(frame, end).frame
+    except ValueError as error:
+        raise _CandleSchemaError("completed candle values are invalid") from error
+    if canonical.empty or canonical.index[-1].to_pydatetime() != expected_latest:
+        raise _CandleLatestError("exact latest completed candle is missing")
+    if len(canonical) != _PAPER_HISTORY_BARS or not canonical.index.equals(expected_index):
         raise _CandleLatestError("600-bar warmup plus execution candle is incomplete")
-    if tail.loc[:, ["open", "high", "low", "close", "volume"]].isna().any().any():
+    if canonical.loc[:, ["open", "high", "low", "close", "volume"]].isna().any().any():
         raise _CandleSchemaError("paper candle history contains invalid values")
-    return frame.loc[index < pd.Timestamp(end), ["open", "high", "low", "close", "volume"]].copy(deep=True)
+    return canonical.loc[:, ["open", "high", "low", "close", "volume"]].copy(deep=True)
 
 
 def _paper_end(value: datetime) -> datetime:

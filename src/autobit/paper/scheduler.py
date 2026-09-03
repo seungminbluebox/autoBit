@@ -81,24 +81,28 @@ class PaperScheduler:
         self._next_end: datetime | None = None
 
     def run_once(self) -> _ResultT:
-        actual_wake = _as_utc(self._clock.now())
-        if self._next_end is None:
-            latest_matured = latest_completed_end(actual_wake)
-            resolver = getattr(self._service, "oldest_required_end", None)
-            required = resolver(latest_matured) if callable(resolver) else latest_matured
-            self._next_end = _resolved_end(required)
-
         try:
-            target = self._next_end + _MATURITY_DELAY
-        except OverflowError as error:
-            raise ValueError("scheduler target is outside datetime range") from error
-        while actual_wake < target:
-            self._sleeper.sleep((target - actual_wake).total_seconds())
             actual_wake = _as_utc(self._clock.now())
+            if self._next_end is None:
+                latest_matured = latest_completed_end(actual_wake)
+                resolver = getattr(self._service, "oldest_required_end", None)
+                required = resolver(latest_matured) if callable(resolver) else latest_matured
+                self._next_end = _resolved_end(required)
 
-        if self._next_end > latest_completed_end(actual_wake):
-            raise RuntimeError("scheduler target did not mature a completed candle")
-        return self._process_pending()
+            try:
+                target = self._next_end + _MATURITY_DELAY
+            except OverflowError as error:
+                raise ValueError("scheduler target is outside datetime range") from error
+            while actual_wake < target:
+                self._sleeper.sleep((target - actual_wake).total_seconds())
+                actual_wake = _as_utc(self._clock.now())
+
+            if self._next_end > latest_completed_end(actual_wake):
+                raise RuntimeError("scheduler target did not mature a completed candle")
+            return self._process_pending()
+        except Exception:
+            self._sleep_for_retry()
+            raise
 
     def _process_pending(self) -> _ResultT:
         if self._next_end is None:  # Defensive: initialized before every call.
@@ -108,16 +112,19 @@ class PaperScheduler:
             following_end = process_end + _FOUR_HOURS
         except OverflowError as error:
             raise ValueError("scheduler cursor is outside datetime range") from error
-        try:
-            result = self._service.process_completed_candle(process_end)
-        except Exception:
-            self._sleeper.sleep(self._current_retry_delay())
-            raise
+        result = self._service.process_completed_candle(process_end)
         if getattr(result, "status", None) == "LEASE_HELD":
-            self._sleeper.sleep(self._current_retry_delay())
+            self._sleep_for_retry()
             return result
         self._next_end = following_end
         return result
+
+    def _sleep_for_retry(self) -> None:
+        try:
+            delay = self._current_retry_delay()
+        except Exception:
+            delay = _MAX_DYNAMIC_RETRY_DELAY_SECONDS
+        self._sleeper.sleep(delay)
 
     def _current_retry_delay(self) -> float:
         if self._retry_delay_provider is None:
