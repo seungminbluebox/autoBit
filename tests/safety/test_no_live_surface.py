@@ -548,6 +548,34 @@ def _network_import_roots(aliases: dict[str, str]) -> frozenset[str]:
     )
 
 
+def _is_httpx_client_receiver(
+    node: ast.AST,
+    clients: set[str],
+    aliases: dict[str, str],
+) -> bool:
+    name = _dotted_name(node) or ""
+    if name in clients:
+        return True
+    if not isinstance(node, ast.Call):
+        return False
+    constructor = _resolve_alias(_dotted_name(node.func) or "", aliases)
+    return constructor in {"httpx.Client", "httpx.AsyncClient"}
+
+
+def _client_method_reference_is_allowed(
+    node: ast.Attribute,
+    clients: set[str],
+    aliases: dict[str, str],
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    if node.attr.lower() not in _HTTP_SINK_METHODS:
+        return True
+    if not _is_httpx_client_receiver(node.value, clients, aliases):
+        return True
+    parent = parents.get(node)
+    return isinstance(parent, ast.Call) and parent.func is node
+
+
 def _httpx_primitive_reference_is_allowed(
     node: ast.Attribute,
     path: str,
@@ -725,6 +753,13 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     f"{label}: direct httpx network primitive reference: "
                     f"{resolved_reference}"
                 )
+            if not _client_method_reference_is_allowed(
+                node, clients, aliases, parents
+            ):
+                violations.append(
+                    f"{label}: captured httpx client method is forbidden: "
+                    f"{node.attr}"
+                )
             if resolved_reference in _PROCESS_EXECUTION_REFERENCES:
                 violations.append(
                     f"{label}: process execution capability is forbidden: "
@@ -835,11 +870,10 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
         elif isinstance(node.func, ast.Attribute):
             base = _dotted_name(node.func.value) or ""
             method = node.func.attr.lower()
-            if has_approved_httpx_import and _is_exact_benign_http_named_call(
-                path, node, constants, aliases
-            ):
-                pass
-            elif base in httpx_modules and method in _HTTP_METHOD_NAMES:
+            receiver_is_client = _is_httpx_client_receiver(
+                node.func.value, clients, aliases
+            )
+            if base in httpx_modules and method in _HTTP_METHOD_NAMES:
                 kind = "module_verb"
                 contract = _network_contract(
                     None,
@@ -848,8 +882,8 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     constants=constants,
                     aliases=aliases,
                 )
-            elif (base in httpx_modules or base in clients) and method == "request":
-                kind = "client_request" if base in clients else "module_request"
+            elif (base in httpx_modules or receiver_is_client) and method == "request":
+                kind = "client_request" if receiver_is_client else "module_request"
                 contract = _network_contract(
                     _call_argument(node, 0, "method"),
                     _call_argument(node, 1, "url"),
@@ -857,7 +891,7 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     constants=constants,
                     aliases=aliases,
                 )
-            elif base in clients and method in _HTTP_METHOD_NAMES:
+            elif receiver_is_client and method in _HTTP_METHOD_NAMES:
                 kind = "client_verb"
                 contract = _network_contract(
                     None,
@@ -866,7 +900,7 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     constants=constants,
                     aliases=aliases,
                 )
-            elif base in clients and method == "send":
+            elif receiver_is_client and method == "send":
                 kind = "client_send"
                 request_node = _call_argument(node, 0, "request")
                 request_name = _dotted_name(request_node) if request_node is not None else None
@@ -880,6 +914,10 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
                     constants=constants,
                     aliases=aliases,
                 )
+            elif has_approved_httpx_import and _is_exact_benign_http_named_call(
+                path, node, constants, aliases
+            ):
+                pass
             elif has_approved_httpx_import and method in _HTTP_SINK_METHODS:
                 kind = "unresolved_receiver"
                 if method == "request":
@@ -1402,6 +1440,59 @@ def test_scanner_rejects_chained_get_in_cli_wiring(
 
     with pytest.raises(AssertionError):
         test_repository_source_has_no_private_upbit_or_live_order_surface()
+
+
+@pytest.mark.parametrize(
+    ("case", "source"),
+    [
+        (
+            "inline_client_bound_post",
+            'import httpx\nmethods = {"send": httpx.Client().post}\ndef go(target):\n    return methods["send"](target)\n',
+        ),
+        (
+            "inline_async_client_bound_post",
+            'import httpx\nmethods = {"send": httpx.AsyncClient().post}\ndef go(target):\n    return methods["send"](target)\n',
+        ),
+        (
+            "assigned_client_bound_post",
+            'import httpx\nclient = httpx.Client()\nmethods = {"send": client.post}\ndef go(target):\n    return methods["send"](target)\n',
+        ),
+        (
+            "client_named_like_benign_fills",
+            "import httpx\nfills = httpx.Client()\ndef go(order_id):\n    return fills.get(order_id)\n",
+        ),
+    ],
+)
+def test_scanner_rejects_captured_client_methods_and_benign_name_collision(
+    case: str,
+    source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del case
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_repository_source_surfaces",
+        lambda: (("index:src/autobit/cli.py", source),),
+    )
+
+    with pytest.raises(AssertionError):
+        test_repository_source_has_no_private_upbit_or_live_order_surface()
+
+
+def test_scanner_allows_real_cli_fills_dictionary_get(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (
+        'import httpx\nfills = {"paper-order": "fill"}\n'
+        "def lookup(order_id):\n    return fills.get(order_id)\n"
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_repository_source_surfaces",
+        lambda: (("worktree:src/autobit/cli.py", source),),
+    )
+
+    test_repository_source_has_no_private_upbit_or_live_order_surface()
 
 
 @pytest.mark.parametrize(
