@@ -139,6 +139,92 @@ class PaperService:
         self._lease_ttl = lease_ttl
         self._fault_hook = fault_hook
 
+    def oldest_required_end(self, latest_matured: datetime) -> datetime:
+        """Resolve the oldest unfinished cycle exclusively from durable evidence."""
+        latest = _require_cycle_end(latest_matured)
+        snapshot = self._store.replay_state()
+        reconciliation = self._broker.reconcile()
+        completed = _completed_cycle_ends(snapshot)
+
+        if not snapshot.event_evidence:
+            return latest
+
+        required: set[datetime] = set()
+        if completed:
+            required.add(_first_uncompleted_after_cycle_chain(completed))
+
+        risk_state = _risk_state_from_payload(snapshot.breaker_state)
+        if risk_state.last_risk_at is not None:
+            required.add(
+                _safe_add(
+                    _require_cycle_end(risk_state.last_risk_at),
+                    _FOUR_HOURS,
+                    "risk cycle end is outside datetime range",
+                )
+            )
+
+        orders: dict[str, PaperOrder] = {
+            order.order_id: order for order in reconciliation.active_orders
+        }
+        for event in snapshot.event_evidence:
+            if event.event_type != "PAPER_ORDER":
+                continue
+            order_id = event.payload.get("order_id")
+            if not isinstance(order_id, str) or not order_id:
+                raise StoreCorruptionError("paper order identity is invalid")
+            orders[order_id] = self._broker.order(order_id)
+        for order in orders.values():
+            eligible = order.eligible_open_utc
+            if eligible is None:
+                raise PaperServiceError("market order has no eligible open evidence")
+            signal_cycle = _safe_add(
+                _require_cycle_end(order.signal_at_utc),
+                _FOUR_HOURS,
+                "order signal cycle is outside datetime range",
+            )
+            if eligible != signal_cycle:
+                raise PaperServiceError("order timing evidence is contradictory")
+            required.add(signal_cycle)
+            required.add(
+                _safe_add(
+                    eligible,
+                    _FOUR_HOURS,
+                    "order execution cycle is outside datetime range",
+                )
+            )
+
+        for fill in reconciliation.fills:
+            required.add(
+                _safe_add(
+                    _require_cycle_end(fill.fill_time),
+                    _FOUR_HOURS,
+                    "fill cycle is outside datetime range",
+                )
+            )
+
+        stop = reconciliation.active_stop
+        if stop is not None:
+            observed_cycle = _safe_add(
+                _require_cycle_end(stop.observed_at_utc),
+                _FOUR_HOURS,
+                "stop observation cycle is outside datetime range",
+            )
+            if stop.active_after_utc != observed_cycle:
+                raise PaperServiceError("stop timing evidence is contradictory")
+            required.add(observed_cycle)
+            required.add(
+                _safe_add(
+                    stop.active_after_utc,
+                    _FOUR_HOURS,
+                    "stop activation cycle is outside datetime range",
+                )
+            )
+
+        unfinished = sorted(end for end in required if end not in completed)
+        if not unfinished:
+            raise PaperServiceError("durable paper evidence has no resolvable cycle cursor")
+        return unfinished[0]
+
     def process_completed_candle(self, end_utc: datetime) -> CycleResult:
         end = _require_cycle_end(end_utc)
         now = _clock_utc(self._clock)
@@ -462,6 +548,45 @@ def _has_completed_cycle(snapshot: PaperSnapshot, event_id: str, end: datetime) 
         if any(not isinstance(value, str) or not value for value in values):
             raise StoreCorruptionError("cycle completion list evidence is invalid")
     return True
+
+
+def _completed_cycle_ends(snapshot: PaperSnapshot) -> frozenset[datetime]:
+    completed: set[datetime] = set()
+    for event in snapshot.event_evidence:
+        if event.event_type != "PAPER_CYCLE" and not event.event_id.startswith("cycle:"):
+            continue
+        try:
+            end = _require_cycle_end(event.occurred_at_utc)
+        except ValueError as error:
+            raise StoreCorruptionError("cycle completion boundary is invalid") from error
+        expected_id = f"cycle:{_canonical_datetime(end)}"
+        if event.event_id != expected_id:
+            raise StoreCorruptionError("cycle completion identity is inconsistent")
+        _has_completed_cycle(snapshot, expected_id, end)
+        if end in completed:
+            raise StoreCorruptionError("cycle completion boundary is duplicated")
+        completed.add(end)
+    return frozenset(completed)
+
+
+def _first_uncompleted_after_cycle_chain(
+    completed: frozenset[datetime],
+) -> datetime:
+    ordered = sorted(completed)
+    if not ordered:
+        raise ValueError("completed cycle chain cannot be empty")
+    cursor = _safe_add(
+        ordered[0],
+        _FOUR_HOURS,
+        "cycle cursor is outside datetime range",
+    )
+    for end in ordered[1:]:
+        if end > cursor:
+            return cursor
+        if end < cursor:
+            raise StoreCorruptionError("cycle completion chronology is inconsistent")
+        cursor = _safe_add(end, _FOUR_HOURS, "cycle cursor is outside datetime range")
+    return cursor
 
 
 def _open_position(

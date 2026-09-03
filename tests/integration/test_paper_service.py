@@ -148,6 +148,15 @@ def test_completed_candle_is_processed_once_without_refetch_or_ledger_growth(
     assert cycle_events[0].event_type == "PAPER_CYCLE"
 
 
+def test_brand_new_service_starts_at_the_latest_matured_end(tmp_path: Path) -> None:
+    latest = END + timedelta(hours=8)
+    source = _Source(_history(latest))
+    _, service = _service(tmp_path / "paper.sqlite3", source)
+
+    assert service.oldest_required_end(latest) == latest
+    assert source.calls == []
+
+
 @pytest.mark.parametrize(
     "end_utc",
     [
@@ -777,7 +786,7 @@ def test_corrupt_risk_bookkeeping_fails_closed_without_completion_and_releases_l
     )
 
 
-def test_restarted_scheduler_does_not_skip_a_pending_orders_eligible_open(
+def test_restarted_scheduler_replays_clean_pending_open_and_contiguous_backlog(
     tmp_path: Path,
 ) -> None:
     class RangeSource:
@@ -792,14 +801,27 @@ def test_restarted_scheduler_does_not_skip_a_pending_orders_eligible_open(
     store = SQLiteStore(path)
     store.initialize()
     broker = PaperBroker(store, CostConfig(0.0, 0.0))
-    bar_at = END - timedelta(hours=4)
-    pending = broker.submit_entry(bar_at - timedelta(hours=4), quantity=0.2)
+    previous_end = END - timedelta(hours=4)
+    pending = broker.submit_entry(previous_end - timedelta(hours=4), quantity=0.2)
+    previous_text = previous_end.isoformat().replace("+00:00", "Z")
+    store.append_event(
+        f"cycle:{previous_text}",
+        "PAPER_CYCLE",
+        previous_end,
+        {
+            "created_order_ids": [pending.order_id],
+            "end_utc": previous_text,
+            "filled_order_ids": [],
+            "reason_codes": [],
+            "status": "PROCESSED",
+        },
+    )
     store.close()
 
     reopened_store = SQLiteStore(path)
     reopened_store.initialize()
     reopened_broker = PaperBroker(reopened_store, CostConfig(0.0, 0.0))
-    clock = _MutableClock(END + timedelta(minutes=11))
+    clock = _MutableClock(END + timedelta(hours=4, minutes=11))
     source = RangeSource()
     service = PaperService(
         source=source,
@@ -812,17 +834,91 @@ def test_restarted_scheduler_does_not_skip_a_pending_orders_eligible_open(
     )
     sleeper = _ClockAdvancingSleeper(clock)
 
-    result = PaperScheduler(service, clock, sleeper).run_once()
+    first = PaperScheduler(service, clock, sleeper).run_once()
+    second = PaperScheduler(service, clock, sleeper).run_once()
 
     reconciliation = reopened_broker.reconcile()
-    assert result.status is CycleStatus.PROCESSED
-    assert result.end_utc == END + timedelta(hours=4)
+    assert first.status is CycleStatus.PROCESSED
+    assert first.end_utc == END
+    assert second.end_utc == END + timedelta(hours=4)
     assert source.calls == [END, END + timedelta(hours=4)]
-    assert sleeper.delays == [14_340.0]
+    assert sleeper.delays == []
     assert len(reconciliation.fills) == 1
     assert reconciliation.fills[0].order_id == pending.order_id
-    assert reconciliation.fills[0].fill_time == bar_at
+    assert reconciliation.fills[0].fill_time == previous_end
     assert reconciliation.active_stop is not None
+    assert [
+        event.occurred_at_utc
+        for event in reopened_store.replay_state().event_evidence
+        if event.event_type == "PAPER_CYCLE"
+    ] == [previous_end, END, END + timedelta(hours=4)]
+
+
+def test_crash_after_acceptance_restarts_oldest_cycle_then_exact_open(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+
+    def crash_after_acceptance(boundary: str) -> None:
+        if boundary == "after_order_acceptance":
+            raise RuntimeError("injected post-acceptance crash")
+
+    crashing_source = _Source(_breakout_history(END))
+    store, crashing = _service(path, crashing_source, fault_hook=crash_after_acceptance)
+    with pytest.raises(RuntimeError, match="post-acceptance"):
+        crashing.process_completed_candle(END)
+    accepted, = PaperBroker(store, CostConfig(0.0, 0.0)).reconcile().active_orders
+    store.close()
+
+    class RangeSource:
+        def __init__(self) -> None:
+            self.calls: list[datetime] = []
+
+        def load_completed_candles(self, end_utc: datetime) -> pd.DataFrame:
+            self.calls.append(end_utc)
+            if end_utc == END:
+                return _breakout_history(end_utc, bars=602)
+            return _history(end_utc, bars=602)
+
+    reopened = SQLiteStore(path)
+    reopened.initialize()
+    broker = PaperBroker(reopened, CostConfig(0.0, 0.0))
+    source = RangeSource()
+    clock = _MutableClock(END + timedelta(hours=8, minutes=11))
+    service = PaperService(
+        source=source,
+        store=reopened,
+        broker=broker,
+        clock=clock,
+        lease_owner="restart-worker",
+        lease_token="restart-token",
+        costs=CostConfig(0.0, 0.0),
+    )
+    sleeper = _ClockAdvancingSleeper(clock)
+
+    first = PaperScheduler(service, clock, sleeper).run_once()
+    after_retry = broker.reconcile()
+    second = PaperScheduler(service, clock, sleeper).run_once()
+    third = PaperScheduler(service, clock, sleeper).run_once()
+
+    final = broker.reconcile()
+    assert [first.end_utc, second.end_utc, third.end_utc] == [
+        END,
+        END + timedelta(hours=4),
+        END + timedelta(hours=8),
+    ]
+    assert source.calls == [END, END + timedelta(hours=4), END + timedelta(hours=8)]
+    assert sleeper.delays == []
+    assert after_retry.active_orders == (accepted,)
+    assert after_retry.fills == ()
+    assert len(final.fills) == 1
+    assert final.fills[0].order_id == accepted.order_id
+    assert final.fills[0].fill_time == END
+    events = reopened.replay_state().event_evidence
+    assert len([event for event in events if event.event_type == "ORDER_CREATED"]) == 1
+    assert [
+        event.occurred_at_utc for event in events if event.event_type == "PAPER_CYCLE"
+    ] == [END, END + timedelta(hours=4), END + timedelta(hours=8)]
 
 
 def test_entry_fill_is_protected_before_corrupt_risk_state_can_abort_cycle(

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import math
 from typing import Protocol, TypeVar
 
 
 _FOUR_HOURS = timedelta(hours=4)
 _MATURITY_DELAY = timedelta(minutes=10)
+_DEFAULT_RETRY_DELAY_SECONDS = 1.0
+_MAX_RETRY_DELAY_SECONDS = 60.0
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _ResultT = TypeVar("_ResultT")
 
@@ -52,44 +55,58 @@ class PaperScheduler:
         service: CandleService[_ResultT],
         clock: Clock,
         sleeper: Sleeper,
+        retry_delay_seconds: float = _DEFAULT_RETRY_DELAY_SECONDS,
     ) -> None:
+        if isinstance(retry_delay_seconds, bool):
+            raise ValueError("retry delay must be positive and at most sixty seconds")
+        try:
+            delay = float(retry_delay_seconds)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "retry delay must be positive and at most sixty seconds"
+            ) from error
+        if not math.isfinite(delay) or not 0.0 < delay <= _MAX_RETRY_DELAY_SECONDS:
+            raise ValueError("retry delay must be positive and at most sixty seconds")
         self._service = service
         self._clock = clock
         self._sleeper = sleeper
+        self._retry_delay_seconds = delay
         self._next_end: datetime | None = None
 
     def run_once(self) -> _ResultT:
         actual_wake = _as_utc(self._clock.now())
         if self._next_end is None:
-            self._next_end = latest_completed_end(actual_wake)
-            startup_result, advanced = self._process_pending()
-            if not advanced:
-                return startup_result
-            actual_wake = _as_utc(self._clock.now())
+            latest_matured = latest_completed_end(actual_wake)
+            resolver = getattr(self._service, "oldest_required_end", None)
+            required = resolver(latest_matured) if callable(resolver) else latest_matured
+            self._next_end = _resolved_end(required)
 
-        target = self._next_end + _MATURITY_DELAY
+        try:
+            target = self._next_end + _MATURITY_DELAY
+        except OverflowError as error:
+            raise ValueError("scheduler target is outside datetime range") from error
         while actual_wake < target:
             self._sleeper.sleep((target - actual_wake).total_seconds())
             actual_wake = _as_utc(self._clock.now())
 
-        result: _ResultT | None = None
-        while self._next_end <= latest_completed_end(actual_wake):
-            result, advanced = self._process_pending()
-            if not advanced:
-                return result
-        if result is None:  # Defensive: a reached target always matures its pending close.
+        if self._next_end > latest_completed_end(actual_wake):
             raise RuntimeError("scheduler target did not mature a completed candle")
-        return result
+        return self._process_pending()
 
-    def _process_pending(self) -> tuple[_ResultT, bool]:
+    def _process_pending(self) -> _ResultT:
         if self._next_end is None:  # Defensive: initialized before every call.
             raise RuntimeError("scheduler has no pending completed candle")
         process_end = self._next_end
-        result = self._service.process_completed_candle(process_end)
+        try:
+            result = self._service.process_completed_candle(process_end)
+        except Exception:
+            self._sleeper.sleep(self._retry_delay_seconds)
+            raise
         if getattr(result, "status", None) == "LEASE_HELD":
-            return result, False
+            self._sleeper.sleep(self._retry_delay_seconds)
+            return result
         self._next_end = process_end + _FOUR_HOURS
-        return result, True
+        return result
 
 
 def _floor_four_hours(value: datetime) -> datetime:
@@ -110,3 +127,10 @@ def _as_utc(value: datetime) -> datetime:
         return value.astimezone(timezone.utc)
     except (OverflowError, ValueError) as error:
         raise ValueError("datetime is outside the supported scheduler range") from error
+
+
+def _resolved_end(value: datetime) -> datetime:
+    resolved = _as_utc(value)
+    if resolved.minute or resolved.second or resolved.microsecond or resolved.hour % 4:
+        raise ValueError("resolved end must be an exact four-hour UTC boundary")
+    return resolved

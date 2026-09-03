@@ -85,8 +85,14 @@ def test_latest_completed_end_never_selects_an_unmatured_candle(
 
 
 class _RecordingService:
-    def __init__(self) -> None:
+    def __init__(self, oldest_end: datetime | None = None) -> None:
         self.ends: list[datetime] = []
+        self.oldest_end = oldest_end
+        self.resolved_latest: list[datetime] = []
+
+    def oldest_required_end(self, latest_matured: datetime) -> datetime:
+        self.resolved_latest.append(latest_matured)
+        return self.oldest_end or latest_matured
 
     def process_completed_candle(self, end_utc: datetime) -> str:
         self.ends.append(end_utc)
@@ -132,8 +138,7 @@ class _StatusService:
         return CycleResult(next(self._statuses), end_utc)
 
 
-def test_fresh_scheduler_processes_latest_matured_end_then_waits_for_the_next(
-) -> None:
+def test_fresh_scheduler_returns_one_immediate_cycle_then_waits_for_the_next() -> None:
     clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
     sleeper = _AdvancingSleeper(clock)
     service = _RecordingService()
@@ -142,14 +147,29 @@ def test_fresh_scheduler_processes_latest_matured_end_then_waits_for_the_next(
     first = scheduler.run_once()
     second = scheduler.run_once()
 
-    assert first == "2026-01-01T12:00:00+00:00"
-    assert second == "2026-01-01T16:00:00+00:00"
+    assert first == "2026-01-01T08:00:00+00:00"
+    assert second == "2026-01-01T12:00:00+00:00"
     assert service.ends == [
         datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
-        datetime(2026, 1, 1, 16, 0, tzinfo=UTC),
     ]
-    assert sleeper.delays == [14_340.0, 14_400.0]
+    assert service.resolved_latest == [datetime(2026, 1, 1, 8, 0, tzinfo=UTC)]
+    assert sleeper.delays == [14_340.0]
+
+
+def test_fresh_scheduler_uses_the_services_durable_oldest_required_end() -> None:
+    now = datetime(2026, 1, 1, 12, 11, tzinfo=UTC)
+    oldest = datetime(2026, 1, 1, 4, 0, tzinfo=UTC)
+    clock = _MutableClock(now)
+    sleeper = _AdvancingSleeper(clock)
+    service = _RecordingService(oldest)
+
+    result = PaperScheduler(service, clock, sleeper).run_once()
+
+    assert result == oldest.isoformat()
+    assert service.resolved_latest == [datetime(2026, 1, 1, 12, 0, tzinfo=UTC)]
+    assert service.ends == [oldest]
+    assert sleeper.delays == []
 
 
 def test_scheduler_retries_the_same_end_after_service_exception() -> None:
@@ -174,7 +194,7 @@ def test_scheduler_retries_the_same_end_after_service_exception() -> None:
         datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
     ]
-    assert sleeper.delays == []
+    assert sleeper.delays == [1.0]
 
 
 def test_scheduler_retries_lease_held_end_then_advances_after_completion() -> None:
@@ -197,7 +217,7 @@ def test_scheduler_retries_lease_held_end_then_advances_after_completion() -> No
         datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
     ]
-    assert sleeper.delays == [14_340.0]
+    assert sleeper.delays == [1.0, 14_339.0]
 
 
 def test_run_once_catches_up_each_matured_end_after_a_late_wake() -> None:
@@ -209,7 +229,9 @@ def test_run_once_catches_up_each_matured_end_after_a_late_wake() -> None:
     service = _RecordingService()
     scheduler = PaperScheduler(service, clock, sleeper)
 
-    result = scheduler.run_once()
+    first = scheduler.run_once()
+    second = scheduler.run_once()
+    third = scheduler.run_once()
 
     assert sleeper.delays == [10_020.0]
     assert service.ends == [
@@ -217,7 +239,9 @@ def test_run_once_catches_up_each_matured_end_after_a_late_wake() -> None:
         datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
     ]
-    assert result == "2026-01-01T12:00:00+00:00"
+    assert first == "2026-01-01T04:00:00+00:00"
+    assert second == "2026-01-01T08:00:00+00:00"
+    assert third == "2026-01-01T12:00:00+00:00"
 
 
 def test_scheduler_cycles_recompute_from_actual_clock_without_fixed_drift() -> None:
@@ -229,8 +253,9 @@ def test_scheduler_cycles_recompute_from_actual_clock_without_fixed_drift() -> N
     scheduler.run_once()
     clock.value = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
     scheduler.run_once()
+    scheduler.run_once()
 
-    assert sleeper.delays == [10_020.0, 11_400.0]
+    assert sleeper.delays == [11_400.0]
     assert service.ends == [
         datetime(2026, 1, 1, 4, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
@@ -251,9 +276,18 @@ def test_spurious_early_wake_recomputes_and_sleeps_the_remaining_time() -> None:
     scheduler = PaperScheduler(service, clock, sleeper)
 
     scheduler.run_once()
+    scheduler.run_once()
 
     assert sleeper.delays == [10_020.0, 300.0]
     assert service.ends == [
         datetime(2026, 1, 1, 4, 0, tzinfo=UTC),
         datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
     ]
+
+
+@pytest.mark.parametrize("delay", [0.0, -1.0, 60.000_001, float("inf"), float("nan")])
+def test_scheduler_rejects_nonpositive_or_unbounded_retry_delays(delay: float) -> None:
+    clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
+
+    with pytest.raises(ValueError, match="retry delay"):
+        PaperScheduler(_RecordingService(), clock, _AdvancingSleeper(clock), delay)
