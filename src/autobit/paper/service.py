@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
@@ -28,6 +28,7 @@ from autobit.persistence.sqlite_store import (
     StoreCorruptionError,
     StoredEvent,
 )
+from autobit.paper.health import HealthAction, HealthMonitor, HealthStateError
 from autobit.risk.breakers import RiskDecision, evaluate_risk
 from autobit.risk.position_sizer import calculate_size
 from autobit.strategy.donchian_trend import (
@@ -467,12 +468,13 @@ class PaperService:
         equity: float,
         reconciliation: PaperReconciliation,
     ) -> RiskDecision:
+        health = _read_health_action(self._store)
         stored = _risk_state_from_payload(self._store.replay_state().breaker_state)
         if stored.last_risk_at is not None:
             if stored.last_risk_at > bar_at:
                 raise PaperServiceError("risk state timestamp is ahead of the current candle")
             if stored.last_risk_at == bar_at:
-                return stored.decision
+                return _apply_health_action(stored.decision, health)
 
         state = _advance_risk_state(
             stored,
@@ -481,8 +483,9 @@ class PaperService:
             row=row,
             completed_trades=reconciliation.completed_trades,
             risk_config=self._risk,
-            system_healthy=not bool(self._store.replay_state().health_state.get("halt_entries", False)),
+            system_healthy=health is not None and not health.halt_entries,
         )
+        state = replace(state, decision=_apply_health_action(state.decision, health))
         self._store.append_event(
             f"risk:{_canonical_datetime(bar_at)}",
             "BREAKER_STATE",
@@ -1106,6 +1109,40 @@ def _forced_exit_reason(decision: RiskDecision) -> str | None:
     if any(reason in {"system_unhealthy", "invalid_input", "invalid_config"} for reason in decision.reasons):
         return "SYSTEM_EXIT"
     return None
+
+
+def _read_health_action(store: SQLiteStore) -> HealthAction | None:
+    """Return strict typed health, or a fail-closed sentinel for bad evidence."""
+    try:
+        return HealthMonitor.from_store(store).current_action()
+    except HealthStateError:
+        return None
+
+
+def _apply_health_action(
+    decision: RiskDecision,
+    health: HealthAction | None,
+) -> RiskDecision:
+    if health is None or health.halt_entries:
+        if decision.reasons == ("system_unhealthy",):
+            return decision
+        return RiskDecision(0.0, 0.0, None, ("system_unhealthy",))
+    if not health.resume_reduced:
+        return decision
+    if "health_recovery_reduced" in decision.reasons:
+        return decision
+    if (
+        decision.halted_until is not None
+        or decision.risk_rate <= 0.0
+        or decision.exposure_cap <= 0.0
+    ):
+        return decision
+    return RiskDecision(
+        risk_rate=decision.risk_rate / 2.0,
+        exposure_cap=decision.exposure_cap / 2.0,
+        halted_until=decision.halted_until,
+        reasons=decision.reasons + ("health_recovery_reduced",),
+    )
 
 
 def _loss_from_baseline(equity: float, baseline: float) -> float:
