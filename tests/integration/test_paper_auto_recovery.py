@@ -137,6 +137,47 @@ def test_health_snapshot_persists_reopens_and_exact_duplicate_is_noop(tmp_path: 
     ) == 1
 
 
+def test_stale_failure_duplicate_after_reopen_does_not_halt_early(tmp_path: Path) -> None:
+    path = tmp_path / "failure-cursor.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    monitor = HealthMonitor()
+    monitor.record_api_failure(BAR_AT - timedelta(seconds=2))
+    monitor.record_api_failure(BAR_AT - timedelta(seconds=1))
+    monitor.persist(store, event_id="health:two-failures", logical_at=BAR_AT)
+    store.close()
+
+    reopened = SQLiteStore(path)
+    reopened.initialize()
+    restored = HealthMonitor.from_store(reopened)
+    action = restored.record_api_failure(BAR_AT - timedelta(seconds=2))
+
+    assert restored.snapshot().api_failures == 2
+    assert action.stage is HealthStage.NORMAL
+    assert restored.record_api_failure(BAR_AT).halt_entries
+
+
+def test_stale_success_duplicate_after_reopen_does_not_resume_early(tmp_path: Path) -> None:
+    path = tmp_path / "success-cursor.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    monitor = _halted_api_monitor()
+    monitor.record_api_success(BAR_AT + timedelta(seconds=10))
+    monitor.record_api_success(BAR_AT + timedelta(seconds=11))
+    monitor.persist(store, event_id="health:two-successes", logical_at=BAR_AT)
+    store.close()
+
+    reopened = SQLiteStore(path)
+    reopened.initialize()
+    restored = HealthMonitor.from_store(reopened)
+    action = restored.record_api_success(BAR_AT + timedelta(seconds=10))
+
+    assert restored.snapshot().api_successes == 2
+    assert action.stage is HealthStage.HALTED
+    assert not action.resume_reduced
+    assert restored.record_api_success(BAR_AT + timedelta(seconds=12)).resume_reduced
+
+
 def test_persisted_identity_reuse_with_different_health_fails_closed(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "health.sqlite3")
     store.initialize()
@@ -429,6 +470,122 @@ def test_reduced_crash_restart_reuses_the_once_halved_persisted_decision(
     assert state.breaker_state["decision_risk_rate"] == pytest.approx(0.01)
     assert len([e for e in state.event_evidence if e.event_type == "BREAKER_STATE"]) == 1
     assert len([e for e in state.event_evidence if e.event_type == "ORDER_CREATED"]) == 1
+
+
+@pytest.mark.parametrize("late_stage", [HealthStage.HALTED, HealthStage.REDUCED])
+def test_late_same_bar_health_change_persists_an_idempotent_risk_followup(
+    tmp_path: Path,
+    late_stage: HealthStage,
+) -> None:
+    path = tmp_path / f"late-{late_stage.value.lower()}.sqlite3"
+
+    def crash(boundary: str) -> None:
+        if boundary == "after_order_acceptance":
+            raise RuntimeError("crash before cycle completion")
+
+    store, broker, crashing = _service(
+        path,
+        _history(END, breakout=True),
+        fault_hook=crash,
+    )
+    with pytest.raises(RuntimeError, match="cycle completion"):
+        crashing.process_completed_candle(END)
+    accepted, = broker.reconcile().active_orders
+    initial = store.replay_state()
+    assert initial.breaker_state["decision_risk_rate"] == pytest.approx(0.02)
+    assert len([e for e in initial.event_evidence if e.event_type == "BREAKER_STATE"]) == 1
+
+    late_health = (
+        _halted_api_monitor()
+        if late_stage is HealthStage.HALTED
+        else _reduced_monitor()
+    )
+    late_health.persist(
+        store,
+        event_id=f"health:late-{late_stage.value.lower()}",
+        logical_at=END,
+    )
+    store.close()
+
+    reopened = SQLiteStore(path)
+    reopened.initialize()
+
+    def crash_after_followup(boundary: str) -> None:
+        if boundary == "after_health_risk_followup":
+            raise RuntimeError("crash after health risk followup")
+
+    _, reopened_broker, retry = _service(
+        path,
+        _history(END, breakout=True),
+        store=reopened,
+        broker=PaperBroker(reopened, CostConfig(0.0, 0.0)),
+        owner=f"retry-{late_stage.value.lower()}",
+        fault_hook=crash_after_followup,
+    )
+    with pytest.raises(RuntimeError, match="health risk followup"):
+        retry.process_completed_candle(END)
+    after_crash = reopened.replay_state()
+    assert len(
+        [e for e in after_crash.event_evidence if e.event_type == "BREAKER_STATE"]
+    ) == 2
+    assert not [e for e in after_crash.event_evidence if e.event_type == "PAPER_CYCLE"]
+    reopened.close()
+
+    final_store = SQLiteStore(path)
+    final_store.initialize()
+    _, reopened_broker, final_retry = _service(
+        path,
+        _history(END, breakout=True),
+        store=final_store,
+        broker=PaperBroker(final_store, CostConfig(0.0, 0.0)),
+        owner=f"final-{late_stage.value.lower()}",
+    )
+    result = final_retry.process_completed_candle(END)
+    after = final_store.replay_state()
+    same_order, = reopened_broker.reconcile().active_orders
+    risk_events = [e for e in after.event_evidence if e.event_type == "BREAKER_STATE"]
+    followups = [e for e in risk_events if e.event_id.startswith("risk-health:")]
+
+    assert same_order == accepted
+    assert len(risk_events) == 2
+    assert len(followups) == 1
+    assert followups[0].occurred_at_utc == END
+    assert ":v1:" in followups[0].event_id
+    assert after.breaker_state["last_risk_at_utc"] == "2026-05-11T00:00:00Z"
+    decision_keys = {
+        "decision_exposure_cap",
+        "decision_halted_until_utc",
+        "decision_reasons",
+        "decision_risk_rate",
+        "halt_entries",
+    }
+    assert {
+        key: value
+        for key, value in after.breaker_state.items()
+        if key not in decision_keys
+    } == {
+        key: value
+        for key, value in initial.breaker_state.items()
+        if key not in decision_keys
+    }
+    if late_stage is HealthStage.HALTED:
+        assert result.reasons == ("system_unhealthy",)
+        assert after.breaker_state["decision_risk_rate"] == 0.0
+        assert after.breaker_state["decision_exposure_cap"] == 0.0
+    else:
+        assert result.reasons == ("health_recovery_reduced",)
+        assert after.breaker_state["decision_risk_rate"] == pytest.approx(0.01)
+        assert after.breaker_state["decision_exposure_cap"] == pytest.approx(0.35)
+
+    before_duplicate = after.last_sequence
+    assert final_retry.process_completed_candle(END).status is CycleStatus.ALREADY_PROCESSED
+    duplicate = final_store.replay_state()
+    assert duplicate.last_sequence == before_duplicate
+    assert len([e for e in duplicate.event_evidence if e.event_type == "BREAKER_STATE"]) == 2
+    assert len([e for e in duplicate.event_evidence if e.event_type == "ORDER_CREATED"]) == 1
+    assert len([e for e in duplicate.event_evidence if e.event_type == "PAPER_CYCLE"]) == 1
+
+    assert final_retry.oldest_required_end(END) == END + timedelta(hours=4)
 
 
 def test_reduced_health_preserves_stricter_core_risk_reasons_before_halving() -> None:

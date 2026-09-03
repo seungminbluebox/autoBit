@@ -41,6 +41,7 @@ _VERSION = 1
 _API_SUCCESSES_REQUIRED = 3
 _LEDGER_TOLERANCE = 1e-10
 _FILL_DEVIATION_LIMIT = 0.05
+_FILL_DEVIATION_LIMIT_DECIMAL = Decimal("0.05")
 _STALE_AFTER = timedelta(minutes=10)
 _UTC = timezone.utc
 _SNAPSHOT_KEYS = frozenset(
@@ -298,7 +299,8 @@ class HealthMonitor:
 
     def record_api_failure(self, at: datetime) -> HealthAction:
         observed = _utc_datetime(at, "API observation time")
-        if self._snapshot.last_failure_at_utc == observed:
+        last_api = _last_api_observation(self._snapshot)
+        if last_api is not None and observed <= last_api:
             return self.current_action()
         self._snapshot = replace(
             self._snapshot,
@@ -309,13 +311,17 @@ class HealthMonitor:
                 or self._snapshot.api_failures + 1 >= 3
             ),
             last_failure_at_utc=observed,
-            last_observation_at_utc=observed,
+            last_observation_at_utc=_latest_observation(
+                self._snapshot.last_observation_at_utc,
+                observed,
+            ),
         )
         return self._finish_observation()
 
     def record_api_success(self, at: datetime) -> HealthAction:
         observed = _utc_datetime(at, "API observation time")
-        if self._snapshot.last_success_at_utc == observed:
+        last_api = _last_api_observation(self._snapshot)
+        if last_api is not None and observed <= last_api:
             return self.current_action()
         successes = min(_API_SUCCESSES_REQUIRED, self._snapshot.api_successes + 1)
         self._snapshot = replace(
@@ -327,7 +333,10 @@ class HealthMonitor:
                 and successes < _API_SUCCESSES_REQUIRED
             ),
             last_success_at_utc=observed,
-            last_observation_at_utc=observed,
+            last_observation_at_utc=_latest_observation(
+                self._snapshot.last_observation_at_utc,
+                observed,
+            ),
         )
         return self._finish_observation()
 
@@ -366,7 +375,10 @@ class HealthMonitor:
             latest_candle_valid=latest_valid,
             schema_valid=self._snapshot.schema_valid and structurally_valid,
             api_successes=successes,
-            last_observation_at_utc=checked,
+            last_observation_at_utc=_latest_observation(
+                self._snapshot.last_observation_at_utc,
+                checked,
+            ),
         )
         return self._finish_observation()
 
@@ -402,7 +414,10 @@ class HealthMonitor:
             self._snapshot,
             unresolved_orders=count,
             api_successes=0 if newly_faulted else self._snapshot.api_successes,
-            last_observation_at_utc=observed or self._snapshot.last_observation_at_utc,
+            last_observation_at_utc=_latest_observation(
+                self._snapshot.last_observation_at_utc,
+                observed,
+            ),
         )
         return self._finish_observation()
 
@@ -439,7 +454,10 @@ class HealthMonitor:
             ledger_cash_difference=cash_difference,
             ledger_btc_difference=btc_difference,
             api_successes=0 if newly_faulted else self._snapshot.api_successes,
-            last_observation_at_utc=observed or self._snapshot.last_observation_at_utc,
+            last_observation_at_utc=_latest_observation(
+                self._snapshot.last_observation_at_utc,
+                observed,
+            ),
         )
         return self._finish_observation()
 
@@ -457,21 +475,35 @@ class HealthMonitor:
         except ValueError:
             self._fail_schema(observed)
             raise
-        deviation = abs(actual - expected) / expected
-        within_limit = deviation <= _FILL_DEVIATION_LIMIT
+        expected_decimal = Decimal(str(expected_price))
+        actual_decimal = Decimal(str(actual_price))
+        decimal_deviation = abs(actual_decimal - expected_decimal) / expected_decimal
+        within_limit = decimal_deviation <= _FILL_DEVIATION_LIMIT_DECIMAL
+        deviation = float(decimal_deviation)
+        if not within_limit and deviation <= _FILL_DEVIATION_LIMIT:
+            deviation = math.nextafter(_FILL_DEVIATION_LIMIT, math.inf)
         newly_faulted = self._snapshot.fill_within_limit and not within_limit
         self._snapshot = replace(
             self._snapshot,
             fill_within_limit=within_limit,
             fill_deviation=deviation,
             api_successes=0 if newly_faulted else self._snapshot.api_successes,
-            last_observation_at_utc=observed or self._snapshot.last_observation_at_utc,
+            last_observation_at_utc=_latest_observation(
+                self._snapshot.last_observation_at_utc,
+                observed,
+            ),
         )
         return self._finish_observation()
 
     def record_recovery_cycle_success(self, at: datetime) -> HealthAction:
         observed = _utc_datetime(at, "recovery cycle time")
-        self._snapshot = replace(self._snapshot, last_observation_at_utc=observed)
+        self._snapshot = replace(
+            self._snapshot,
+            last_observation_at_utc=_latest_observation(
+                self._snapshot.last_observation_at_utc,
+                observed,
+            ),
+        )
         if self._snapshot.stage is HealthStage.REDUCED and not _derive_reasons(
             self._snapshot,
         ):
@@ -550,7 +582,10 @@ class HealthMonitor:
                 "api_successes": (
                     0 if previous and not value else self._snapshot.api_successes
                 ),
-                "last_observation_at_utc": observed,
+                "last_observation_at_utc": _latest_observation(
+                    self._snapshot.last_observation_at_utc,
+                    observed,
+                ),
             },
         )
         return self._finish_observation()
@@ -561,7 +596,10 @@ class HealthMonitor:
             self._snapshot,
             schema_valid=False,
             api_successes=0 if newly_faulted else self._snapshot.api_successes,
-            last_observation_at_utc=observed or self._snapshot.last_observation_at_utc,
+            last_observation_at_utc=_latest_observation(
+                self._snapshot.last_observation_at_utc,
+                observed,
+            ),
         )
         self._finish_observation()
 
@@ -656,6 +694,8 @@ def _validate_snapshot_relationships(
         raise HealthStateError("API latch contradicts reasons")
     if snapshot.api_failure_latched and snapshot.api_successes >= 3:
         raise HealthStateError("API latch contradicts recovery successes")
+    if snapshot.api_failure_latched and 0 < snapshot.api_failures < 3:
+        raise HealthStateError("API latch contradicts the failure threshold")
     if snapshot.api_failures >= 3 and not snapshot.api_failure_latched:
         raise HealthStateError("API failures contradict the API latch")
     if snapshot.api_failures > 0 and snapshot.api_successes > 0:
@@ -664,6 +704,12 @@ def _validate_snapshot_relationships(
         raise HealthStateError("API failure counter lacks observation evidence")
     if snapshot.api_successes > 0 and snapshot.last_success_at_utc is None:
         raise HealthStateError("API success counter lacks observation evidence")
+    last_api_observation = _last_api_observation(snapshot)
+    if last_api_observation is not None and (
+        snapshot.last_observation_at_utc is None
+        or snapshot.last_observation_at_utc < last_api_observation
+    ):
+        raise HealthStateError("last observation predates an API observation cursor")
     if snapshot.stage is HealthStage.NORMAL:
         if derived or snapshot.retry_attempts != 0:
             raise HealthStateError("NORMAL health state is contradictory")
@@ -760,6 +806,29 @@ def _utc_datetime(value: object, label: str) -> datetime:
 
 def _optional_utc_datetime(value: object, label: str) -> datetime | None:
     return None if value is None else _utc_datetime(value, label)
+
+
+def _latest_observation(
+    current: datetime | None,
+    observed: datetime | None,
+) -> datetime | None:
+    if current is None:
+        return observed
+    if observed is None:
+        return current
+    return max(current, observed)
+
+
+def _last_api_observation(snapshot: HealthSnapshot) -> datetime | None:
+    cursors = tuple(
+        cursor
+        for cursor in (
+            snapshot.last_success_at_utc,
+            snapshot.last_failure_at_utc,
+        )
+        if cursor is not None
+    )
+    return max(cursors) if cursors else None
 
 
 def _canonical_datetime(value: datetime) -> str:

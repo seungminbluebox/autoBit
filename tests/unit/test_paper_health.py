@@ -74,6 +74,45 @@ def test_duplicate_api_observation_remains_idempotent_after_another_result() -> 
     assert monitor.snapshot().api_successes == 1
 
 
+def test_non_increasing_failure_times_never_supply_a_third_failure() -> None:
+    monitor = HealthMonitor()
+    monitor.record_api_failure(NOW)
+    monitor.record_api_failure(NOW + timedelta(seconds=1))
+
+    action = monitor.record_api_failure(NOW)
+
+    assert action.stage is HealthStage.NORMAL
+    assert not action.halt_entries
+    assert monitor.snapshot().api_failures == 2
+
+
+def test_non_increasing_success_times_never_supply_a_third_recovery_success() -> None:
+    monitor = HealthMonitor()
+    for second in range(3):
+        monitor.record_api_failure(NOW + timedelta(seconds=second))
+    monitor.record_api_success(NOW + timedelta(seconds=10))
+    monitor.record_api_success(NOW + timedelta(seconds=11))
+
+    action = monitor.record_api_success(NOW + timedelta(seconds=10))
+
+    assert action.stage is HealthStage.HALTED
+    assert not action.resume_reduced
+    assert monitor.snapshot().api_successes == 2
+    assert monitor.record_api_success(NOW + timedelta(seconds=12)).resume_reduced
+
+
+def test_api_observations_must_increase_across_result_types() -> None:
+    monitor = HealthMonitor()
+    monitor.record_api_failure(NOW)
+    after_success = monitor.record_api_success(NOW + timedelta(seconds=10))
+
+    stale_failure = monitor.record_api_failure(NOW + timedelta(seconds=1))
+
+    assert stale_failure == after_success
+    assert monitor.snapshot().api_failures == 0
+    assert monitor.snapshot().api_successes == 1
+
+
 def test_multiple_faults_remain_independent_and_reasons_are_canonical() -> None:
     monitor = HealthMonitor()
     monitor.record_fill_check(expected_price=100.0, actual_price=106.0, at=NOW)
@@ -238,6 +277,34 @@ def test_fill_deviation_exact_five_percent_boundary(
 
 
 @pytest.mark.parametrize(
+    ("actual", "excessive"),
+    [
+        (0.315, False),
+        (0.285, False),
+        (0.3149999999, False),
+        (0.2850000001, False),
+        (0.3150000001, True),
+        (0.2849999999, True),
+    ],
+)
+def test_fill_deviation_uses_canonical_decimal_boundary(
+    actual: float,
+    excessive: bool,
+) -> None:
+    monitor = HealthMonitor()
+
+    action = monitor.record_fill_check(
+        expected_price=0.3,
+        actual_price=actual,
+        at=NOW,
+    )
+
+    assert ("FILL_DEVIATION" in action.reasons) is excessive
+    if not excessive:
+        assert monitor.snapshot().fill_deviation <= 0.05
+
+
+@pytest.mark.parametrize(
     ("expected", "actual"),
     [
         (0.0, 100.0),
@@ -383,6 +450,40 @@ def test_strict_snapshot_rejects_recovered_halted_stage_and_impossible_api_count
     healthy["api_failures"] = 3
     with pytest.raises(ValueError):
         HealthSnapshot.from_mapping(healthy)
+
+
+def test_strict_snapshot_rejects_impossible_two_failure_latch() -> None:
+    monitor = HealthMonitor()
+    monitor.record_api_failure(NOW)
+    monitor.record_api_failure(NOW + timedelta(seconds=1))
+    payload = dict(monitor.snapshot().to_mapping())
+    payload.update(
+        {
+            "api_failure_latched": True,
+            "halt_entries": True,
+            "reasons": ["API_FAILURES"],
+            "retry_attempts": 1,
+            "stage": "HALTED",
+        },
+    )
+
+    with pytest.raises(ValueError):
+        HealthSnapshot.from_mapping(payload)
+
+
+@pytest.mark.parametrize("cursor", ["last_success_at_utc", "last_failure_at_utc"])
+def test_strict_snapshot_rejects_last_observation_before_api_cursor(cursor: str) -> None:
+    monitor = HealthMonitor()
+    monitor.record_api_failure(NOW)
+    monitor.record_api_failure(NOW + timedelta(seconds=1))
+    monitor.record_api_failure(NOW + timedelta(seconds=2))
+    monitor.record_api_success(NOW + timedelta(seconds=3))
+    payload = dict(monitor.snapshot().to_mapping())
+    payload["last_observation_at_utc"] = "2025-12-31T23:59:59Z"
+    assert payload[cursor] is not None
+
+    with pytest.raises(ValueError):
+        HealthSnapshot.from_mapping(payload)
 
 
 def test_empty_mapping_is_fresh_normal_for_task_three_compatibility() -> None:
