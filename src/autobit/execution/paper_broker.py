@@ -82,6 +82,8 @@ class PaperStop:
     observed_at_utc: datetime
     active_after_utc: datetime
     source_id: str
+    fee_rate: float = 0.0
+    slippage_rate: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +121,7 @@ class _Ledger:
     fills: tuple[PaperFill, ...]
     trades: tuple[PaperTrade, ...]
     active_stop: PaperStop | None
+    open_stops: tuple[PaperStop, ...]
     total_fees: float
     total_slippage: float
 
@@ -257,7 +260,7 @@ class PaperBroker:
                 raise ValueError("sell quantity exceeds position")
             if ledger.snapshot.pending_orders:
                 raise ValueError("an active exit already holds reserved position")
-            order = self._submit_order_in_transaction(
+            return self._submit_order_in_transaction(
                 signal_text=signal_text,
                 signal_time=signal_time,
                 occurred_at=signal_text,
@@ -270,14 +273,6 @@ class PaperBroker:
                 order_kind="MARKET",
                 eligible_open=_next_boundary(signal_time),
             )
-            if ledger.active_stop is not None:
-                self._deactivate_stop_in_transaction(
-                    ledger.active_stop,
-                    signal_text,
-                    action="CANCELED",
-                    identity=order_id,
-                )
-            return order
 
     def process_open(
         self,
@@ -292,7 +287,7 @@ class PaperBroker:
         candle_text, candle_time = _timestamp(candle_at)
         reference = _positive(open_price, "open price")
         if actual_quantity is not None:
-            normalized_actual = _nonnegative(actual_quantity, "actual quantity")
+            normalized_actual = _positive(actual_quantity, "actual quantity")
         else:
             normalized_actual = None
 
@@ -322,6 +317,7 @@ class PaperBroker:
                 candle_time=candle_time,
                 reference_price=reference,
                 actual_quantity=normalized_actual,
+                protective_stops=ledger.open_stops,
             )
 
     def process_intrabar_stop(
@@ -341,9 +337,14 @@ class PaperBroker:
 
         with self._store.transaction():
             ledger = self._build_ledger()
-            stop = ledger.active_stop
-            if stop is None or candle_time < stop.active_after_utc:
+            eligible_stops = tuple(
+                stop
+                for stop in ledger.open_stops
+                if stop.active_after_utc <= candle_time
+            )
+            if not eligible_stops:
                 return None
+            stop = eligible_stops[-1]
             if open_value <= stop.stop_price:
                 reference = open_value
             elif low_value <= stop.stop_price:
@@ -373,6 +374,8 @@ class PaperBroker:
                 order_id=order_id,
                 order_kind="STOP",
                 eligible_open=candle_time,
+                fee_rate=stop.fee_rate,
+                slippage_rate=stop.slippage_rate,
             )
             fill = self._process_order_in_transaction(
                 order,
@@ -380,13 +383,15 @@ class PaperBroker:
                 candle_time=candle_time,
                 reference_price=reference,
                 actual_quantity=None,
+                protective_stops=(),
             )
-            self._deactivate_stop_in_transaction(
-                stop,
-                candle_text,
-                action="TRIGGERED",
-                identity=order_id,
-            )
+            for open_stop in ledger.open_stops:
+                self._deactivate_stop_in_transaction(
+                    open_stop,
+                    candle_text,
+                    action=("TRIGGERED" if open_stop.stop_id == stop.stop_id else "CANCELED"),
+                    identity=order_id,
+                )
             return fill
 
     def set_stop(
@@ -433,15 +438,25 @@ class PaperBroker:
                 observed_time,
                 active_time,
                 normalized_source,
+                self._fee_rate,
+                self._slippage_rate,
             )
             matching = next(
                 (event for event in ledger.snapshot.event_evidence if event.event_id == event_id),
                 None,
             )
             if matching is not None:
-                if _stop_from_event(matching) != candidate:
+                persisted = _stop_from_event(matching)
+                if not (
+                    persisted.stop_id == candidate.stop_id
+                    and _exact(persisted.stop_price, candidate.stop_price)
+                    and persisted.reason == candidate.reason
+                    and persisted.observed_at_utc == candidate.observed_at_utc
+                    and persisted.active_after_utc == candidate.active_after_utc
+                    and persisted.source_id == candidate.source_id
+                ):
                     raise IdempotencyConflictError("stop identity has conflicting evidence")
-                return candidate
+                return persisted
             if ledger.snapshot.btc_quantity <= 0.0:
                 raise ValueError("stop requires owned BTC")
             if ledger.active_stop is not None:
@@ -456,10 +471,12 @@ class PaperBroker:
                 {
                     "action": "SET",
                     "active_after_utc": active_text,
+                    "fee_rate": self._fee_rate,
                     "reason": normalized_reason,
                     "source_id": normalized_source,
                     "stop_id": stop_id,
                     "stop_price": price,
+                    "slippage_rate": self._slippage_rate,
                 },
             )
             return candidate
@@ -588,6 +605,7 @@ class PaperBroker:
         candle_time: datetime,
         reference_price: float,
         actual_quantity: float | None,
+        protective_stops: tuple[PaperStop, ...],
     ) -> PaperFill | None:
         remainder = order.remainder_quantity
         quantity = remainder if actual_quantity is None else actual_quantity
@@ -595,15 +613,6 @@ class PaperBroker:
         remainder_decimal = Decimal(str(remainder))
         if quantity_decimal > remainder_decimal:
             raise ValueError("actual quantity exceeds order remainder")
-        if quantity == 0.0:
-            self._store.transition_order_status(
-                order.order_id,
-                f"{order.idempotency_key}:no-fill:{candle_text}",
-                OrderStatus.CANCELED,
-                candle_text,
-                reason="NO_FILL",
-            )
-            return None
         fill_price = _computed_fill_price(
             reference_price,
             order.slippage_rate,
@@ -723,6 +732,18 @@ class PaperBroker:
                     fee_rate=order.fee_rate,
                     slippage_rate=order.slippage_rate,
                 )
+        if (
+            order.side == "SELL"
+            and order.order_kind == "MARKET"
+            and _decimal(self._store.replay_state().btc_quantity) == 0
+        ):
+            for stop in protective_stops:
+                self._deactivate_stop_in_transaction(
+                    stop,
+                    candle_text,
+                    action="CANCELED",
+                    identity=order.order_id,
+                )
         self._fault("fill")
         return fill
 
@@ -763,6 +784,7 @@ class PaperBroker:
         fill_metadata: dict[str, StoredEvent] = {}
         active_stop: PaperStop | None = None
         known_stops: dict[str, PaperStop] = {}
+        open_stops: dict[str, PaperStop] = {}
         stop_set_events: dict[str, StoredEvent] = {}
         stop_terminals: list[StoredEvent] = []
 
@@ -808,14 +830,18 @@ class PaperBroker:
                                 "persisted protective stop is not tighter"
                             )
                     known_stops[candidate.stop_id] = candidate
+                    open_stops[candidate.stop_id] = candidate
                     stop_set_events[candidate.stop_id] = event
                     active_stop = candidate
                 elif action in {"CANCELED", "TRIGGERED"}:
-                    if active_stop is None:
+                    stop_id = _payload_text(payload, "stop_id")
+                    terminal_stop = open_stops.get(stop_id)
+                    if terminal_stop is None:
                         raise PaperReconciliationError("stop terminal event has no active stop")
-                    _validate_stop_terminal(event, active_stop)
+                    _validate_stop_terminal(event, terminal_stop)
                     stop_terminals.append(event)
-                    active_stop = None
+                    del open_stops[stop_id]
+                    active_stop = next(reversed(open_stops.values()), None)
                 else:
                     raise PaperReconciliationError("unknown paper stop action")
 
@@ -928,9 +954,9 @@ class PaperBroker:
                 total_slippage += _decimal(fill.slippage)
                 paper_fills.append(fill)
 
-        if cash != _decimal(snapshot.cash):
+        if float(cash) != snapshot.cash:
             raise PaperReconciliationError("cash does not reconcile to immutable fills")
-        if btc != _decimal(snapshot.btc_quantity):
+        if float(btc) != snapshot.btc_quantity:
             raise PaperReconciliationError("BTC does not reconcile to immutable fills")
 
         active_orders = tuple(order for order in orders.values() if order.status in _ACTIVE)
@@ -1002,6 +1028,24 @@ class PaperBroker:
             related = orders.get(identity)
             if related is None or related.side != "SELL":
                 raise PaperReconciliationError("paper stop terminal lacks its exit order")
+            related_fills = fills_by_order.get(identity, ())
+            if related.status is not OrderStatus.COMPLETED or len(related_fills) != 1:
+                raise PaperReconciliationError(
+                    "paper stop terminal exit lifecycle is incomplete"
+                )
+            related_fill = related_fills[0]
+            related_fill_meta = fill_metadata.get(related_fill.event_id)
+            if related_fill_meta is None or not (
+                order_metadata[identity].sequence
+                < related_fill.sequence
+                < related_fill_meta.sequence
+                < event.sequence
+            ):
+                raise PaperReconciliationError(
+                    "paper stop terminal sequence is not causal"
+                )
+            if event.occurred_at_utc != related_fill.occurred_at_utc:
+                raise PaperReconciliationError("paper stop terminal time is not causal")
             action = _payload_text(event.payload, "action")
             stop_id = _payload_text(event.payload, "stop_id")
             if action == "TRIGGERED" and related.parent_order_id != stop_id:
@@ -1018,6 +1062,7 @@ class PaperBroker:
             fills=tuple(paper_fills),
             trades=trades,
             active_stop=active_stop,
+            open_stops=tuple(open_stops.values()),
             total_fees=float(total_fees),
             total_slippage=float(total_slippage),
         )
@@ -1194,19 +1239,6 @@ def _paper_order_from_evidence(
                 reason="INSUFFICIENT_CASH",
             )
             final_status = OrderStatus.INSUFFICIENT_CASH
-        elif status_values == [
-            OrderStatus.SUBMITTED,
-            OrderStatus.ACCEPTED,
-            OrderStatus.CANCELED,
-        ]:
-            terminal = status_events[2]
-            _validate_status_identity(
-                terminal,
-                key,
-                f"{key}:no-fill:{eligible_text}",
-                reason="NO_FILL",
-            )
-            final_status = OrderStatus.CANCELED
         else:
             raise PaperReconciliationError("paper no-fill lifecycle is invalid")
         if len(status_events) == 3:
@@ -1454,7 +1486,16 @@ def _stop_from_event(event: StoredEvent) -> PaperStop:
     payload = event.payload
     _require_evidence_keys(
         payload,
-        {"action", "active_after_utc", "reason", "source_id", "stop_id", "stop_price"},
+        {
+            "action",
+            "active_after_utc",
+            "fee_rate",
+            "reason",
+            "slippage_rate",
+            "source_id",
+            "stop_id",
+            "stop_price",
+        },
         "paper stop metadata",
     )
     if _payload_text(payload, "action") != "SET":
@@ -1482,8 +1523,12 @@ def _stop_from_event(event: StoredEvent) -> PaperStop:
     if stop_id != expected_stop_id or event.event_id != expected_event_id:
         raise PaperReconciliationError("paper stop identity is not deterministic")
     stop_price = _payload_number(payload, "stop_price")
+    fee_rate = _payload_number(payload, "fee_rate")
+    slippage_rate = _payload_number(payload, "slippage_rate")
     if stop_price <= 0:
         raise PaperReconciliationError("paper stop price is invalid")
+    if fee_rate < 0 or slippage_rate < 0:
+        raise PaperReconciliationError("paper stop cost binding is invalid")
     return PaperStop(
         stop_id=stop_id,
         stop_price=stop_price,
@@ -1491,6 +1536,8 @@ def _stop_from_event(event: StoredEvent) -> PaperStop:
         observed_at_utc=observed,
         active_after_utc=active_after,
         source_id=source_id,
+        fee_rate=fee_rate,
+        slippage_rate=slippage_rate,
     )
 
 

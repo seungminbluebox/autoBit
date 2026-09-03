@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from random import Random
 from threading import Barrier
 
 import pytest
@@ -83,6 +84,27 @@ def test_market_buy_fills_next_open_once_with_exact_costs(tmp_path: Path) -> Non
         if event.event_type == "ORDER_STATUS"
         and event.payload["order_id"] == order.order_id
     ] == ["SUBMITTED", "ACCEPTED", "COMPLETED"]
+
+
+def test_reconcile_uses_the_store_canonical_float_projection_without_tolerance(
+    tmp_path: Path,
+) -> None:
+    generator = Random(7439)
+    for index in range(32):
+        price = generator.uniform(5.0, 150.0)
+        quantity = generator.uniform(0.000001, min(0.5, 90.0 / price))
+        store, broker = _broker(
+            tmp_path / f"ordinary-{index}.sqlite3",
+            CostConfig(0.0, 0.0),
+        )
+        order = broker.submit_entry(UTC_0, quantity=quantity)
+        fill = broker.process_open(order.order_id, UTC_4, open_price=price)
+
+        assert fill is not None
+        result = broker.reconcile()
+        assert result.cash == store.replay_state().cash
+        assert result.btc_quantity == store.replay_state().btc_quantity
+        store.close()
 
 
 def test_submitted_order_binds_costs_across_reopen(tmp_path: Path) -> None:
@@ -350,20 +372,83 @@ def test_sub_tolerance_entry_remainder_is_not_misclassified_as_a_full_fill(
     assert terminal.remainder_quantity == pytest.approx(5e-11)
 
 
-def test_unfilled_entry_is_canceled_without_a_fill_or_automatic_retry(tmp_path: Path) -> None:
+def test_zero_injected_entry_is_rejected_without_mutation(tmp_path: Path) -> None:
     store, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
     order = broker.submit_entry(UTC_0, quantity=0.4)
+    before = store.replay_state()
 
-    assert broker.process_open(
-        order.order_id,
-        UTC_4,
-        open_price=100.0,
-        actual_quantity=0.0,
-    ) is None
+    with pytest.raises(ValueError, match="positive"):
+        broker.process_open(
+            order.order_id,
+            UTC_4,
+            open_price=100.0,
+            actual_quantity=0.0,
+        )
 
-    assert broker.order(order.order_id).status is OrderStatus.CANCELED
+    assert store.replay_state() == before
+    assert broker.order(order.order_id).status is OrderStatus.ACCEPTED
     assert broker.reconcile().fills == ()
-    assert store.replay_state().position_state is PositionState.FLAT
+    assert store.replay_state().position_state is PositionState.ENTRY_PENDING
+
+
+def test_zero_fill_root_exit_keeps_the_existing_protective_stop(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store, broker = _broker(path, CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    stop = broker.set_stop(UTC_4, 95.0, reason="HARD_STOP")
+    order = broker.submit_exit(
+        UTC_8,
+        quantity=0.2,
+        owned_quantity=0.2,
+        reason="CLOSE_EXIT",
+    )
+    before = broker.reconcile()
+
+    with pytest.raises(ValueError, match="positive"):
+        broker.process_open(
+            order.order_id,
+            UTC_12,
+            open_price=100.0,
+            actual_quantity=0.0,
+        )
+
+    result = broker.reconcile()
+    assert result == before
+    assert result.btc_quantity == 0.2
+    assert result.position_state is PositionState.EXIT_PENDING
+    assert result.active_orders == (order,)
+    assert result.active_stop == stop
+    store.close()
+
+    reopened_store = SQLiteStore(path)
+    reopened_store.initialize()
+    reopened = PaperBroker(reopened_store, CostConfig(0.0, 0.0))
+    assert reopened.reconcile() == result
+
+
+def test_market_exit_cancels_protective_stops_only_after_inventory_is_flat(
+    tmp_path: Path,
+) -> None:
+    _, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    stop = broker.set_stop(UTC_4, 95.0, reason="HARD_STOP")
+    parent = broker.submit_exit(
+        UTC_8,
+        quantity=0.2,
+        owned_quantity=0.2,
+        reason="CLOSE_EXIT",
+    )
+    assert broker.active_stop() == stop
+
+    broker.process_open(parent.order_id, UTC_12, open_price=100.0, actual_quantity=0.1)
+    child, = broker.reconcile().active_orders
+    assert broker.active_stop() == stop
+
+    broker.process_open(child.order_id, UTC_16, open_price=100.0)
+    result = broker.reconcile()
+    assert result.btc_quantity == 0.0
+    assert result.active_orders == ()
+    assert result.active_stop is None
 
 
 def test_exit_partial_fill_creates_one_exact_next_open_remainder(tmp_path: Path) -> None:
@@ -513,6 +598,38 @@ def test_exit_remainder_child_cannot_partially_fill_or_create_grandchild(
     assert broker.reconcile().active_orders == (child,)
 
 
+def test_exit_remainder_child_rejects_zero_fill_across_reopen_without_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store, broker = _broker(path, CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    parent = broker.submit_exit(
+        UTC_8,
+        quantity=0.2,
+        owned_quantity=0.2,
+        reason="CLOSE_EXIT",
+    )
+    broker.process_open(parent.order_id, UTC_12, open_price=100.0, actual_quantity=0.1)
+    child, = broker.reconcile().active_orders
+    store.close()
+
+    reopened_store = SQLiteStore(path)
+    reopened_store.initialize()
+    reopened = PaperBroker(reopened_store, CostConfig(0.0, 0.0))
+    before = reopened_store.replay_state()
+    with pytest.raises(ValueError, match="positive"):
+        reopened.process_open(
+            child.order_id,
+            UTC_16,
+            open_price=100.0,
+            actual_quantity=0.0,
+        )
+
+    assert reopened_store.replay_state() == before
+    assert reopened.reconcile().active_orders == (child,)
+
+
 def test_persisted_stop_uses_worse_gap_and_is_not_retroactive(tmp_path: Path) -> None:
     store, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.001))
     _, entry = _enter(broker, quantity=0.2, open_price=100.0)
@@ -549,6 +666,41 @@ def test_persisted_intrabar_stop_uses_stop_reference_and_survives_reopen(
     assert fill.reference_price == 95.0
     assert fill.fill_price == 95.0
     assert reopened.active_stop() is None
+
+
+def test_future_stop_version_does_not_shadow_the_prior_active_stop(tmp_path: Path) -> None:
+    _, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    broker.set_stop(UTC_4, 95.0, reason="HARD_STOP")
+    broker.set_stop(UTC_8, 97.0, reason="TRAILING_STOP")
+
+    fill = broker.process_intrabar_stop(UTC_8, open_price=100.0, low_price=94.0)
+
+    assert fill is not None
+    assert fill.reference_price == 95.0
+    assert fill.fill_price == 95.0
+    assert broker.active_stop() is None
+
+
+def test_stop_binds_trigger_costs_across_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store, broker = _broker(path, CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    broker.set_stop(UTC_4, 95.0, reason="HARD_STOP")
+    store.close()
+
+    reopened_store = SQLiteStore(path)
+    reopened_store.initialize()
+    reopened = PaperBroker(
+        reopened_store,
+        CostConfig(fee_rate=0.1, slippage_rate=0.2),
+    )
+    fill = reopened.process_intrabar_stop(UTC_8, open_price=100.0, low_price=94.0)
+
+    assert fill is not None
+    assert fill.reference_price == 95.0
+    assert fill.fill_price == 95.0
+    assert fill.fee == 0.0
 
 
 def test_stop_is_next_boundary_only_and_exact_boundary_can_trigger(tmp_path: Path) -> None:
@@ -824,6 +976,103 @@ def test_reconcile_rejects_public_store_same_candle_broker_fill(tmp_path: Path) 
     )
 
     with pytest.raises(PaperReconciliationError, match="strictly after|eligible"):
+        broker.reconcile()
+
+
+def test_reconcile_rejects_stop_terminal_before_its_future_trigger_lifecycle(
+    tmp_path: Path,
+) -> None:
+    store, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    stop = broker.set_stop(UTC_4, 95.0, reason="HARD_STOP")
+    key = f"KRW-BTC:{UTC_4}:SELL:HARD_STOP:{stop.stop_id}"
+    order_id = f"paper-order:{sha256(key.encode('utf-8')).hexdigest()}"
+    terminal_id = (
+        "paper-stop-triggered:"
+        f"{sha256((stop.stop_id + '|' + order_id).encode('utf-8')).hexdigest()}"
+    )
+    store.append_event(
+        terminal_id,
+        "PAPER_STOP",
+        UTC_8,
+        {"action": "TRIGGERED", "identity": order_id, "stop_id": stop.stop_id},
+    )
+    store.record_order_once(
+        key,
+        "SELL",
+        0.2,
+        order_id=order_id,
+        occurred_at=UTC_8,
+        status=OrderStatus.CREATED,
+    )
+    store.transition_order_status(
+        order_id,
+        f"{key}:submitted",
+        OrderStatus.SUBMITTED,
+        UTC_8,
+    )
+    store.transition_order_status(
+        order_id,
+        f"{key}:accepted",
+        OrderStatus.ACCEPTED,
+        UTC_8,
+    )
+    store.append_event(
+        f"paper-order-meta:{sha256(order_id.encode('utf-8')).hexdigest()}",
+        "PAPER_ORDER",
+        UTC_8,
+        {
+            "eligible_open_utc": UTC_8,
+            "fee_rate": 0.0,
+            "idempotency_key": key,
+            "order_id": order_id,
+            "order_kind": "STOP",
+            "parent_order_id": stop.stop_id,
+            "reason": "HARD_STOP",
+            "requested_quantity": 0.2,
+            "side": "SELL",
+            "signal_at_utc": UTC_4,
+            "slippage_rate": 0.0,
+        },
+    )
+    fill_material = "|".join((order_id, UTC_8, repr(0.2)))
+    fill_id = f"paper-fill:{sha256(fill_material.encode('utf-8')).hexdigest()}"
+    store.append_fill(
+        order_id,
+        "SELL",
+        0.2,
+        95.0,
+        0.0,
+        UTC_8,
+        fill_id=fill_id,
+    )
+    store.transition_order_status(
+        order_id,
+        f"{key}:completed:{UTC_8}",
+        OrderStatus.COMPLETED,
+        UTC_8,
+        reason="HARD_STOP",
+    )
+    store.append_event(
+        f"paper-fill-meta:{sha256(fill_id.encode('utf-8')).hexdigest()}",
+        "PAPER_FILL",
+        UTC_8,
+        {
+            "fee": 0.0,
+            "fee_rate": 0.0,
+            "fill_id": fill_id,
+            "fill_price": 95.0,
+            "order_id": order_id,
+            "quantity": 0.2,
+            "reason": "HARD_STOP",
+            "reference_price": 95.0,
+            "side": "SELL",
+            "slippage": 0.0,
+            "slippage_rate": 0.0,
+        },
+    )
+
+    with pytest.raises(PaperReconciliationError, match="sequence|causal"):
         broker.reconcile()
 
 
