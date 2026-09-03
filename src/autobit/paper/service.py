@@ -51,6 +51,7 @@ _MATURITY_DELAY = timedelta(minutes=10)
 _DEFAULT_LEASE_TTL = timedelta(minutes=5)
 _RISK_STATE_VERSION = 1
 _UTC = timezone.utc
+_ALERT_SOURCE_TYPES = frozenset({"HEALTH_STATE", "PAPER_CYCLE"})
 
 
 class CompletedCandleSource(Protocol):
@@ -173,6 +174,7 @@ class PaperService:
         latest = _require_cycle_end(latest_matured)
         snapshot = self._store.replay_state()
         risk_chain = _validate_health_and_risk_chain(snapshot)
+        _validate_operational_alert_chain(snapshot.event_evidence)
         reconciliation = self._broker.reconcile()
         completed = _completed_cycle_ends(
             snapshot,
@@ -290,6 +292,16 @@ class PaperService:
             end for end in observed | obligations if end not in completed
         )
         if not unfinished:
+            operational_only = {
+                "HEALTH_STATE",
+                "ALERT_ATTEMPT",
+                "ALERT_FAILURE",
+            }
+            if all(
+                event.event_type in operational_only
+                for event in snapshot.event_evidence
+            ):
+                return latest
             raise PaperServiceError("durable paper evidence has no resolvable cycle cursor")
         return unfinished[0]
 
@@ -301,6 +313,7 @@ class PaperService:
         event_id = f"cycle:{_canonical_datetime(end)}"
         initial_snapshot = self._store.replay_state()
         _validate_health_and_risk_chain(initial_snapshot)
+        _validate_operational_alert_chain(initial_snapshot.event_evidence)
         if _has_completed_cycle(initial_snapshot, event_id, end, self._broker):
             return CycleResult(CycleStatus.ALREADY_PROCESSED, end)
 
@@ -316,6 +329,7 @@ class PaperService:
         try:
             leased_snapshot = self._store.replay_state()
             _validate_health_and_risk_chain(leased_snapshot)
+            _validate_operational_alert_chain(leased_snapshot.event_evidence)
             if _has_completed_cycle(
                 leased_snapshot,
                 event_id,
@@ -1369,6 +1383,58 @@ def _loss_from_baseline(equity: float, baseline: float) -> float:
     if baseline <= 0.0:
         return 0.0
     return max(0.0, 1.0 - equity / baseline)
+
+
+def _validate_operational_alert_chain(events: Sequence[StoredEvent]) -> None:
+    """Accept only notifier evidence produced from an earlier durable source."""
+    seen: dict[str, StoredEvent] = {}
+    for event in events:
+        if event.event_type not in {"ALERT_ATTEMPT", "ALERT_FAILURE"}:
+            seen[event.event_id] = event
+            continue
+
+        payload = dict(event.payload)
+        common_keys = {
+            "source_event_id",
+            "source_event_type",
+            "version",
+        }
+        expected_keys = (
+            common_keys
+            if event.event_type == "ALERT_ATTEMPT"
+            else common_keys | {"failure_code"}
+        )
+        if set(payload) != expected_keys or type(payload.get("version")) is not int:
+            raise StoreCorruptionError("alert evidence payload is invalid")
+        if payload["version"] != 1:
+            raise StoreCorruptionError("alert evidence version is invalid")
+        source_id = payload.get("source_event_id")
+        source_type = payload.get("source_event_type")
+        if (
+            not isinstance(source_id, str)
+            or not source_id
+            or source_type not in _ALERT_SOURCE_TYPES
+        ):
+            raise StoreCorruptionError("alert evidence source identity is invalid")
+        source = seen.get(source_id)
+        if source is None or source.event_type != source_type:
+            raise StoreCorruptionError("alert evidence has no matching prior source")
+
+        digest = sha256(f"{source_id}|{source_type}".encode("utf-8")).hexdigest()
+        attempt_id = f"alert-attempt:{digest}"
+        if event.event_type == "ALERT_ATTEMPT":
+            if event.event_id != attempt_id:
+                raise StoreCorruptionError("alert evidence identity is invalid")
+        else:
+            if (
+                payload.get("failure_code") != "DELIVERY_FAILED"
+                or event.event_id != f"alert-failure:{digest}"
+            ):
+                raise StoreCorruptionError("alert evidence failure payload is invalid")
+            attempt = seen.get(attempt_id)
+            if attempt is None or attempt.event_type != "ALERT_ATTEMPT":
+                raise StoreCorruptionError("alert evidence failure has no prior attempt")
+        seen[event.event_id] = event
 
 
 def _require_cycle_end(value: datetime) -> datetime:

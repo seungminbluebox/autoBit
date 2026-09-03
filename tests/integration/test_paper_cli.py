@@ -1,0 +1,644 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+import json
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from autobit.cli import (
+    _PaperApplication,
+    _PublicPaperCandleSource,
+    build_parser,
+    main,
+)
+from autobit.config import CostConfig, DataConfig
+from autobit.execution.paper_broker import PaperBroker
+from autobit.paper.health import HealthMonitor, HealthStage
+from autobit.paper.service import CycleStatus
+from autobit.persistence.sqlite_store import SQLiteStore
+
+
+UTC = timezone.utc
+END = datetime(2026, 5, 11, 4, tzinfo=UTC)
+
+
+@dataclass
+class _Clock:
+    value: datetime
+
+    def now(self) -> datetime:
+        return self.value
+
+
+class _Sleeper:
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+        self.delays: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.delays.append(seconds)
+        self.clock.value += timedelta(seconds=seconds)
+
+
+class _FrameSource:
+    def __init__(self, frames: list[pd.DataFrame | BaseException]) -> None:
+        self.frames = iter(frames)
+        self.calls: list[datetime] = []
+
+    def load_completed_candles(self, end_utc: datetime) -> pd.DataFrame:
+        self.calls.append(end_utc)
+        value = next(self.frames)
+        if isinstance(value, BaseException):
+            raise value
+        return value.copy()
+
+
+def _history(end: datetime, bars: int = 601) -> pd.DataFrame:
+    index = pd.date_range(
+        end=pd.Timestamp(end) - pd.Timedelta(hours=4),
+        periods=bars,
+        freq="4h",
+        tz="UTC",
+    )
+    return pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1.0,
+        },
+        index=index,
+    )
+
+
+def _raw_row(at: datetime) -> dict[str, object]:
+    return {
+        "market": "KRW-BTC",
+        "candle_date_time_utc": at.isoformat().replace("+00:00", "Z"),
+        "opening_price": 100.0,
+        "high_price": 101.0,
+        "low_price": 99.0,
+        "trade_price": 100.0,
+        "candle_acc_trade_volume": 1.0,
+    }
+
+
+class _PublicClient:
+    source_url = "https://api.upbit.com/v1/candles/minutes/240"
+    collection_config = DataConfig()
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+        self.calls: list[str] = []
+
+    def fetch_page(self, to_utc: str) -> list[dict[str, object]]:
+        self.calls.append(to_utc)
+        return list(self.rows)
+
+
+def test_parser_exposes_exact_commands_and_accepts_only_paired_env_names() -> None:
+    parser = build_parser()
+    action = next(item for item in parser._actions if item.dest == "command")
+    assert tuple(action.choices) == (
+        "data-download",
+        "data-quality",
+        "backtest",
+        "walk-forward",
+        "paper-once",
+        "paper-run",
+        "paper-status",
+    )
+
+    parsed = parser.parse_args(
+        [
+            "paper-once",
+            "--db",
+            "paper.sqlite3",
+            "--data-dir",
+            "evidence",
+            "--telegram-token-env",
+            "BOT_TOKEN_NAME",
+            "--telegram-chat-env",
+            "BOT_CHAT_NAME",
+        ]
+    )
+    assert parsed.telegram_token_env == "BOT_TOKEN_NAME"
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "paper-once",
+                "--db",
+                "paper.sqlite3",
+                "--data-dir",
+                "evidence",
+                "--telegram-token",
+                "raw-secret",
+            ]
+        )
+
+
+def test_paper_status_missing_db_is_nonzero_and_creates_nothing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "missing.sqlite3"
+
+    assert main(["paper-status", "--db", str(path)]) != 0
+
+    assert not path.exists()
+    assert tuple(tmp_path.iterdir()) == ()
+    assert capsys.readouterr().out == ""
+
+
+def test_paper_status_is_byte_and_metadata_read_only_with_stable_json(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    store.close()
+    before_files = tuple(sorted(item.name for item in tmp_path.iterdir()))
+    before_bytes = path.read_bytes()
+    before_stat = path.stat()
+
+    assert main(["paper-status", "--db", str(path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert list(payload) == sorted(payload)
+    assert payload["mode"] == "normalized-paper"
+    assert payload["normalized_cash"] == 100.0
+    assert payload["normalized_equity"] == 100.0
+    assert payload["btc_quantity"] == 0.0
+    assert payload["position_state"] == "FLAT"
+    assert payload["health_stage"] == "NORMAL"
+    assert payload["last_completed_candle_utc"] is None
+    assert payload["pending_orders"] == []
+    assert payload["next_scheduled_utc"].endswith("Z")
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_size == before_stat.st_size
+    assert path.stat().st_mtime_ns == before_stat.st_mtime_ns
+    assert tuple(sorted(item.name for item in tmp_path.iterdir())) == before_files
+
+
+def test_paper_status_corrupt_db_is_nonzero_and_byte_unchanged(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "corrupt.sqlite3"
+    path.write_bytes(b"not a sqlite ledger")
+    before = path.read_bytes()
+    before_stat = path.stat()
+
+    assert main(["paper-status", "--db", str(path)]) != 0
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "not a sqlite ledger" not in captured.err
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime_ns == before_stat.st_mtime_ns
+    assert tuple(item.name for item in tmp_path.iterdir()) == (path.name,)
+
+
+def test_paper_status_rejects_forged_operational_event_without_mutation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    HealthMonitor().persist(
+        store,
+        event_id="health:seed",
+        logical_at=END - timedelta(hours=4),
+    )
+    store.append_event(
+        "alert-attempt:forged",
+        "ALERT_ATTEMPT",
+        END - timedelta(hours=3),
+        {
+            "source_event_id": "health:seed",
+            "source_event_type": "HEALTH_STATE",
+            "version": 1,
+        },
+    )
+    store.close()
+    before_bytes = path.read_bytes()
+    before_stat = path.stat()
+    before_files = tuple(sorted(item.name for item in tmp_path.iterdir()))
+
+    assert main(["paper-status", "--db", str(path)]) != 0
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "paper-status failed: INVALID_OR_MISSING_LEDGER\n"
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_size == before_stat.st_size
+    assert path.stat().st_mtime_ns == before_stat.st_mtime_ns
+    assert tuple(sorted(item.name for item in tmp_path.iterdir())) == before_files
+
+
+def test_paper_status_reports_live_wal_pending_long_stop_and_recovery_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: END + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    order = broker.submit_entry(
+        END - timedelta(hours=4),
+        quantity=0.2,
+        reason="ENTRY_BREAKOUT",
+    )
+
+    before_pending = _ledger_file_image(path)
+    assert main(["paper-status", "--db", str(path)]) == 0
+    pending = json.loads(capsys.readouterr().out)
+    assert pending["position_state"] == "ENTRY_PENDING"
+    assert pending["pending_orders"] == [order.order_id]
+    assert pending["active_stop"] is None
+    assert _ledger_file_image(path) == before_pending
+
+    broker.process_open(order.order_id, END, open_price=100.0)
+    stop = broker.set_stop(END, 98.0, reason="HARD_STOP")
+    monitor = HealthMonitor.from_store(store)
+    for offset in (1, 2, 3):
+        observed = END + timedelta(minutes=offset)
+        monitor.record_api_failure(observed)
+        monitor.persist(
+            store,
+            event_id=f"health:failure:{offset}",
+            logical_at=observed,
+        )
+
+    before_halted = _ledger_file_image(path)
+    assert main(["paper-status", "--db", str(path)]) == 0
+    halted = json.loads(capsys.readouterr().out)
+    assert halted["position_state"] == "LONG"
+    assert halted["btc_quantity"] == 0.2
+    assert halted["active_stop"]["stop_price"] == stop.stop_price
+    assert halted["health_stage"] == "HALTED"
+    assert halted["health_recovery_progress"]["successes_observed"] == 0
+    assert _ledger_file_image(path) == before_halted
+
+    for offset in (4, 5, 6):
+        observed = END + timedelta(minutes=offset)
+        monitor.record_api_success(observed)
+        monitor.persist(
+            store,
+            event_id=f"health:success:{offset}",
+            logical_at=observed,
+        )
+    before_reduced = _ledger_file_image(path)
+    assert main(["paper-status", "--db", str(path)]) == 0
+    reduced = json.loads(capsys.readouterr().out)
+    assert reduced["health_stage"] == "REDUCED"
+    assert reduced["health_recovery_progress"]["successes_observed"] == 3
+    assert reduced["health_recovery_progress"]["successes_required"] == 3
+    assert _ledger_file_image(path) == before_reduced
+
+
+def _ledger_file_image(path: Path) -> tuple[tuple[str, bytes, int, int], ...]:
+    return tuple(
+        (
+            item.name,
+            item.read_bytes(),
+            item.stat().st_size,
+            item.stat().st_mtime_ns,
+        )
+        for item in sorted(path.parent.iterdir(), key=lambda candidate: candidate.name)
+    )
+
+
+def test_public_source_binds_cache_to_exclusive_end_and_requires_601_bars(
+    tmp_path: Path,
+) -> None:
+    start = END - timedelta(hours=4 * 601)
+    rows = [_raw_row(start - timedelta(hours=4))]
+    rows.extend(_raw_row(start + timedelta(hours=4 * index)) for index in range(601))
+    client = _PublicClient(list(reversed(rows)))
+    source = _PublicPaperCandleSource(tmp_path, client=client)
+
+    frame = source.load_completed_candles(END)
+
+    assert len(frame) == 601
+    assert frame.index[0].to_pydatetime() == start
+    assert frame.index[-1].to_pydatetime() == END - timedelta(hours=4)
+    assert all(timestamp.to_pydatetime() < END for timestamp in frame.index)
+    assert len(client.calls) == 1
+
+
+def test_corrupt_public_cache_fails_before_network_and_is_not_replaced(
+    tmp_path: Path,
+) -> None:
+    start = END - timedelta(hours=4 * 601)
+    rows = [_raw_row(start - timedelta(hours=4))]
+    rows.extend(_raw_row(start + timedelta(hours=4 * index)) for index in range(601))
+    first = _PublicClient(list(reversed(rows)))
+    _PublicPaperCandleSource(tmp_path, client=first).load_completed_candles(END)
+    checkpoint = next(tmp_path.rglob("checkpoint.json"))
+    checkpoint.write_text("{corrupt", encoding="utf-8")
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    second = _PublicClient([])
+
+    with pytest.raises(ValueError, match="malformed"):
+        _PublicPaperCandleSource(tmp_path, client=second).load_completed_candles(END)
+
+    assert second.calls == []
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+
+
+def test_application_persists_three_failures_three_successes_and_auto_promotes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    clock = _Clock(END + timedelta(minutes=10))
+    sleeper = _Sleeper(clock)
+    next_end = END + timedelta(hours=4)
+    source = _FrameSource(
+        [
+            RuntimeError("outage-1"),
+            RuntimeError("outage-2"),
+            RuntimeError("outage-3"),
+            _history(END),
+            _history(END),
+            _history(END),
+            _history(next_end, 602),
+        ]
+    )
+    app = _PaperApplication(
+        source=source,
+        store=store,
+        clock=clock,
+        sleeper=sleeper,
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="test-worker",
+        lease_token="test-token",
+    )
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="outage"):
+            app.run_once()
+    assert HealthMonitor.from_store(store).current_action().stage is HealthStage.HALTED
+    for _ in range(3):
+        app.run_once()
+    assert HealthMonitor.from_store(store).current_action().stage is HealthStage.REDUCED
+
+    promoted = app.run_once()
+
+    assert promoted.status is CycleStatus.PROCESSED
+    assert promoted.end_utc == next_end
+    assert HealthMonitor.from_store(store).current_action().stage is HealthStage.NORMAL
+    health_events = [
+        event.event_id
+        for event in store.replay_state().event_evidence
+        if event.event_type == "HEALTH_STATE"
+    ]
+    assert len(health_events) == len(set(health_events))
+    assert sum(identity.startswith("health:recovery:") for identity in health_events) == 1
+    assert sleeper.delays[:5] == [1.0, 1.0, 1.0, 2.0, 4.0]
+    assert sleeper.delays[-1] > 14_000.0
+    assert source.calls[:6] == [END] * 6
+    assert source.calls[-1] == next_end
+    cycles = [
+        event
+        for event in store.replay_state().event_evidence
+        if event.event_type == "PAPER_CYCLE"
+    ]
+    assert [event.occurred_at_utc for event in cycles] == [END, next_end]
+    assert PaperBroker(store, CostConfig(0.0, 0.0)).reconcile().active_orders == ()
+
+
+def test_health_only_cursor_compatibility_does_not_accept_arbitrary_events(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    store.append_event(
+        "unknown-operational-event",
+        "UNKNOWN_EVIDENCE",
+        END - timedelta(hours=4),
+        {"value": 1},
+    )
+    clock = _Clock(END + timedelta(minutes=10))
+    source = _FrameSource([_history(END)])
+    app = _PaperApplication(
+        source=source,
+        store=store,
+        clock=clock,
+        sleeper=_Sleeper(clock),
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="unknown-worker",
+        lease_token="unknown-token",
+    )
+
+    with pytest.raises(RuntimeError, match="no resolvable cycle cursor"):
+        app.run_once()
+
+    assert source.calls == []
+
+
+@pytest.mark.parametrize(
+    ("event_id", "event_type", "payload"),
+    [
+        (
+            "alert-attempt:forged",
+            "ALERT_ATTEMPT",
+            {
+                "source_event_id": "health:seed",
+                "source_event_type": "HEALTH_STATE",
+                "version": 1,
+            },
+        ),
+        (
+            "alert-attempt:orphan",
+            "ALERT_ATTEMPT",
+            {
+                "source_event_id": "health:missing",
+                "source_event_type": "HEALTH_STATE",
+                "version": 1,
+            },
+        ),
+        (
+            "alert-failure:orphan",
+            "ALERT_FAILURE",
+            {
+                "failure_code": "DELIVERY_FAILED",
+                "source_event_id": "health:seed",
+                "source_event_type": "HEALTH_STATE",
+                "version": 1,
+            },
+        ),
+    ],
+)
+def test_health_cursor_rejects_forged_alert_identity_or_payload_chain(
+    tmp_path: Path,
+    event_id: str,
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    store = SQLiteStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    HealthMonitor().persist(
+        store,
+        event_id="health:seed",
+        logical_at=END - timedelta(hours=4),
+    )
+    store.append_event(event_id, event_type, END - timedelta(hours=3), payload)
+    clock = _Clock(END + timedelta(minutes=10))
+    source = _FrameSource([_history(END)])
+    app = _PaperApplication(
+        source=source,
+        store=store,
+        clock=clock,
+        sleeper=_Sleeper(clock),
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="forged-worker",
+        lease_token="forged-token",
+    )
+
+    with pytest.raises(RuntimeError, match="alert evidence"):
+        app.run_once()
+
+    assert source.calls == []
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        _history(END).drop(columns=["volume"]),
+        _history(END).rename(
+            index={_history(END).index[-1]: _history(END).index[-1] + pd.Timedelta(hours=1)}
+        ),
+        _history(END - timedelta(hours=4)),
+    ],
+)
+def test_malformed_timestamp_or_missing_latest_persists_health_before_no_cycle(
+    tmp_path: Path,
+    broken: pd.DataFrame,
+) -> None:
+    store = SQLiteStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    clock = _Clock(END + timedelta(minutes=10))
+    app = _PaperApplication(
+        source=_FrameSource([broken]),
+        store=store,
+        clock=clock,
+        sleeper=_Sleeper(clock),
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="invalid-worker",
+        lease_token="invalid-token",
+    )
+
+    with pytest.raises(ValueError):
+        app.run_once()
+
+    snapshot = store.replay_state()
+    assert HealthMonitor.from_store(store).current_action().stage is HealthStage.HALTED
+    assert any(event.event_type == "HEALTH_STATE" for event in snapshot.event_evidence)
+    assert not any(event.event_type == "PAPER_CYCLE" for event in snapshot.event_evidence)
+    assert PaperBroker(store, CostConfig(0.0, 0.0)).reconcile().active_orders == ()
+
+
+def test_paper_once_prints_one_non_secret_json_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: END + timedelta(minutes=10))
+    monkeypatch.setattr(
+        "autobit.cli._paper_source_factory",
+        lambda data_dir: _FrameSource([_history(END)]),
+    )
+    monkeypatch.setenv("BOT_TOKEN_NAME", "NEVER-PRINT-TOKEN")
+    monkeypatch.setenv("BOT_CHAT_NAME", "NEVER-PRINT-CHAT")
+    monkeypatch.setattr("autobit.cli._telegram_notifier_factory", lambda token, chat: None)
+
+    code = main(
+        [
+            "paper-once",
+            "--db",
+            str(tmp_path / "paper.sqlite3"),
+            "--data-dir",
+            str(tmp_path / "evidence"),
+            "--telegram-token-env",
+            "BOT_TOKEN_NAME",
+            "--telegram-chat-env",
+            "BOT_CHAT_NAME",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert code == 0
+    assert payload["status"] == "PROCESSED"
+    assert payload["end_utc"] == "2026-05-11T04:00:00Z"
+    rendered = captured.out + captured.err + (tmp_path / "paper.sqlite3").read_bytes().decode(
+        "utf-8", errors="ignore"
+    )
+    assert "NEVER-PRINT-TOKEN" not in rendered
+    assert "NEVER-PRINT-CHAT" not in rendered
+
+
+def test_paper_run_continues_recoverable_error_then_ctrl_c_rolls_back_active_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+
+    class InterruptingApplication:
+        calls = 0
+
+        def __init__(self, store: SQLiteStore) -> None:
+            self.store = store
+
+        def run_once(self) -> object:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("recoverable secret detail")
+            with self.store.transaction():
+                self.store.append_event(
+                    "must-roll-back",
+                    "CYCLE_EVIDENCE",
+                    END,
+                    {"value": 1},
+                )
+                raise KeyboardInterrupt
+
+    holder: dict[str, InterruptingApplication] = {}
+
+    def factory(arguments, store, notifier):
+        del arguments, notifier
+        holder["app"] = InterruptingApplication(store)
+        return holder["app"]
+
+    monkeypatch.setattr("autobit.cli._new_paper_application", factory)
+
+    assert main(
+        ["paper-run", "--db", str(path), "--data-dir", str(tmp_path / "evidence")]
+    ) == 130
+
+    captured = capsys.readouterr()
+    assert "secret detail" not in captured.err
+    assert holder["app"].calls == 2
+    reopened = SQLiteStore(path)
+    reopened.initialize()
+    assert not any(
+        event.event_id == "must-roll-back"
+        for event in reopened.replay_state().event_evidence
+    )

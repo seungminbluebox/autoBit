@@ -18,6 +18,7 @@ import math
 from pathlib import Path
 import re
 import sqlite3
+import tempfile
 import threading
 from types import MappingProxyType
 from typing import Any
@@ -247,13 +248,52 @@ class _TransactionFacade:
 class SQLiteStore:
     """One explicit-transaction SQLite connection for a normalized paper ledger."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        _read_only: bool = False,
+        _connection_path: Path | None = None,
+        _temporary_snapshot: tempfile.TemporaryDirectory[str] | None = None,
+    ) -> None:
         self.path = Path(path)
+        self._read_only = _read_only
+        self._connection_path = _connection_path or self.path
+        self._temporary_snapshot = _temporary_snapshot
         self._connection: sqlite3.Connection | None = None
         self._initialized = False
         self._closed = False
         self._lock = threading.RLock()
         self._savepoint_counter = 0
+
+    @classmethod
+    def open_read_only(cls, path: str | Path) -> SQLiteStore:
+        """Open and fully verify an existing ledger without initialization writes."""
+        resolved = Path(path)
+        if not resolved.is_file():
+            raise StoreError("read-only store requires an existing database file")
+        temporary = tempfile.TemporaryDirectory(prefix="autobit-status-")
+        snapshot_path = Path(temporary.name) / resolved.name
+        try:
+            _copy_stable_sqlite_snapshot(resolved, snapshot_path)
+        except Exception:
+            temporary.cleanup()
+            raise
+        store = cls(
+            resolved,
+            _read_only=True,
+            _connection_path=snapshot_path,
+            _temporary_snapshot=temporary,
+        )
+        try:
+            connection = store._connect()
+            store._validate_schema_and_identity(connection)
+            store._replay_and_verify(connection)
+            store._initialized = True
+        except Exception:
+            store.close()
+            raise
+        return store
 
     def __enter__(self) -> SQLiteStore:
         self._ensure_not_closed()
@@ -276,6 +316,8 @@ class SQLiteStore:
     ) -> None:
         """Create or validate schema version 1 without migrating unknown state."""
         self._ensure_not_closed()
+        if self._read_only:
+            raise StoreError("read-only store cannot be initialized")
         normalized_equity = _finite_number(
             initial_equity,
             "initial equity must be finite and exactly 100",
@@ -324,6 +366,9 @@ class SQLiteStore:
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
+            if self._temporary_snapshot is not None:
+                self._temporary_snapshot.cleanup()
+                self._temporary_snapshot = None
             self._initialized = False
             self._closed = True
 
@@ -331,6 +376,7 @@ class SQLiteStore:
     def transaction(self) -> Iterator[_TransactionFacade]:
         """Run a public mutation boundary using ``BEGIN IMMEDIATE``."""
         self._ensure_ready()
+        self._ensure_writable()
         with self._transaction(require_initialized=True) as connection:
             yield _TransactionFacade(connection)
             self._replay_and_verify(connection)
@@ -835,6 +881,7 @@ class SQLiteStore:
     @contextmanager
     def _mutation_transaction(self) -> Iterator[sqlite3.Connection]:
         """Expose the raw connection only to store-owned mutation methods."""
+        self._ensure_writable()
         with self._transaction(require_initialized=True) as connection:
             yield connection
             self._replay_and_verify(connection)
@@ -845,6 +892,7 @@ class SQLiteStore:
         *,
         require_initialized: bool,
     ) -> Iterator[sqlite3.Connection]:
+        self._ensure_writable()
         if require_initialized:
             self._ensure_ready()
         else:
@@ -877,14 +925,26 @@ class SQLiteStore:
 
     def _connect(self) -> sqlite3.Connection:
         if self._connection is None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._connection = sqlite3.connect(
-                self.path,
-                timeout=5.0,
-                isolation_level=None,
-                check_same_thread=False,
-            )
+            if self._read_only:
+                uri = f"{self._connection_path.resolve().as_uri()}?mode=ro"
+                self._connection = sqlite3.connect(
+                    uri,
+                    uri=True,
+                    timeout=5.0,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+            else:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._connection = sqlite3.connect(
+                    self.path,
+                    timeout=5.0,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
             self._connection.row_factory = sqlite3.Row
+            if self._read_only:
+                self._connection.execute("PRAGMA query_only=ON")
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA busy_timeout=5000")
         return self._connection
@@ -1406,6 +1466,39 @@ class SQLiteStore:
         self._ensure_not_closed()
         if not self._initialized or self._connection is None:
             raise RuntimeError("store is not initialized")
+
+    def _ensure_writable(self) -> None:
+        if self._read_only:
+            raise StoreError("store is read-only")
+
+
+def _copy_stable_sqlite_snapshot(source: Path, destination: Path) -> None:
+    """Copy a stable main/WAL pair without opening or mutating the source."""
+    wal_source = Path(f"{source}-wal")
+
+    def capture() -> tuple[bytes, bytes | None]:
+        main = source.read_bytes()
+        wal = wal_source.read_bytes() if wal_source.exists() else None
+        if wal_source.exists() != (wal is not None):
+            raise OSError("SQLite WAL changed while taking a read-only snapshot")
+        return main, wal
+
+    stable: tuple[bytes, bytes | None] | None = None
+    for _ in range(5):
+        try:
+            first = capture()
+            second = capture()
+        except OSError:
+            continue
+        if first == second:
+            stable = second
+            break
+    if stable is None:
+        raise StoreError("could not capture a stable read-only database snapshot")
+    main, wal = stable
+    destination.write_bytes(main)
+    if wal is not None:
+        Path(f"{destination}-wal").write_bytes(wal)
 
 
 def _initial_snapshot() -> PaperSnapshot:

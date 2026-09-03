@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 import math
 from typing import Protocol, TypeVar
@@ -11,6 +12,7 @@ _FOUR_HOURS = timedelta(hours=4)
 _MATURITY_DELAY = timedelta(minutes=10)
 _DEFAULT_RETRY_DELAY_SECONDS = 1.0
 _MAX_RETRY_DELAY_SECONDS = 60.0
+_MAX_DYNAMIC_RETRY_DELAY_SECONDS = 300.0
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _ResultT = TypeVar("_ResultT")
 
@@ -56,6 +58,8 @@ class PaperScheduler:
         clock: Clock,
         sleeper: Sleeper,
         retry_delay_seconds: float = _DEFAULT_RETRY_DELAY_SECONDS,
+        *,
+        retry_delay_provider: Callable[[], float] | None = None,
     ) -> None:
         if isinstance(retry_delay_seconds, bool):
             raise ValueError("retry delay must be positive and at most sixty seconds")
@@ -71,6 +75,9 @@ class PaperScheduler:
         self._clock = clock
         self._sleeper = sleeper
         self._retry_delay_seconds = delay
+        if retry_delay_provider is not None and not callable(retry_delay_provider):
+            raise TypeError("retry delay provider must be callable")
+        self._retry_delay_provider = retry_delay_provider
         self._next_end: datetime | None = None
 
     def run_once(self) -> _ResultT:
@@ -104,13 +111,29 @@ class PaperScheduler:
         try:
             result = self._service.process_completed_candle(process_end)
         except Exception:
-            self._sleeper.sleep(self._retry_delay_seconds)
+            self._sleeper.sleep(self._current_retry_delay())
             raise
         if getattr(result, "status", None) == "LEASE_HELD":
-            self._sleeper.sleep(self._retry_delay_seconds)
+            self._sleeper.sleep(self._current_retry_delay())
             return result
         self._next_end = following_end
         return result
+
+    def _current_retry_delay(self) -> float:
+        if self._retry_delay_provider is None:
+            return self._retry_delay_seconds
+        value = self._retry_delay_provider()
+        if isinstance(value, bool):
+            raise ValueError("dynamic retry delay must be positive and at most 300 seconds")
+        try:
+            delay = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "dynamic retry delay must be positive and at most 300 seconds"
+            ) from error
+        if not math.isfinite(delay) or not 0.0 < delay <= _MAX_DYNAMIC_RETRY_DELAY_SECONDS:
+            raise ValueError("dynamic retry delay must be positive and at most 300 seconds")
+        return delay
 
 
 def _floor_four_hours(value: datetime) -> datetime:

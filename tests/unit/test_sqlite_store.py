@@ -14,6 +14,7 @@ from autobit.domain.models import OrderStatus, PositionState
 from autobit.persistence.sqlite_store import (
     IdempotencyConflictError,
     SQLiteStore,
+    StoreError,
     StoreCorruptionError,
 )
 
@@ -1158,6 +1159,46 @@ def test_context_manager_and_close_are_idempotent(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="store is closed"):
         store.replay_state()
+
+
+def test_read_only_open_requires_existing_database_and_never_creates_it(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "missing.sqlite3"
+
+    with pytest.raises(StoreError, match="existing"):
+        SQLiteStore.open_read_only(path)
+
+    assert not path.exists()
+    assert tuple(tmp_path.iterdir()) == ()
+
+
+def test_read_only_open_sees_committed_wal_tail_without_mutating_database_or_wal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    writer = _open_store(path)
+    writer.append_event("committed-tail", "CYCLE_EVIDENCE", UTC_0, {"value": 1})
+    before_files = tuple(sorted(item.name for item in tmp_path.iterdir()))
+    before_db = path.read_bytes()
+    wal = Path(f"{path}-wal")
+    before_wal = wal.read_bytes()
+
+    reader = SQLiteStore.open_read_only(path)
+    snapshot = reader.replay_state()
+    reader.close()
+
+    assert snapshot.last_sequence == 1
+    assert snapshot.event_evidence[-1].event_id == "committed-tail"
+    assert path.read_bytes() == before_db
+    assert wal.read_bytes() == before_wal
+    assert tuple(sorted(item.name for item in tmp_path.iterdir())) == before_files
+    blocked = SQLiteStore.open_read_only(path)
+    try:
+        with pytest.raises(StoreError, match="read-only"):
+            blocked.append_event("forbidden", "CYCLE_EVIDENCE", UTC_4, {})
+    finally:
+        blocked.close()
 
 
 def _table_names(path: Path) -> set[str]:

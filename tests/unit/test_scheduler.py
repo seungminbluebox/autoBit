@@ -197,6 +197,37 @@ def test_scheduler_retries_the_same_end_after_service_exception() -> None:
     assert sleeper.delays == [1.0]
 
 
+def test_scheduler_reads_dynamic_health_delay_once_after_each_failure() -> None:
+    class AlwaysFail(_RecordingService):
+        def process_completed_candle(self, end_utc: datetime) -> str:
+            self.ends.append(end_utc)
+            raise RuntimeError("recoverable public-data failure")
+
+    delays = iter((1.0, 2.0, 4.0, 8.0, 16.0, 300.0, 300.0))
+    provider_calls = 0
+
+    def current_health_delay() -> float:
+        nonlocal provider_calls
+        provider_calls += 1
+        return next(delays)
+
+    clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
+    sleeper = _AdvancingSleeper(clock)
+    scheduler = PaperScheduler(
+        AlwaysFail(),
+        clock,
+        sleeper,
+        retry_delay_provider=current_health_delay,
+    )
+
+    for _ in range(7):
+        with pytest.raises(RuntimeError, match="recoverable"):
+            scheduler.run_once()
+
+    assert provider_calls == 7
+    assert sleeper.delays == [1.0, 2.0, 4.0, 8.0, 16.0, 300.0, 300.0]
+
+
 def test_scheduler_retries_lease_held_end_then_advances_after_completion() -> None:
     clock = _MutableClock(datetime(2026, 1, 1, 8, 11, tzinfo=UTC))
     sleeper = _AdvancingSleeper(clock)

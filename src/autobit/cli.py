@@ -2,13 +2,18 @@
 
 import argparse
 from dataclasses import asdict, fields
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from itertools import combinations
 import json
 import math
+import os
 from pathlib import Path
+import re
 import sys
+import time
+from typing import Protocol
+from uuid import uuid4
 
 import httpx
 import pandas as pd
@@ -16,12 +21,26 @@ import pandas as pd
 from autobit.backtest.analyzers import PerformanceMetrics, calculate_metrics
 from autobit.backtest.benchmark import BuyAndHoldResult, run_buy_and_hold
 from autobit.backtest.engine import BacktestConfig, run_backtest
+from autobit.alerts.notifier import Notifier, SafeNotifier, TelegramNotifier, deliver_alert_once
 from autobit.config import CostConfig, DataConfig, ExchangeRulesConfig, StrategyConfig
 from autobit.data.collector import collect_evidence_range, load_completed_evidence_frame
 from autobit.data.quality import QualityReport, canonicalize_ohlcv
 from autobit.data.storage import _atomic_write, _canonical_json_bytes
-from autobit.data.upbit_public import UpbitPublicClient
+from autobit.data.upbit_public import PublicDataUnavailable, UpbitPublicClient
+from autobit.execution.paper_broker import PaperBroker, PaperReconciliation
 from autobit.indicators.trend import compute_trend_indicators
+from autobit.paper.health import HealthMonitor, HealthStage
+from autobit.paper.scheduler import PaperScheduler, latest_completed_end, next_cycle_at
+from autobit.paper.service import (
+    CycleResult,
+    CycleStatus,
+    PaperService,
+    _completed_cycle_ends,
+    _has_completed_cycle,
+    _validate_health_and_risk_chain,
+    _validate_operational_alert_chain,
+)
+from autobit.persistence.sqlite_store import SQLiteStore, StoreError, StoredEvent
 from autobit.reporting.reports import SCHEMA_VERSION, write_report_bundle
 from autobit.reporting.validation import (
     BenchmarkComparisonRow,
@@ -55,6 +74,8 @@ from autobit.validation.trials import registered_cost_scenarios, registered_tria
 _FOUR_HOURS = pd.Timedelta(hours=4)
 _TRIAL_IDS = tuple(trial.trial_id for trial in registered_trials())
 _COST_IDS = tuple(cost.cost_id for cost in registered_cost_scenarios())
+_PAPER_HISTORY_BARS = 601
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,6 +127,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exclusive aware UTC 4-hour boundary",
     )
     validation.set_defaults(handler=_run_walk_forward)
+
+    for name, help_text, handler in (
+        ("paper-once", "Process one normalized paper candle", _run_paper_once),
+        ("paper-run", "Run normalized paper automation", _run_paper_run),
+    ):
+        paper = commands.add_parser(name, help=help_text)
+        paper.add_argument("--db", type=Path, required=True, help="Normalized paper ledger")
+        paper.add_argument("--data-dir", type=Path, required=True, help="Public candle evidence")
+        paper.add_argument("--telegram-token-env", type=_environment_name, default=None)
+        paper.add_argument("--telegram-chat-env", type=_environment_name, default=None)
+        paper.set_defaults(handler=handler)
+
+    status = commands.add_parser("paper-status", help="Read normalized paper state")
+    status.add_argument("--db", type=Path, required=True, help="Existing normalized paper ledger")
+    status.set_defaults(handler=_run_paper_status)
     return parser
 
 
@@ -234,6 +270,620 @@ def _run_walk_forward(arguments: argparse.Namespace) -> int:
         print(f"walk-forward failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 2
     return 0
+
+
+class _SystemClock:
+    def now(self) -> datetime:
+        return _utc_now()
+
+
+class _SystemSleeper:
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+class _CandleSchemaError(ValueError):
+    pass
+
+
+class _CandleTimestampError(ValueError):
+    pass
+
+
+class _CandleLatestError(ValueError):
+    pass
+
+
+class _PublicPaperCandleSource:
+    """Durable public-only evidence bound to one exclusive completed end."""
+
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        client: UpbitPublicClient | None = None,
+    ) -> None:
+        self._data_dir = Path(data_dir)
+        self._client = client
+
+    def load_completed_candles(self, end_utc: datetime) -> pd.DataFrame:
+        end = _paper_end(end_utc)
+        if self._data_dir.exists() and (
+            not self._data_dir.is_dir() or self._data_dir.is_symlink()
+        ):
+            raise ValueError("paper data directory must be a real directory")
+        start = end - timedelta(hours=4 * _PAPER_HISTORY_BARS)
+        identity = hashlib.sha256(_format_utc(end).encode("utf-8")).hexdigest()
+        evidence_root = self._data_dir / "KRW-BTC-240" / identity
+        if evidence_root.exists() and (
+            not evidence_root.is_dir() or evidence_root.is_symlink()
+        ):
+            raise ValueError("paper candle evidence path is invalid")
+        if self._client is None:
+            with httpx.Client() as http_client:
+                client = UpbitPublicClient(http_client, DataConfig())
+                collected = collect_evidence_range(
+                    client,
+                    _format_utc(start),
+                    _format_utc(end),
+                    evidence_root=evidence_root,
+                    config=DataConfig(),
+                )
+        else:
+            collected = collect_evidence_range(
+                self._client,
+                _format_utc(start),
+                _format_utc(end),
+                evidence_root=evidence_root,
+                config=DataConfig(),
+            )
+        raw = collected.frame
+        if "market" not in raw or not raw["market"].eq("KRW-BTC").all():
+            raise _CandleSchemaError("public candle market evidence is invalid")
+        renamed = raw.rename(
+            columns={
+                "candle_date_time_utc": "timestamp",
+                "opening_price": "open",
+                "high_price": "high",
+                "low_price": "low",
+                "trade_price": "close",
+                "candle_acc_trade_volume": "volume",
+            }
+        )
+        if "timestamp" not in renamed:
+            raise _CandleSchemaError("public candles are missing timestamps")
+        frame = renamed.loc[:, ["timestamp", "open", "high", "low", "close", "volume"]].copy()
+        try:
+            frame.index = pd.to_datetime(frame.pop("timestamp"), utc=True, errors="raise")
+        except (TypeError, ValueError) as error:
+            raise _CandleTimestampError("public candle timestamps are invalid") from error
+        return _validated_paper_frame(frame, end)
+
+
+class _ObservedCandleSource:
+    """Persist one health observation before PaperService may decide an entry."""
+
+    def __init__(
+        self,
+        source: object,
+        store: SQLiteStore,
+        clock: object,
+        notifier: Notifier | None,
+    ) -> None:
+        self._source = source
+        self._store = store
+        self._clock = clock
+        self._notifier = notifier
+        self._prepared: dict[datetime, pd.DataFrame] = {}
+
+    def prepare(self, end_utc: datetime) -> pd.DataFrame:
+        end = _paper_end(end_utc)
+        observed = _clock_now(self._clock)
+        monitor = HealthMonitor.from_store(self._store)
+        outcome = "success"
+        try:
+            loader = getattr(self._source, "load_completed_candles")
+            frame = _validated_paper_frame(loader(end), end)
+        except Exception as error:
+            if isinstance(error, _CandleTimestampError):
+                monitor.record_timestamp_check(False, observed)
+                outcome = "timestamp"
+            elif isinstance(error, (_CandleSchemaError, _CandleLatestError, ValueError, TypeError)):
+                if isinstance(error, _CandleLatestError):
+                    monitor.record_candle_check(
+                        expected_end=end,
+                        observed_end=None,
+                        checked_at=observed,
+                    )
+                    outcome = "candle"
+                else:
+                    monitor.record_schema_check(False, observed)
+                    outcome = "schema"
+            else:
+                monitor.record_api_failure(observed)
+                outcome = "failure"
+            event = self._persist(monitor, end, observed, outcome)
+            self._notify(event)
+            raise
+
+        snapshot = monitor.snapshot()
+        if not snapshot.schema_valid:
+            monitor.record_schema_check(True, observed)
+        if not snapshot.timestamps_monotonic:
+            monitor.record_timestamp_check(True, observed)
+        if not snapshot.latest_candle_valid:
+            monitor.record_candle_check(
+                expected_end=end,
+                observed_end=end,
+                checked_at=observed,
+            )
+        monitor.record_api_success(observed)
+        event = self._persist(monitor, end, observed, outcome)
+        self._notify(event)
+        self._prepared[end] = frame
+        return frame.copy(deep=True)
+
+    def load_completed_candles(self, end_utc: datetime) -> pd.DataFrame:
+        end = _paper_end(end_utc)
+        frame = self._prepared.pop(end, None)
+        if frame is None:
+            frame = self.prepare(end)
+            self._prepared.pop(end, None)
+        return frame.copy(deep=True)
+
+    def _persist(
+        self,
+        monitor: HealthMonitor,
+        end: datetime,
+        observed: datetime,
+        outcome: str,
+    ) -> StoredEvent:
+        event_id = f"health:public:{_format_utc(end)}:{_format_utc(observed)}:{outcome}"
+        monitor.persist(
+            self._store,
+            event_id=event_id,
+            logical_at=_monotonic_event_time(self._store, end - timedelta(hours=4)),
+        )
+        return _event_by_id(self._store, event_id)
+
+    def _notify(self, event: StoredEvent) -> None:
+        if self._notifier is None:
+            return
+        try:
+            deliver_alert_once(
+                self._store,
+                self._notifier,
+                source_event_id=event.event_id,
+                source_event_type=event.event_type,
+                source_payload=event.payload,
+                logical_at=event.occurred_at_utc,
+            )
+        except Exception:
+            return
+
+
+class _OperationalPaperService:
+    def __init__(self, service: PaperService, source: _ObservedCandleSource) -> None:
+        self._service = service
+        self._source = source
+
+    def oldest_required_end(self, latest_matured: datetime) -> datetime:
+        return self._service.oldest_required_end(latest_matured)
+
+    def process_completed_candle(self, end_utc: datetime) -> CycleResult:
+        self._source.prepare(end_utc)
+        return self._service.process_completed_candle(end_utc)
+
+
+class _PaperApplication:
+    """Production wiring around the proven one-candle service and scheduler."""
+
+    def __init__(
+        self,
+        *,
+        source: object,
+        store: SQLiteStore,
+        clock: object,
+        sleeper: object,
+        notifier: Notifier | None,
+        costs: CostConfig = CostConfig(),
+        lease_owner: str,
+        lease_token: str,
+    ) -> None:
+        self._store = store
+        self._clock = clock
+        self._sleeper = sleeper
+        self._notifier = notifier
+        self._costs = costs
+        self._broker = PaperBroker(store, costs)
+        self._source = _ObservedCandleSource(source, store, clock, notifier)
+        service = PaperService(
+            source=self._source,
+            store=store,
+            broker=self._broker,
+            clock=clock,
+            lease_owner=lease_owner,
+            lease_token=lease_token,
+            costs=costs,
+        )
+        self._service = _OperationalPaperService(service, self._source)
+
+    def run_once(self) -> CycleResult:
+        now = _clock_now(self._clock)
+        current_end = latest_completed_end(now)
+        action = HealthMonitor.from_store(self._store).current_action()
+        if action.stage is HealthStage.HALTED and self._is_completed(current_end):
+            if action.retry_delay_seconds > 0:
+                self._sleeper.sleep(float(action.retry_delay_seconds))
+            self._source.prepare(current_end)
+            self._record_reconciliation(current_end, ())
+            refreshed = HealthMonitor.from_store(self._store).current_action()
+            return CycleResult(
+                CycleStatus.ALREADY_PROCESSED,
+                current_end,
+                reasons=refreshed.reasons,
+                equity=self._broker.reconcile().equity,
+            )
+
+        scheduler = PaperScheduler(
+            self._service,
+            self._clock,
+            self._sleeper,
+            retry_delay_provider=self._retry_delay,
+        )
+        result = scheduler.run_once()
+        if result.status in {CycleStatus.PROCESSED, CycleStatus.ALREADY_PROCESSED}:
+            self._record_reconciliation(result.end_utc, result.filled_order_ids)
+            if result.status is CycleStatus.PROCESSED:
+                self._promote_after_reduced_cycle(result.end_utc)
+            self._notify_cycle(result.end_utc)
+        return result
+
+    def _retry_delay(self) -> float:
+        delay = HealthMonitor.from_store(self._store).current_action().retry_delay_seconds
+        return float(max(1, delay))
+
+    def _is_completed(self, end: datetime) -> bool:
+        snapshot = self._store.replay_state()
+        return _has_completed_cycle(
+            snapshot,
+            f"cycle:{_format_utc(end)}",
+            end,
+            self._broker,
+        )
+
+    def _record_reconciliation(
+        self,
+        end: datetime,
+        filled_order_ids: tuple[str, ...],
+    ) -> None:
+        health_events = tuple(
+            event
+            for event in self._store.replay_state().event_evidence
+            if event.event_type == "HEALTH_STATE"
+        )
+        if not health_events:
+            raise StoreError("reconciliation requires durable health evidence")
+        source_health = health_events[-1]
+        binding = hashlib.sha256(source_health.event_id.encode("utf-8")).hexdigest()
+        event_id = (
+            f"health:reconcile:{_format_utc(end)}:"
+            f"{source_health.sequence}:{binding}"
+        )
+        if _find_event(self._store, event_id) is not None:
+            return
+        monitor = HealthMonitor.from_store(self._store)
+        reconciliation = self._broker.reconcile()
+        observed = _clock_now(self._clock)
+        if monitor.snapshot().unresolved_orders != 0:
+            monitor.set_unresolved_orders(0, observed)
+        if not monitor.snapshot().ledger_matches:
+            monitor.record_ledger_check(
+                stored_cash=reconciliation.cash,
+                actual_cash=reconciliation.cash,
+                stored_btc=reconciliation.btc_quantity,
+                actual_btc=reconciliation.btc_quantity,
+                at=observed,
+            )
+        fills = {fill.order_id: fill for fill in reconciliation.fills}
+        for order_id in filled_order_ids:
+            fill = fills.get(order_id)
+            if fill is None:
+                monitor.set_unresolved_orders(1, observed)
+                break
+            multiplier = 1.0 + self._costs.slippage_rate if fill.side == "BUY" else 1.0 - self._costs.slippage_rate
+            monitor.record_fill_check(
+                expected_price=fill.reference_price * multiplier,
+                actual_price=fill.fill_price,
+                at=observed,
+            )
+        monitor.persist(
+            self._store,
+            event_id=event_id,
+            logical_at=_monotonic_event_time(self._store, end),
+        )
+
+    def _promote_after_reduced_cycle(self, end: datetime) -> None:
+        monitor = HealthMonitor.from_store(self._store)
+        if monitor.current_action().stage is not HealthStage.REDUCED:
+            return
+        event_id = f"health:recovery:{_format_utc(end)}"
+        if _find_event(self._store, event_id) is not None:
+            return
+        monitor.record_recovery_cycle_success(_clock_now(self._clock))
+        monitor.persist(
+            self._store,
+            event_id=event_id,
+            logical_at=_monotonic_event_time(self._store, end),
+        )
+
+    def _notify_cycle(self, end: datetime) -> None:
+        if self._notifier is None:
+            return
+        event = _event_by_id(self._store, f"cycle:{_format_utc(end)}")
+        try:
+            deliver_alert_once(
+                self._store,
+                self._notifier,
+                source_event_id=event.event_id,
+                source_event_type=event.event_type,
+                source_payload=event.payload,
+                logical_at=event.occurred_at_utc,
+            )
+        except Exception:
+            return
+
+
+def _run_paper_once(arguments: argparse.Namespace) -> int:
+    store: SQLiteStore | None = None
+    try:
+        notifier = _resolve_notifier(arguments)
+        store = SQLiteStore(arguments.db)
+        store.initialize()
+        application = _new_paper_application(arguments, store, notifier)
+        result = application.run_once()
+        print(_canonical_output(_cycle_output(result)))
+        return 0 if result.status in {CycleStatus.PROCESSED, CycleStatus.ALREADY_PROCESSED} else 2
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        print("paper-once failed: SAFE_OPERATION_ERROR", file=sys.stderr)
+        return 2
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _run_paper_run(arguments: argparse.Namespace) -> int:
+    store: SQLiteStore | None = None
+    try:
+        notifier = _resolve_notifier(arguments)
+        store = SQLiteStore(arguments.db)
+        store.initialize()
+        application = _new_paper_application(arguments, store, notifier)
+        while True:
+            try:
+                result = application.run_once()
+            except KeyboardInterrupt:
+                return 130
+            except Exception:
+                print("paper-run retrying: RECOVERABLE_OPERATION_ERROR", file=sys.stderr)
+                continue
+            print(_canonical_output(_cycle_output(result)))
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        print("paper-run failed: SAFE_CONFIGURATION_ERROR", file=sys.stderr)
+        return 2
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _run_paper_status(arguments: argparse.Namespace) -> int:
+    store: SQLiteStore | None = None
+    try:
+        store = SQLiteStore.open_read_only(arguments.db)
+        snapshot = store.replay_state()
+        chain = _validate_health_and_risk_chain(snapshot)
+        _validate_operational_alert_chain(snapshot.event_evidence)
+        broker = PaperBroker(store)
+        reconciliation = broker.reconcile()
+        health = HealthMonitor.from_store(store).current_action()
+        now = _utc_now()
+        completed = _completed_cycle_ends(
+            snapshot,
+            broker,
+            reconciliation,
+            latest_completed_end(now),
+        )
+        stop = reconciliation.active_stop
+        combined = tuple(
+            dict.fromkeys((*chain.projection.decision.reasons, *health.reasons))
+        )
+        payload = {
+            "active_stop": (
+                None
+                if stop is None
+                else {
+                    "active_after_utc": _format_utc(stop.active_after_utc),
+                    "reason": stop.reason,
+                    "stop_price": stop.stop_price,
+                }
+            ),
+            "breaker_health_reasons": list(combined),
+            "btc_quantity": reconciliation.btc_quantity,
+            "health_recovery_progress": {
+                "remaining_gates": list(health.progress.remaining_gates),
+                "successes_observed": health.progress.successes_observed,
+                "successes_required": health.progress.successes_required,
+            },
+            "health_stage": health.stage.value,
+            "last_completed_candle_utc": (
+                _format_utc(max(completed)) if completed else None
+            ),
+            "market": snapshot.market,
+            "mode": "normalized-paper",
+            "next_scheduled_utc": _format_utc(next_cycle_at(now)),
+            "normalized_cash": reconciliation.cash,
+            "normalized_equity": reconciliation.equity,
+            "pending_orders": [order.order_id for order in reconciliation.active_orders],
+            "position_state": reconciliation.position_state.value,
+        }
+        print(_canonical_output(payload))
+        return 0
+    except Exception:
+        print("paper-status failed: INVALID_OR_MISSING_LEDGER", file=sys.stderr)
+        return 2
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _new_paper_application(
+    arguments: argparse.Namespace,
+    store: SQLiteStore,
+    notifier: Notifier | None,
+) -> _PaperApplication:
+    owner = f"paper-cli-{os.getpid()}"
+    return _PaperApplication(
+        source=_paper_source_factory(arguments.data_dir),
+        store=store,
+        clock=_SystemClock(),
+        sleeper=_SystemSleeper(),
+        notifier=notifier,
+        lease_owner=owner,
+        lease_token=f"{owner}-{uuid4().hex}",
+    )
+
+
+def _resolve_notifier(arguments: argparse.Namespace) -> Notifier | None:
+    token_name = arguments.telegram_token_env
+    chat_name = arguments.telegram_chat_env
+    if (token_name is None) != (chat_name is None):
+        raise ValueError("both telegram environment names are required")
+    if token_name is None:
+        return None
+    token = os.environ.get(token_name, "")
+    chat = os.environ.get(chat_name, "")
+    if not token or not chat:
+        raise ValueError("telegram environment values must be non-empty")
+    return _telegram_notifier_factory(token, chat)
+
+
+def _paper_source_factory(data_dir: Path) -> object:
+    return _PublicPaperCandleSource(data_dir)
+
+
+def _telegram_notifier_factory(token: str, chat: str) -> Notifier:
+    return SafeNotifier(TelegramNotifier(token, chat, http_client=httpx.Client()))
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _validated_paper_frame(frame: object, end: datetime) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame):
+        raise _CandleSchemaError("completed candle source must return a pandas DataFrame")
+    required = {"open", "high", "low", "close", "volume"}
+    if not required.issubset(frame.columns):
+        raise _CandleSchemaError("completed candle source schema is invalid")
+    try:
+        index = pd.DatetimeIndex(frame.index)
+    except (TypeError, ValueError) as error:
+        raise _CandleTimestampError("completed candle timestamps are invalid") from error
+    if index.tz is None or any(timestamp.utcoffset() != timedelta(0) for timestamp in index):
+        raise _CandleTimestampError("completed candle timestamps must use UTC")
+    if not index.is_monotonic_increasing or index.has_duplicates:
+        raise _CandleTimestampError("completed candle timestamps must be unique and increasing")
+    if any(timestamp.minute or timestamp.second or timestamp.microsecond or timestamp.hour % 4 for timestamp in index):
+        raise _CandleTimestampError("completed candle timestamps must align to four hours")
+    if any(timestamp.to_pydatetime() >= end for timestamp in index):
+        raise _CandleLatestError("completed candle source crossed its exclusive end")
+    try:
+        canonical = canonicalize_ohlcv(frame, end).frame
+    except ValueError as error:
+        raise _CandleSchemaError("completed candle values are invalid") from error
+    expected_latest = end - timedelta(hours=4)
+    if canonical.empty or canonical.index[-1].to_pydatetime() != expected_latest:
+        raise _CandleLatestError("exact latest completed candle is missing")
+    tail = canonical.iloc[-_PAPER_HISTORY_BARS:]
+    expected_index = pd.date_range(
+        end=pd.Timestamp(expected_latest),
+        periods=_PAPER_HISTORY_BARS,
+        freq="4h",
+        tz="UTC",
+    )
+    if len(tail) != _PAPER_HISTORY_BARS or not tail.index.equals(expected_index):
+        raise _CandleLatestError("600-bar warmup plus execution candle is incomplete")
+    if tail.loc[:, ["open", "high", "low", "close", "volume"]].isna().any().any():
+        raise _CandleSchemaError("paper candle history contains invalid values")
+    return frame.loc[index < pd.Timestamp(end), ["open", "high", "low", "close", "volume"]].copy(deep=True)
+
+
+def _paper_end(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("paper candle end must be timezone-aware UTC")
+    result = value.astimezone(timezone.utc)
+    if result.minute or result.second or result.microsecond or result.hour % 4:
+        raise ValueError("paper candle end must align to four hours")
+    return result
+
+
+def _clock_now(clock: object) -> datetime:
+    value = getattr(clock, "now")()
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("paper clock must return an aware datetime")
+    return value.astimezone(timezone.utc)
+
+
+def _monotonic_event_time(store: SQLiteStore, logical_at: datetime) -> datetime:
+    evidence = store.replay_state().event_evidence
+    return max(logical_at, evidence[-1].occurred_at_utc) if evidence else logical_at
+
+
+def _find_event(store: SQLiteStore, event_id: str) -> StoredEvent | None:
+    matches = tuple(
+        event for event in store.replay_state().event_evidence if event.event_id == event_id
+    )
+    if len(matches) > 1:
+        raise StoreError("event identity is duplicated")
+    return matches[0] if matches else None
+
+
+def _event_by_id(store: SQLiteStore, event_id: str) -> StoredEvent:
+    event = _find_event(store, event_id)
+    if event is None:
+        raise StoreError("required durable event is missing")
+    return event
+
+
+def _cycle_output(result: CycleResult) -> dict[str, object]:
+    return {
+        "created_order_ids": list(result.created_order_ids),
+        "end_utc": _format_utc(result.end_utc),
+        "filled_order_ids": list(result.filled_order_ids),
+        "normalized_equity": result.equity,
+        "reason_codes": list(result.reasons),
+        "status": result.status.value,
+    }
+
+
+def _canonical_output(payload: object) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _environment_name(value: str) -> str:
+    if not _ENVIRONMENT_NAME.fullmatch(value):
+        raise argparse.ArgumentTypeError("environment variable name is invalid")
+    return value
 
 
 def _walk_forward_config() -> WalkForwardConfig:
