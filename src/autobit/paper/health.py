@@ -76,6 +76,10 @@ class HealthStateError(ValueError):
     """Raised when health evidence is malformed or contradictory."""
 
 
+class EmptyHealthEventError(HealthStateError):
+    """Raised when an actual retained health event has an empty payload."""
+
+
 class HealthStage(str, Enum):
     NORMAL = "NORMAL"
     HALTED = "HALTED"
@@ -232,6 +236,15 @@ class HealthSnapshot:
         )
         _validate_snapshot_relationships(snapshot, halt_entries, resume_reduced)
         return snapshot
+
+    @classmethod
+    def from_event_mapping(cls, payload: Mapping[str, object]) -> HealthSnapshot:
+        """Parse retained event evidence without the no-event compatibility case."""
+        if not isinstance(payload, Mapping):
+            raise HealthStateError("health event payload must be a mapping")
+        if not payload:
+            raise EmptyHealthEventError("health event payload must not be empty")
+        return cls.from_mapping(payload)
 
     def to_mapping(self) -> Mapping[str, object]:
         """Return an immutable canonical JSON-compatible mapping."""
@@ -578,7 +591,7 @@ class HealthMonitor:
         if event.event_type != "HEALTH_STATE" or event.occurred_at_utc != logical_at:
             raise IdempotencyConflictError("health event identity conflicts")
         try:
-            stored = HealthSnapshot.from_mapping(event.payload)
+            stored = HealthSnapshot.from_event_mapping(event.payload)
         except HealthStateError as error:
             raise StoreCorruptionError("stored health event is invalid") from error
         if stored != self._snapshot:
@@ -643,7 +656,7 @@ class HealthMonitor:
 
 
 def _snapshot_from_health_event(event: StoredEvent) -> HealthSnapshot:
-    return HealthSnapshot.from_mapping(event.payload)
+    return HealthSnapshot.from_event_mapping(event.payload)
 
 
 def _derive_reasons(snapshot: HealthSnapshot) -> tuple[str, ...]:

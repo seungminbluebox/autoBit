@@ -30,6 +30,7 @@ from autobit.persistence.sqlite_store import (
     StoredEvent,
 )
 from autobit.paper.health import (
+    EmptyHealthEventError,
     HealthAction,
     HealthMonitor,
     HealthSnapshot,
@@ -1184,7 +1185,7 @@ def _health_gate_from_snapshot(snapshot: PaperSnapshot) -> _HealthGate:
     if gate.action is None:
         return gate
     projected = HealthSnapshot.from_mapping(snapshot.health_state)
-    latest = HealthSnapshot.from_mapping(health_events[-1].payload)
+    latest = HealthSnapshot.from_event_mapping(health_events[-1].payload)
     if projected != latest:
         raise StoreCorruptionError("health projection contradicts event evidence")
     return gate
@@ -1195,7 +1196,9 @@ def _health_gate_from_events(events: Sequence[StoredEvent]) -> _HealthGate:
     latest_event: StoredEvent | None = None
     for event in events:
         try:
-            latest_snapshot = HealthSnapshot.from_mapping(event.payload)
+            latest_snapshot = HealthSnapshot.from_event_mapping(event.payload)
+        except EmptyHealthEventError:
+            raise
         except HealthStateError:
             return _HealthGate(None, event.event_id, event.sequence, 0)
         latest_event = event

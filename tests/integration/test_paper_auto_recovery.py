@@ -8,7 +8,12 @@ import pytest
 
 from autobit.config import CostConfig
 from autobit.execution.paper_broker import PaperBroker
-from autobit.paper.health import HealthMonitor, HealthSnapshot, HealthStage
+from autobit.paper.health import (
+    HealthMonitor,
+    HealthSnapshot,
+    HealthStage,
+    HealthStateError,
+)
 from autobit.paper.service import CycleStatus, PaperService
 from autobit.paper.service import _apply_health_action
 from autobit.persistence.sqlite_store import (
@@ -118,6 +123,19 @@ def _persist(monitor: HealthMonitor, store: SQLiteStore, identity: str) -> int:
     )
 
 
+def _store_with_empty_health_event(path: Path, position: str) -> SQLiteStore:
+    store = SQLiteStore(path)
+    store.initialize()
+    halted = _halted_api_monitor()
+    if position == "older":
+        store.append_event("health:empty", "HEALTH_STATE", BAR_AT, {})
+        halted.persist(store, event_id="health:halted", logical_at=BAR_AT)
+    else:
+        halted.persist(store, event_id="health:halted", logical_at=BAR_AT)
+        store.append_event("health:empty", "HEALTH_STATE", BAR_AT, {})
+    return store
+
+
 def _normal_breaker_payload(tmp_path: Path, identity: str) -> dict[str, object]:
     store, _, service = _service(
         tmp_path / f"normal-risk-{identity}.sqlite3",
@@ -156,6 +174,73 @@ def test_health_snapshot_persists_reopens_and_exact_duplicate_is_noop(tmp_path: 
     assert len(
         [event for event in reopened.replay_state().event_evidence if event.event_type == "HEALTH_STATE"]
     ) == 1
+
+
+@pytest.mark.parametrize("position", ["older", "tail"])
+def test_real_empty_health_event_is_rejected_anywhere_in_store_history(
+    tmp_path: Path,
+    position: str,
+) -> None:
+    path = tmp_path / f"empty-health-{position}.sqlite3"
+    store = _store_with_empty_health_event(path, position)
+    before = store.replay_state()
+    store.close()
+    reopened = SQLiteStore(path)
+    reopened.initialize()
+
+    with pytest.raises(HealthStateError, match="empty|event"):
+        HealthMonitor.from_store(reopened)
+
+    assert reopened.replay_state() == before
+
+
+@pytest.mark.parametrize("position", ["older", "tail"])
+@pytest.mark.parametrize("public_path", ["process", "oldest"])
+def test_empty_health_event_fails_before_any_public_service_side_effect(
+    tmp_path: Path,
+    position: str,
+    public_path: str,
+) -> None:
+    path = tmp_path / f"empty-health-{position}-{public_path}.sqlite3"
+    store = _store_with_empty_health_event(path, position)
+    source = _Source(_history(END, breakout=True))
+    broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    service = PaperService(
+        source=source,
+        store=store,
+        broker=broker,
+        clock=_Clock(END + timedelta(minutes=10)),
+        lease_owner=f"empty-health-{position}-{public_path}",
+        lease_token=f"empty-health-{position}-{public_path}-token",
+        costs=CostConfig(0.0, 0.0),
+    )
+    before = store.replay_state()
+
+    with pytest.raises(HealthStateError, match="empty|event"):
+        if public_path == "process":
+            service.process_completed_candle(END)
+        else:
+            service.oldest_required_end(END)
+
+    assert source.calls == []
+    assert broker.reconcile().active_orders == ()
+    assert broker.reconcile().fills == ()
+    assert store.replay_state() == before
+
+
+def test_store_without_health_events_keeps_task_three_normal_compatibility(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "no-health-events.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    assert HealthMonitor.from_store(store).current_action().stage is HealthStage.NORMAL
+    _, broker, service = _service(path, _history(END, breakout=True), store=store)
+
+    result = service.process_completed_candle(END)
+
+    assert result.reasons == ()
+    assert len(broker.reconcile().active_orders) == 1
 
 
 def test_stale_failure_duplicate_after_reopen_does_not_halt_early(tmp_path: Path) -> None:
