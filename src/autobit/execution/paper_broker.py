@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 import math
@@ -35,7 +35,7 @@ _ACTIVE = frozenset(
     }
 )
 _UTC_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
-_TOLERANCE = Decimal("1e-10")
+_FOUR_HOURS = timedelta(hours=4)
 
 
 class PaperReconciliationError(RuntimeError):
@@ -55,6 +55,9 @@ class PaperOrder:
     status: OrderStatus
     order_kind: str = "MARKET"
     parent_order_id: str | None = None
+    eligible_open_utc: datetime | None = None
+    fee_rate: float = 0.0
+    slippage_rate: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +81,7 @@ class PaperStop:
     reason: str
     observed_at_utc: datetime
     active_after_utc: datetime
+    source_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,22 +185,21 @@ class PaperBroker:
             normalized_reason,
             parent_order_id=None,
         )
-        existing = self._existing_order(order_id)
-        if existing is not None:
-            _assert_same_order(
-                existing,
-                key=key,
-                side="BUY",
-                reason=normalized_reason,
-                signal_at=signal_time,
-                quantity=normalized_quantity,
-                parent_order_id=None,
-            )
-            return existing
-
         with self._store.transaction():
             ledger = self._build_ledger()
-            if ledger.snapshot.btc_quantity > 0.0 or ledger.active_orders:
+            existing = ledger.orders.get(order_id)
+            if existing is not None:
+                _assert_same_order(
+                    existing,
+                    key=key,
+                    side="BUY",
+                    reason=normalized_reason,
+                    signal_at=signal_time,
+                    quantity=normalized_quantity,
+                    parent_order_id=None,
+                )
+                return existing
+            if ledger.snapshot.btc_quantity > 0.0 or ledger.snapshot.pending_orders:
                 raise ValueError("entry requires a flat account with no active order")
             return self._submit_order_in_transaction(
                 signal_text=signal_text,
@@ -208,6 +211,8 @@ class PaperBroker:
                 parent_order_id=None,
                 key=key,
                 order_id=order_id,
+                order_kind="MARKET",
+                eligible_open=_next_boundary(signal_time),
             )
 
     def submit_exit(
@@ -229,35 +234,29 @@ class PaperBroker:
             normalized_reason,
             parent_order_id=parent_order_id,
         )
-        existing = self._existing_order(order_id)
-        if existing is not None:
-            _assert_same_order(
-                existing,
-                key=key,
-                side="SELL",
-                reason=normalized_reason,
-                signal_at=signal_time,
-                quantity=normalized_quantity,
-                parent_order_id=parent_order_id,
-            )
-            return existing
-
         with self._store.transaction():
             ledger = self._build_ledger()
+            existing = ledger.orders.get(order_id)
+            if existing is not None:
+                _assert_same_order(
+                    existing,
+                    key=key,
+                    side="SELL",
+                    reason=normalized_reason,
+                    signal_at=signal_time,
+                    quantity=normalized_quantity,
+                    parent_order_id=parent_order_id,
+                )
+                return existing
+            if parent_order_id is not None:
+                raise ValueError("remainder child orders are broker-managed")
             actual_owned = ledger.snapshot.btc_quantity
-            if not _close(normalized_owned, actual_owned):
+            if not _exact(normalized_owned, actual_owned):
                 raise ValueError("owned quantity does not match paper ledger")
-            if normalized_quantity > normalized_owned + 1e-12:
+            if _decimal(normalized_quantity) > _decimal(normalized_owned):
                 raise ValueError("sell quantity exceeds position")
-            if any(order.side == "SELL" for order in ledger.active_orders):
+            if ledger.snapshot.pending_orders:
                 raise ValueError("an active exit already holds reserved position")
-            reserved = sum(
-                order.remainder_quantity
-                for order in ledger.active_orders
-                if order.side == "SELL"
-            )
-            if normalized_quantity > actual_owned - reserved + 1e-12:
-                raise ValueError("sell quantity exceeds unreserved position")
             order = self._submit_order_in_transaction(
                 signal_text=signal_text,
                 signal_time=signal_time,
@@ -268,6 +267,8 @@ class PaperBroker:
                 parent_order_id=parent_order_id,
                 key=key,
                 order_id=order_id,
+                order_kind="MARKET",
+                eligible_open=_next_boundary(signal_time),
             )
             if ledger.active_stop is not None:
                 self._deactivate_stop_in_transaction(
@@ -306,6 +307,15 @@ class PaperBroker:
                 raise ValueError("market fill candle must be strictly later than signal")
             if order.order_kind != "MARKET":
                 raise ValueError("process_open requires a market order")
+            if order.eligible_open_utc is None or candle_time != order.eligible_open_utc:
+                raise ValueError("market order is eligible only at the immediately following open")
+            if (
+                order.parent_order_id is not None
+                and order.parent_order_id.startswith("paper-order:")
+                and normalized_actual is not None
+                and not _exact(normalized_actual, order.remainder_quantity)
+            ):
+                raise ValueError("remainder child must fill completely")
             return self._process_order_in_transaction(
                 order,
                 candle_text=candle_text,
@@ -323,6 +333,7 @@ class PaperBroker:
     ) -> PaperFill | None:
         """Trigger only a stop that was active before this candle began."""
         candle_text, candle_time = _timestamp(candle_at)
+        _require_boundary(candle_time, "stop candle")
         open_value = _positive(open_price, "open price")
         low_value = _positive(low_price, "low price")
         if low_value > open_value:
@@ -331,7 +342,7 @@ class PaperBroker:
         with self._store.transaction():
             ledger = self._build_ledger()
             stop = ledger.active_stop
-            if stop is None or candle_time <= stop.active_after_utc:
+            if stop is None or candle_time < stop.active_after_utc:
                 return None
             if open_value <= stop.stop_price:
                 reference = open_value
@@ -341,18 +352,18 @@ class PaperBroker:
                 return None
             if ledger.snapshot.btc_quantity <= 0.0:
                 raise PaperReconciliationError("active stop has no owned BTC")
-            if ledger.active_orders:
+            if ledger.snapshot.pending_orders:
                 raise PaperReconciliationError("stop trigger conflicts with an active order")
 
             key, order_id = _order_identity(
-                _canonical_datetime(stop.active_after_utc),
+                _canonical_datetime(stop.observed_at_utc),
                 "SELL",
                 stop.reason,
                 parent_order_id=stop.stop_id,
             )
             order = self._submit_order_in_transaction(
-                signal_text=_canonical_datetime(stop.active_after_utc),
-                signal_time=stop.active_after_utc,
+                signal_text=_canonical_datetime(stop.observed_at_utc),
+                signal_time=stop.observed_at_utc,
                 occurred_at=candle_text,
                 side="SELL",
                 quantity=ledger.snapshot.btc_quantity,
@@ -360,6 +371,8 @@ class PaperBroker:
                 parent_order_id=stop.stop_id,
                 key=key,
                 order_id=order_id,
+                order_kind="STOP",
+                eligible_open=candle_time,
             )
             fill = self._process_order_in_transaction(
                 order,
@@ -383,26 +396,44 @@ class PaperBroker:
         *,
         active_after: str | datetime | None = None,
         reason: str = "HARD_STOP",
+        source_id: str | None = None,
     ) -> PaperStop:
         """Persist a stop whose low-price trigger is effective after its source candle."""
         observed_text, observed_time = _timestamp(observed_at)
+        _require_boundary(observed_time, "stop observation")
+        required_active = _next_boundary(observed_time)
         if active_after is None:
-            active_text, active_time = observed_text, observed_time
+            active_time = required_active
+            active_text = _canonical_datetime(required_active)
         else:
             active_text, active_time = _timestamp(active_after)
-        if active_time > observed_time:
-            raise ValueError("stop cannot become active after it was observed")
+            if active_time != required_active:
+                raise ValueError("stop active time must be the next four-hour boundary")
         price = _positive(stop_price, "stop price")
         normalized_reason = _reason(reason)
-        identity_material = "|".join(
-            (_MARKET, observed_text, active_text, repr(price), normalized_reason)
-        )
-        stop_id = f"paper-stop:{sha256(identity_material.encode('utf-8')).hexdigest()}"
-        event_id = f"paper-stop-set:{sha256(stop_id.encode('utf-8')).hexdigest()}"
-        candidate = PaperStop(stop_id, price, normalized_reason, observed_time, active_time)
 
         with self._store.transaction():
             ledger = self._build_ledger()
+            normalized_source = (
+                _text(source_id, "stop source id")
+                if source_id is not None
+                else _open_entry_identity(ledger)
+            )
+            if normalized_source != _open_entry_identity(ledger):
+                raise ValueError("stop source must be the currently open paper entry")
+            identity_material = "|".join(
+                (_MARKET, normalized_source, observed_text, normalized_reason)
+            )
+            stop_id = f"paper-stop:{sha256(identity_material.encode('utf-8')).hexdigest()}"
+            event_id = f"paper-stop-set:{sha256(stop_id.encode('utf-8')).hexdigest()}"
+            candidate = PaperStop(
+                stop_id,
+                price,
+                normalized_reason,
+                observed_time,
+                active_time,
+                normalized_source,
+            )
             matching = next(
                 (event for event in ledger.snapshot.event_evidence if event.event_id == event_id),
                 None,
@@ -413,6 +444,11 @@ class PaperBroker:
                 return candidate
             if ledger.snapshot.btc_quantity <= 0.0:
                 raise ValueError("stop requires owned BTC")
+            if ledger.active_stop is not None:
+                if _decimal(price) < _decimal(ledger.active_stop.stop_price):
+                    raise ValueError("protective stop cannot loosen")
+                if _exact(price, ledger.active_stop.stop_price):
+                    return ledger.active_stop
             self._store.append_event(
                 event_id,
                 "PAPER_STOP",
@@ -421,6 +457,7 @@ class PaperBroker:
                     "action": "SET",
                     "active_after_utc": active_text,
                     "reason": normalized_reason,
+                    "source_id": normalized_source,
                     "stop_id": stop_id,
                     "stop_price": price,
                 },
@@ -459,9 +496,6 @@ class PaperBroker:
             active_stop=ledger.active_stop,
         )
 
-    def _existing_order(self, order_id: str) -> PaperOrder | None:
-        return self._build_ledger().orders.get(order_id)
-
     def _submit_order_in_transaction(
         self,
         *,
@@ -474,7 +508,15 @@ class PaperBroker:
         parent_order_id: str | None,
         key: str,
         order_id: str,
+        order_kind: str,
+        eligible_open: datetime,
+        fee_rate: float | None = None,
+        slippage_rate: float | None = None,
     ) -> PaperOrder:
+        bound_fee_rate = self._fee_rate if fee_rate is None else fee_rate
+        bound_slippage_rate = (
+            self._slippage_rate if slippage_rate is None else slippage_rate
+        )
         created = self._store.record_order_once(
             key,
             side,
@@ -509,13 +551,16 @@ class PaperBroker:
             occurred_at,
             {
                 "idempotency_key": key,
+                "eligible_open_utc": _canonical_datetime(eligible_open),
+                "fee_rate": bound_fee_rate,
                 "order_id": order_id,
-                "order_kind": "MARKET",
+                "order_kind": order_kind,
                 "parent_order_id": parent_order_id,
                 "reason": reason,
                 "requested_quantity": quantity,
                 "side": side,
                 "signal_at_utc": signal_text,
+                "slippage_rate": bound_slippage_rate,
             },
         )
         return PaperOrder(
@@ -528,7 +573,11 @@ class PaperBroker:
             filled_quantity=0.0,
             remainder_quantity=quantity,
             status=OrderStatus.ACCEPTED,
+            order_kind=order_kind,
             parent_order_id=parent_order_id,
+            eligible_open_utc=eligible_open,
+            fee_rate=bound_fee_rate,
+            slippage_rate=bound_slippage_rate,
         )
 
     def _process_order_in_transaction(
@@ -547,23 +596,25 @@ class PaperBroker:
         if quantity_decimal > remainder_decimal:
             raise ValueError("actual quantity exceeds order remainder")
         if quantity == 0.0:
-            if order.side == "BUY":
-                self._store.transition_order_status(
-                    order.order_id,
-                    f"{order.idempotency_key}:no-fill:{candle_text}",
-                    OrderStatus.CANCELED,
-                    candle_text,
-                    reason="NO_FILL",
-                )
-                return None
+            self._store.transition_order_status(
+                order.order_id,
+                f"{order.idempotency_key}:no-fill:{candle_text}",
+                OrderStatus.CANCELED,
+                candle_text,
+                reason="NO_FILL",
+            )
             return None
-        multiplier = 1.0 + self._slippage_rate if order.side == "BUY" else 1.0 - self._slippage_rate
-        fill_price = reference_price * multiplier
+        fill_price = _computed_fill_price(
+            reference_price,
+            order.slippage_rate,
+            order.side,
+        )
         if not math.isfinite(fill_price) or fill_price <= 0.0:
             raise ValueError("slippage produces a non-positive fill price")
-        fee = quantity * fill_price * self._fee_rate
+        fee = _computed_fee(quantity, fill_price, order.fee_rate)
         current = self._store.replay_state()
-        if order.side == "BUY" and quantity * fill_price + fee > current.cash + 1e-12:
+        cash_required = _decimal(quantity) * _decimal(fill_price) + _decimal(fee)
+        if order.side == "BUY" and cash_required > _decimal(current.cash):
             self._store.transition_order_status(
                 order.order_id,
                 f"{order.idempotency_key}:insufficient:{candle_text}",
@@ -572,7 +623,7 @@ class PaperBroker:
                 reason="INSUFFICIENT_CASH",
             )
             return None
-        if order.side == "SELL" and quantity > current.btc_quantity + 1e-12:
+        if order.side == "SELL" and quantity_decimal > _decimal(current.btc_quantity):
             raise ValueError("sell fill exceeds owned BTC")
 
         fill_identity = "|".join((order.order_id, candle_text, repr(quantity)))
@@ -600,14 +651,14 @@ class PaperBroker:
             candle_text,
             reason=order.reason,
         )
-        slippage = abs(fill_price - reference_price) * quantity
+        slippage = _computed_slippage(quantity, fill_price, reference_price)
         self._store.append_event(
             f"paper-fill-meta:{sha256(fill_id.encode('utf-8')).hexdigest()}",
             "PAPER_FILL",
             candle_text,
             {
                 "fee": fee,
-                "fee_rate": self._fee_rate,
+                "fee_rate": order.fee_rate,
                 "fill_id": fill_id,
                 "fill_price": fill_price,
                 "order_id": order.order_id,
@@ -616,7 +667,7 @@ class PaperBroker:
                 "reference_price": reference_price,
                 "side": order.side,
                 "slippage": slippage,
-                "slippage_rate": self._slippage_rate,
+                "slippage_rate": order.slippage_rate,
             },
         )
         fill = PaperFill(
@@ -641,9 +692,16 @@ class PaperBroker:
                 reason="PARTIAL_REMAINDER",
             )
             if order.side == "SELL":
-                remaining_owned = self._store.replay_state().btc_quantity
-                if remaining_owned <= 0.0:
+                if order.parent_order_id is not None and order.parent_order_id.startswith(
+                    "paper-order:"
+                ):
+                    raise PaperReconciliationError(
+                        "remainder child cannot create another remainder child"
+                    )
+                remaining_owned_decimal = remainder_decimal - quantity_decimal
+                if remaining_owned_decimal <= 0:
                     raise PaperReconciliationError("partial sell left no remainder")
+                remaining_owned = float(remaining_owned_decimal)
                 child_key, child_id = _order_identity(
                     candle_text,
                     "SELL",
@@ -660,6 +718,10 @@ class PaperBroker:
                     parent_order_id=order.order_id,
                     key=child_key,
                     order_id=child_id,
+                    order_kind="MARKET",
+                    eligible_open=_next_boundary(candle_time),
+                    fee_rate=order.fee_rate,
+                    slippage_rate=order.slippage_rate,
                 )
         self._fault("fill")
         return fill
@@ -682,6 +744,7 @@ class PaperBroker:
             occurred_at,
             {
                 "action": action,
+                "identity": identity,
                 "stop_id": stop.stop_id,
             },
         )
@@ -692,89 +755,146 @@ class PaperBroker:
 
     def _build_ledger(self) -> _Ledger:
         snapshot = self._store.replay_state()
-        created: dict[str, dict[str, object]] = {}
-        statuses: dict[str, OrderStatus] = {}
-        filled: dict[str, Decimal] = {}
-        order_metadata: dict[str, Mapping[str, object]] = {}
+        created: dict[str, StoredEvent] = {}
+        status_events: dict[str, list[StoredEvent]] = {}
+        fills_by_order: dict[str, list[StoredEvent]] = {}
         raw_fills: dict[str, StoredEvent] = {}
+        order_metadata: dict[str, StoredEvent] = {}
         fill_metadata: dict[str, StoredEvent] = {}
         active_stop: PaperStop | None = None
+        known_stops: dict[str, PaperStop] = {}
+        stop_set_events: dict[str, StoredEvent] = {}
+        stop_terminals: list[StoredEvent] = []
 
         for event in snapshot.event_evidence:
             payload = event.payload
             if event.event_type == "ORDER_CREATED":
                 order_id = _payload_text(payload, "order_id")
-                created[order_id] = dict(payload)
-                statuses[order_id] = OrderStatus(_payload_text(payload, "status"))
-                filled[order_id] = Decimal("0")
+                if order_id in created:
+                    raise PaperReconciliationError("duplicate order creation evidence")
+                created[order_id] = event
             elif event.event_type == "ORDER_STATUS":
                 order_id = _payload_text(payload, "order_id")
                 if order_id not in created:
                     raise PaperReconciliationError("order status lacks creation evidence")
-                statuses[order_id] = OrderStatus(_payload_text(payload, "status"))
+                status_events.setdefault(order_id, []).append(event)
             elif event.event_type == "FILL":
+                if event.event_id in raw_fills:
+                    raise PaperReconciliationError("duplicate fill evidence")
                 raw_fills[event.event_id] = event
                 order_id = _payload_text(payload, "order_id")
-                if order_id in filled:
-                    filled[order_id] += Decimal(str(_payload_number(payload, "quantity")))
+                fills_by_order.setdefault(order_id, []).append(event)
             elif event.event_type == "PAPER_ORDER":
                 order_id = _payload_text(payload, "order_id")
                 if order_id in order_metadata:
                     raise PaperReconciliationError("duplicate paper order metadata")
-                order_metadata[order_id] = payload
+                order_metadata[order_id] = event
             elif event.event_type == "PAPER_FILL":
                 fill_id = _payload_text(payload, "fill_id")
                 if fill_id in fill_metadata:
-                    raise PaperReconciliationError("duplicate paper fill evidence")
+                    raise PaperReconciliationError("duplicate paper fill metadata")
                 fill_metadata[fill_id] = event
             elif event.event_type == "PAPER_STOP":
                 action = _payload_text(payload, "action")
                 if action == "SET":
-                    active_stop = _stop_from_event(event)
+                    candidate = _stop_from_event(event)
+                    if candidate.stop_id in known_stops:
+                        raise PaperReconciliationError("duplicate paper stop identity")
+                    if active_stop is not None:
+                        if candidate.source_id != active_stop.source_id:
+                            raise PaperReconciliationError("stop update changes position source")
+                        if _decimal(candidate.stop_price) <= _decimal(active_stop.stop_price):
+                            raise PaperReconciliationError(
+                                "persisted protective stop is not tighter"
+                            )
+                    known_stops[candidate.stop_id] = candidate
+                    stop_set_events[candidate.stop_id] = event
+                    active_stop = candidate
                 elif action in {"CANCELED", "TRIGGERED"}:
-                    stop_id = _payload_text(payload, "stop_id")
-                    if active_stop is None or active_stop.stop_id != stop_id:
+                    if active_stop is None:
                         raise PaperReconciliationError("stop terminal event has no active stop")
+                    _validate_stop_terminal(event, active_stop)
+                    stop_terminals.append(event)
                     active_stop = None
                 else:
                     raise PaperReconciliationError("unknown paper stop action")
 
-        if set(created) != set(order_metadata):
-            raise PaperReconciliationError("order evidence does not match broker metadata")
-        if set(raw_fills) != set(fill_metadata):
-            raise PaperReconciliationError("fill evidence does not match broker metadata")
-
         orders: dict[str, PaperOrder] = {}
-        for order_id, creation in created.items():
-            metadata = order_metadata[order_id]
-            requested = _payload_number(creation, "requested_quantity")
-            accumulated = float(filled[order_id])
-            if accumulated > requested + 1e-12:
-                raise PaperReconciliationError("filled quantity exceeds requested quantity")
-            if (
-                _payload_text(creation, "idempotency_key")
-                != _payload_text(metadata, "idempotency_key")
-                or _payload_text(creation, "side") != _payload_text(metadata, "side")
-                or not _close(requested, _payload_number(metadata, "requested_quantity"))
-            ):
-                raise PaperReconciliationError("paper order metadata contradicts order evidence")
-            _, signal_time = _timestamp(_payload_text(metadata, "signal_at_utc"))
-            parent = metadata.get("parent_order_id")
-            if parent is not None and not isinstance(parent, str):
-                raise PaperReconciliationError("invalid parent order identity")
-            orders[order_id] = PaperOrder(
+        for order_id, metadata in order_metadata.items():
+            creation = created.get(order_id)
+            if creation is None:
+                raise PaperReconciliationError("paper order metadata lacks creation evidence")
+            orders[order_id] = _paper_order_from_evidence(
                 order_id=order_id,
-                idempotency_key=_payload_text(metadata, "idempotency_key"),
-                side=_payload_text(metadata, "side"),
-                reason=_payload_text(metadata, "reason"),
-                signal_at_utc=signal_time,
-                requested_quantity=requested,
-                filled_quantity=accumulated,
-                remainder_quantity=max(0.0, requested - accumulated),
-                status=statuses[order_id],
-                order_kind=_payload_text(metadata, "order_kind"),
-                parent_order_id=parent,
+                creation=creation,
+                status_events=tuple(status_events.get(order_id, ())),
+                raw_fill_events=tuple(fills_by_order.get(order_id, ())),
+                metadata_event=metadata,
+                fill_metadata=fill_metadata,
             )
+
+        paper_fill_ids = {
+            event.event_id
+            for order_id in orders
+            for event in fills_by_order.get(order_id, ())
+        }
+        if set(fill_metadata) != paper_fill_ids:
+            raise PaperReconciliationError(
+                "paper fill metadata does not match paper order fills"
+            )
+
+        children: dict[str, list[PaperOrder]] = {}
+        for order in orders.values():
+            parent_id = order.parent_order_id
+            if parent_id is None:
+                continue
+            if parent_id.startswith("paper-order:"):
+                parent = orders.get(parent_id)
+                if parent is None:
+                    raise PaperReconciliationError("remainder child lacks its paper parent")
+                if parent.parent_order_id is not None and parent.parent_order_id.startswith(
+                    "paper-order:"
+                ):
+                    raise PaperReconciliationError("remainder order has recursive ancestry")
+                if parent.side != "SELL" or order.side != "SELL":
+                    raise PaperReconciliationError("remainder ancestry must be SELL orders")
+                if parent.status is not OrderStatus.CANCELED or parent.filled_quantity <= 0:
+                    raise PaperReconciliationError(
+                        "remainder parent is not a partial canceled exit"
+                    )
+                if order.reason != parent.reason:
+                    raise PaperReconciliationError("remainder child changes exit reason")
+                parent_fills = fills_by_order.get(parent_id, ())
+                if len(parent_fills) != 1:
+                    raise PaperReconciliationError("remainder parent fill is ambiguous")
+                if order.signal_at_utc != parent_fills[0].occurred_at_utc:
+                    raise PaperReconciliationError(
+                        "remainder child time is not parent fill time"
+                    )
+                if not _exact(order.requested_quantity, parent.remainder_quantity):
+                    raise PaperReconciliationError("remainder child quantity is not exact")
+                if not (
+                    _exact(order.fee_rate, parent.fee_rate)
+                    and _exact(order.slippage_rate, parent.slippage_rate)
+                ):
+                    raise PaperReconciliationError("remainder child changes cost binding")
+                children.setdefault(parent_id, []).append(order)
+            elif parent_id.startswith("paper-stop:"):
+                if order.order_kind != "STOP" or parent_id not in known_stops:
+                    raise PaperReconciliationError("stop order ancestry is invalid")
+            else:
+                raise PaperReconciliationError("paper order has unknown parent identity")
+        if any(len(items) != 1 for items in children.values()):
+            raise PaperReconciliationError("partial exit has duplicate remainder children")
+        for order in orders.values():
+            if (
+                order.side == "SELL"
+                and order.status is OrderStatus.CANCELED
+                and order.filled_quantity > 0
+                and order.remainder_quantity > 0
+                and order.order_id not in children
+            ):
+                raise PaperReconciliationError("partial exit lacks its exact remainder child")
 
         paper_fills: list[PaperFill] = []
         cash = Decimal("100")
@@ -782,43 +902,11 @@ class PaperBroker:
         total_fees = Decimal("0")
         total_slippage = Decimal("0")
         for fill_id, raw in raw_fills.items():
-            meta_event = fill_metadata[fill_id]
-            raw_payload = raw.payload
-            meta = meta_event.payload
-            for key, meta_key in (
-                ("order_id", "order_id"),
-                ("side", "side"),
-            ):
-                if _payload_text(raw_payload, key) != _payload_text(meta, meta_key):
-                    raise PaperReconciliationError("paper fill evidence contradicts ledger fill")
-            for key, meta_key in (
-                ("quantity", "quantity"),
-                ("price", "fill_price"),
-                ("fee", "fee"),
-            ):
-                if not _close(
-                    _payload_number(raw_payload, key),
-                    _payload_number(meta, meta_key),
-                ):
-                    raise PaperReconciliationError("paper fill evidence contradicts ledger fill")
-            quantity = Decimal(str(_payload_number(meta, "quantity")))
-            fill_price = Decimal(str(_payload_number(meta, "fill_price")))
-            reference = Decimal(str(_payload_number(meta, "reference_price")))
-            fee = Decimal(str(_payload_number(meta, "fee")))
-            fee_rate = Decimal(str(_payload_number(meta, "fee_rate")))
-            slip_rate = Decimal(str(_payload_number(meta, "slippage_rate")))
-            stated_slippage = Decimal(str(_payload_number(meta, "slippage")))
-            side = _payload_text(meta, "side")
-            expected_fill = reference * (
-                Decimal("1") + slip_rate if side == "BUY" else Decimal("1") - slip_rate
-            )
-            if abs(fill_price - expected_fill) > _TOLERANCE:
-                raise PaperReconciliationError("fill price does not match slippage evidence")
-            if abs(fee - quantity * fill_price * fee_rate) > _TOLERANCE:
-                raise PaperReconciliationError("fill fee does not match rate evidence")
-            slippage = abs(fill_price - reference) * quantity
-            if abs(stated_slippage - slippage) > _TOLERANCE:
-                raise PaperReconciliationError("fill slippage evidence is inconsistent")
+            payload = raw.payload
+            quantity = _decimal(_payload_number(payload, "quantity"))
+            fill_price = _decimal(_payload_number(payload, "price"))
+            fee = _decimal(_payload_number(payload, "fee"))
+            side = _payload_text(payload, "side")
             if side == "BUY":
                 cash -= quantity * fill_price + fee
                 btc += quantity
@@ -827,60 +915,58 @@ class PaperBroker:
                 btc -= quantity
             else:
                 raise PaperReconciliationError("invalid fill side")
-            if cash < -_TOLERANCE or btc < -_TOLERANCE:
+            if cash < 0 or btc < 0:
                 raise PaperReconciliationError("paper ledger has negative balance")
-            total_fees += fee
-            total_slippage += slippage
-            paper_fills.append(
-                PaperFill(
-                    fill_id=fill_id,
-                    order_id=_payload_text(meta, "order_id"),
-                    side=side,
-                    reason=_payload_text(meta, "reason"),
-                    quantity=float(quantity),
-                    reference_price=float(reference),
-                    fill_price=float(fill_price),
-                    fee=float(fee),
-                    slippage=float(slippage),
-                    fill_time=raw.occurred_at_utc,
+            if fill_id in paper_fill_ids:
+                order = orders[_payload_text(payload, "order_id")]
+                fill = _paper_fill_from_evidence(
+                    raw,
+                    fill_metadata[fill_id],
+                    order,
                 )
-            )
+                total_fees += _decimal(fill.fee)
+                total_slippage += _decimal(fill.slippage)
+                paper_fills.append(fill)
 
-        if abs(cash - Decimal(str(snapshot.cash))) > _TOLERANCE:
+        if cash != _decimal(snapshot.cash):
             raise PaperReconciliationError("cash does not reconcile to immutable fills")
-        if abs(btc - Decimal(str(snapshot.btc_quantity))) > _TOLERANCE:
+        if btc != _decimal(snapshot.btc_quantity):
             raise PaperReconciliationError("BTC does not reconcile to immutable fills")
 
         active_orders = tuple(order for order in orders.values() if order.status in _ACTIVE)
         projected_active = {order.order_id: order for order in snapshot.pending_orders}
-        if set(projected_active) != {order.order_id for order in active_orders}:
-            raise PaperReconciliationError("active order projection contradicts broker evidence")
+        paper_projected = {order_id for order_id in projected_active if order_id in orders}
+        if paper_projected != {order.order_id for order in active_orders}:
+            raise PaperReconciliationError(
+                "active paper order projection contradicts broker evidence"
+            )
         for order in active_orders:
             projected = projected_active[order.order_id]
             if not (
                 projected.idempotency_key == order.idempotency_key
                 and projected.side == order.side
                 and projected.status is order.status
-                and _close(projected.requested_quantity, order.requested_quantity)
-                and _close(projected.filled_quantity, order.filled_quantity)
+                and _exact(projected.requested_quantity, order.requested_quantity)
+                and _exact(projected.filled_quantity, order.filled_quantity)
             ):
-                raise PaperReconciliationError("active order projection contradicts broker evidence")
+                raise PaperReconciliationError(
+                    "active paper order projection contradicts broker evidence"
+                )
         if len(active_orders) > 1:
             raise PaperReconciliationError("more than one active paper order")
         reserved = sum(
-            Decimal(str(order.remainder_quantity))
-            for order in active_orders
-            if order.side == "SELL"
+            (_decimal(order.remainder_quantity) for order in active_orders if order.side == "SELL"),
+            Decimal("0"),
         )
-        if reserved > btc + _TOLERANCE:
+        if reserved > btc:
             raise PaperReconciliationError("active exits reserve more BTC than owned")
         if any(order.side == "BUY" for order in active_orders) and btc > 0:
             raise PaperReconciliationError("active entry would pyramid an existing position")
         if active_stop is not None and btc <= 0:
             raise PaperReconciliationError("active stop has no owned BTC")
 
+        paper_fills.sort(key=lambda item: (item.fill_time, item.fill_id))
         trades = _completed_trades(tuple(paper_fills))
-        expected_position = snapshot.position_state
         if active_orders:
             derived_position = (
                 PositionState.ENTRY_PENDING
@@ -891,17 +977,43 @@ class PaperBroker:
             derived_position = PositionState.LONG
         else:
             derived_position = PositionState.FLAT
-        if expected_position is not PositionState.HALTED and expected_position is not derived_position:
+        generic_evidence = bool(set(created) - set(orders)) or any(
+            _payload_text(event.payload, "order_id") not in orders
+            for event in raw_fills.values()
+        )
+        if (
+            not generic_evidence
+            and snapshot.position_state is not PositionState.HALTED
+            and snapshot.position_state is not derived_position
+        ):
             raise PaperReconciliationError("position state contradicts paper evidence")
+        for stop in known_stops.values():
+            source = orders.get(stop.source_id)
+            if source is None or source.side != "BUY" or source.filled_quantity <= 0:
+                raise PaperReconciliationError("paper stop source is not a filled entry")
+            if _paper_source_at_sequence(
+                stop_set_events[stop.stop_id].sequence,
+                snapshot.event_evidence,
+                orders,
+            ) != stop.source_id:
+                raise PaperReconciliationError("paper stop source was not open when observed")
+        for event in stop_terminals:
+            identity = _payload_text(event.payload, "identity")
+            related = orders.get(identity)
+            if related is None or related.side != "SELL":
+                raise PaperReconciliationError("paper stop terminal lacks its exit order")
+            action = _payload_text(event.payload, "action")
+            stop_id = _payload_text(event.payload, "stop_id")
+            if action == "TRIGGERED" and related.parent_order_id != stop_id:
+                raise PaperReconciliationError("triggered stop exit ancestry is invalid")
+            if action == "CANCELED" and related.parent_order_id == stop_id:
+                raise PaperReconciliationError("canceled stop is bound to a trigger order")
 
         return _Ledger(
             snapshot=snapshot,
             orders=orders,
             active_orders=tuple(
-                sorted(
-                    active_orders,
-                    key=lambda item: (item.signal_at_utc, item.order_id),
-                )
+                sorted(active_orders, key=lambda item: (item.signal_at_utc, item.order_id))
             ),
             fills=tuple(paper_fills),
             trades=trades,
@@ -909,6 +1021,383 @@ class PaperBroker:
             total_fees=float(total_fees),
             total_slippage=float(total_slippage),
         )
+
+
+def _paper_order_from_evidence(
+    *,
+    order_id: str,
+    creation: StoredEvent,
+    status_events: tuple[StoredEvent, ...],
+    raw_fill_events: tuple[StoredEvent, ...],
+    metadata_event: StoredEvent,
+    fill_metadata: Mapping[str, StoredEvent],
+) -> PaperOrder:
+    metadata = metadata_event.payload
+    _require_evidence_keys(
+        metadata,
+        {
+            "eligible_open_utc",
+            "fee_rate",
+            "idempotency_key",
+            "order_id",
+            "order_kind",
+            "parent_order_id",
+            "reason",
+            "requested_quantity",
+            "side",
+            "signal_at_utc",
+            "slippage_rate",
+        },
+        "paper order metadata",
+    )
+    if metadata_event.event_id != (
+        f"paper-order-meta:{sha256(order_id.encode('utf-8')).hexdigest()}"
+    ):
+        raise PaperReconciliationError("paper order metadata id is not deterministic")
+    if _payload_text(metadata, "order_id") != order_id:
+        raise PaperReconciliationError("paper order metadata changes order identity")
+    key = _payload_text(metadata, "idempotency_key")
+    side = _payload_text(metadata, "side")
+    if side not in {"BUY", "SELL"}:
+        raise PaperReconciliationError("paper order side is invalid")
+    reason = _payload_text(metadata, "reason")
+    if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", reason) is None:
+        raise PaperReconciliationError("paper order reason is invalid")
+    requested = _payload_number(metadata, "requested_quantity")
+    if requested <= 0:
+        raise PaperReconciliationError("paper order quantity is invalid")
+    fee_rate = _payload_number(metadata, "fee_rate")
+    slippage_rate = _payload_number(metadata, "slippage_rate")
+    if fee_rate < 0 or slippage_rate < 0:
+        raise PaperReconciliationError("paper order cost binding is invalid")
+    parent_value = metadata["parent_order_id"]
+    if parent_value is not None and (not isinstance(parent_value, str) or not parent_value):
+        raise PaperReconciliationError("paper order parent is invalid")
+    parent = parent_value if isinstance(parent_value, str) else None
+    signal_text, signal_time = _evidence_timestamp(
+        _payload_text(metadata, "signal_at_utc")
+    )
+    eligible_text, eligible_time = _evidence_timestamp(
+        _payload_text(metadata, "eligible_open_utc")
+    )
+    order_kind = _payload_text(metadata, "order_kind")
+    if order_kind not in {"MARKET", "STOP"}:
+        raise PaperReconciliationError("paper order kind is invalid")
+    try:
+        _require_boundary(signal_time, "paper order signal")
+        _require_boundary(eligible_time, "paper order eligible open")
+    except ValueError as error:
+        raise PaperReconciliationError(str(error)) from error
+    if order_kind == "MARKET":
+        if eligible_time != _next_boundary(signal_time):
+            raise PaperReconciliationError("market order eligible open is not immediate")
+        if creation.occurred_at_utc != signal_time:
+            raise PaperReconciliationError("market order creation time is not signal time")
+    else:
+        if side != "SELL" or parent is None or not parent.startswith("paper-stop:"):
+            raise PaperReconciliationError("stop order identity is invalid")
+        if eligible_time < _next_boundary(signal_time):
+            raise PaperReconciliationError("stop order fill is not after observation")
+        if creation.occurred_at_utc != eligible_time:
+            raise PaperReconciliationError("stop order creation is not trigger time")
+    expected_key, expected_order_id = _order_identity(
+        signal_text,
+        side,
+        reason,
+        parent_order_id=parent,
+    )
+    if key != expected_key or order_id != expected_order_id:
+        raise PaperReconciliationError("paper order identity is not deterministic")
+
+    creation_payload = creation.payload
+    _require_evidence_keys(
+        creation_payload,
+        {
+            "filled_quantity",
+            "idempotency_key",
+            "order_id",
+            "requested_quantity",
+            "side",
+            "status",
+        },
+        "paper order creation",
+    )
+    if not (
+        _payload_text(creation_payload, "idempotency_key") == key
+        and _payload_text(creation_payload, "order_id") == order_id
+        and _payload_text(creation_payload, "side") == side
+        and _payload_text(creation_payload, "status") == OrderStatus.CREATED.value
+        and _exact(_payload_number(creation_payload, "requested_quantity"), requested)
+        and _exact(_payload_number(creation_payload, "filled_quantity"), 0.0)
+    ):
+        raise PaperReconciliationError("paper order creation contradicts metadata")
+    if metadata_event.occurred_at_utc != creation.occurred_at_utc:
+        raise PaperReconciliationError("paper order metadata time is not creation time")
+
+    if len(raw_fill_events) > 1:
+        raise PaperReconciliationError("paper order has more than one fill")
+    raw_fill = raw_fill_events[0] if raw_fill_events else None
+    if raw_fill is not None:
+        if raw_fill.occurred_at_utc <= signal_time:
+            raise PaperReconciliationError("paper fill is not strictly after its signal")
+        if raw_fill.occurred_at_utc != eligible_time:
+            raise PaperReconciliationError("paper fill is outside its eligible open")
+        accumulated = _payload_number(raw_fill.payload, "quantity")
+        if _decimal(accumulated) > _decimal(requested):
+            raise PaperReconciliationError("paper fill exceeds requested quantity")
+    else:
+        accumulated = 0.0
+
+    status_values: list[OrderStatus] = []
+    for event in status_events:
+        payload = event.payload
+        _require_evidence_keys(
+            payload,
+            {"idempotency_key", "order_id", "reason", "status"},
+            "paper order status",
+        )
+        if _payload_text(payload, "order_id") != order_id:
+            raise PaperReconciliationError("paper status changes order identity")
+        try:
+            status_values.append(OrderStatus(_payload_text(payload, "status")))
+        except ValueError as error:
+            raise PaperReconciliationError("paper order status is invalid") from error
+    if status_values[:2] != [OrderStatus.SUBMITTED, OrderStatus.ACCEPTED]:
+        raise PaperReconciliationError(
+            "paper order lifecycle must begin CREATED, SUBMITTED, ACCEPTED"
+        )
+    if len(status_events) < 2:
+        raise PaperReconciliationError("paper order lifecycle is incomplete")
+    for event, suffix in zip(status_events[:2], ("submitted", "accepted"), strict=True):
+        if event.occurred_at_utc != creation.occurred_at_utc:
+            raise PaperReconciliationError("paper order acceptance time is not causal")
+        _validate_status_identity(event, key, f"{key}:{suffix}", reason=None)
+    if not (
+        creation.sequence < status_events[0].sequence < status_events[1].sequence
+        < metadata_event.sequence
+    ):
+        raise PaperReconciliationError("paper order evidence sequence is not causal")
+
+    if raw_fill is None:
+        if len(status_values) == 2:
+            final_status = OrderStatus.ACCEPTED
+        elif status_values == [
+            OrderStatus.SUBMITTED,
+            OrderStatus.ACCEPTED,
+            OrderStatus.INSUFFICIENT_CASH,
+        ]:
+            terminal = status_events[2]
+            _validate_status_identity(
+                terminal,
+                key,
+                f"{key}:insufficient:{eligible_text}",
+                reason="INSUFFICIENT_CASH",
+            )
+            final_status = OrderStatus.INSUFFICIENT_CASH
+        elif status_values == [
+            OrderStatus.SUBMITTED,
+            OrderStatus.ACCEPTED,
+            OrderStatus.CANCELED,
+        ]:
+            terminal = status_events[2]
+            _validate_status_identity(
+                terminal,
+                key,
+                f"{key}:no-fill:{eligible_text}",
+                reason="NO_FILL",
+            )
+            final_status = OrderStatus.CANCELED
+        else:
+            raise PaperReconciliationError("paper no-fill lifecycle is invalid")
+        if len(status_events) == 3:
+            if (
+                status_events[2].occurred_at_utc != eligible_time
+                or metadata_event.sequence >= status_events[2].sequence
+            ):
+                raise PaperReconciliationError("paper terminal no-fill time is not causal")
+    elif _exact(accumulated, requested):
+        expected = [
+            OrderStatus.SUBMITTED,
+            OrderStatus.ACCEPTED,
+            OrderStatus.COMPLETED,
+        ]
+        if status_values != expected:
+            raise PaperReconciliationError("completed paper fill lacks exact lifecycle")
+        terminal = status_events[2]
+        _validate_status_identity(
+            terminal,
+            key,
+            f"{key}:completed:{eligible_text}",
+            reason=reason,
+        )
+        meta_fill = fill_metadata.get(raw_fill.event_id)
+        if meta_fill is None or not (
+            metadata_event.sequence < raw_fill.sequence < terminal.sequence < meta_fill.sequence
+        ):
+            raise PaperReconciliationError("completed paper fill sequence is not causal")
+        if terminal.occurred_at_utc != eligible_time:
+            raise PaperReconciliationError("completed paper fill status time is invalid")
+        final_status = OrderStatus.COMPLETED
+    else:
+        expected = [
+            OrderStatus.SUBMITTED,
+            OrderStatus.ACCEPTED,
+            OrderStatus.PARTIAL,
+            OrderStatus.CANCELED,
+        ]
+        if status_values != expected:
+            raise PaperReconciliationError("partial paper fill lacks exact lifecycle")
+        partial, canceled = status_events[2:]
+        _validate_status_identity(
+            partial,
+            key,
+            f"{key}:partial:{eligible_text}",
+            reason=reason,
+        )
+        _validate_status_identity(
+            canceled,
+            key,
+            f"{key}:cancel-remainder:{eligible_text}",
+            reason="PARTIAL_REMAINDER",
+        )
+        meta_fill = fill_metadata.get(raw_fill.event_id)
+        if meta_fill is None or not (
+            metadata_event.sequence < raw_fill.sequence < partial.sequence
+            < meta_fill.sequence < canceled.sequence
+        ):
+            raise PaperReconciliationError("partial paper fill sequence is not causal")
+        if partial.occurred_at_utc != eligible_time or canceled.occurred_at_utc != eligible_time:
+            raise PaperReconciliationError("partial paper fill status time is invalid")
+        final_status = OrderStatus.CANCELED
+
+    remainder = _decimal(requested) - _decimal(accumulated)
+    return PaperOrder(
+        order_id=order_id,
+        idempotency_key=key,
+        side=side,
+        reason=reason,
+        signal_at_utc=signal_time,
+        requested_quantity=requested,
+        filled_quantity=accumulated,
+        remainder_quantity=float(remainder),
+        status=final_status,
+        order_kind=order_kind,
+        parent_order_id=parent,
+        eligible_open_utc=eligible_time,
+        fee_rate=fee_rate,
+        slippage_rate=slippage_rate,
+    )
+
+
+def _paper_fill_from_evidence(
+    raw: StoredEvent,
+    metadata_event: StoredEvent,
+    order: PaperOrder,
+) -> PaperFill:
+    metadata = metadata_event.payload
+    _require_evidence_keys(
+        metadata,
+        {
+            "fee",
+            "fee_rate",
+            "fill_id",
+            "fill_price",
+            "order_id",
+            "quantity",
+            "reason",
+            "reference_price",
+            "side",
+            "slippage",
+            "slippage_rate",
+        },
+        "paper fill metadata",
+    )
+    if metadata_event.event_id != (
+        f"paper-fill-meta:{sha256(raw.event_id.encode('utf-8')).hexdigest()}"
+    ):
+        raise PaperReconciliationError("paper fill metadata id is not deterministic")
+    if metadata_event.occurred_at_utc != raw.occurred_at_utc:
+        raise PaperReconciliationError("paper fill metadata time is inconsistent")
+    raw_payload = raw.payload
+    quantity = _payload_number(raw_payload, "quantity")
+    fill_price = _payload_number(raw_payload, "price")
+    fee = _payload_number(raw_payload, "fee")
+    side = _payload_text(raw_payload, "side")
+    order_id = _payload_text(raw_payload, "order_id")
+    expected_fill_id = (
+        "paper-fill:"
+        f"{sha256('|'.join((order_id, _canonical_datetime(raw.occurred_at_utc), repr(quantity))).encode('utf-8')).hexdigest()}"
+    )
+    if raw.event_id != expected_fill_id:
+        raise PaperReconciliationError("paper fill id is not deterministic")
+    if not (
+        _payload_text(metadata, "fill_id") == raw.event_id
+        and _payload_text(metadata, "order_id") == order_id == order.order_id
+        and _payload_text(metadata, "side") == side == order.side
+        and _payload_text(metadata, "reason") == order.reason
+        and _exact(_payload_number(metadata, "quantity"), quantity)
+        and _exact(_payload_number(metadata, "fill_price"), fill_price)
+        and _exact(_payload_number(metadata, "fee"), fee)
+        and _exact(_payload_number(metadata, "fee_rate"), order.fee_rate)
+        and _exact(_payload_number(metadata, "slippage_rate"), order.slippage_rate)
+    ):
+        raise PaperReconciliationError("paper fill metadata contradicts order or ledger")
+    reference = _payload_number(metadata, "reference_price")
+    expected_price = _computed_fill_price(reference, order.slippage_rate, side)
+    expected_fee = _computed_fee(quantity, expected_price, order.fee_rate)
+    expected_slippage = _computed_slippage(quantity, expected_price, reference)
+    if not (
+        _exact(fill_price, expected_price)
+        and _exact(fee, expected_fee)
+        and _exact(_payload_number(metadata, "slippage"), expected_slippage)
+    ):
+        raise PaperReconciliationError("paper fill costs are inconsistent")
+    return PaperFill(
+        fill_id=raw.event_id,
+        order_id=order_id,
+        side=side,
+        reason=order.reason,
+        quantity=quantity,
+        reference_price=reference,
+        fill_price=fill_price,
+        fee=fee,
+        slippage=expected_slippage,
+        fill_time=raw.occurred_at_utc,
+    )
+
+
+def _validate_status_identity(
+    event: StoredEvent,
+    order_key: str,
+    expected_key: str,
+    *,
+    reason: str | None,
+) -> None:
+    payload = event.payload
+    actual_key = _payload_text(payload, "idempotency_key")
+    if actual_key != expected_key:
+        raise PaperReconciliationError("paper status idempotency key is invalid")
+    expected_event_id = f"order-status:{sha256(actual_key.encode('utf-8')).hexdigest()}"
+    if event.event_id != expected_event_id or not actual_key.startswith(f"{order_key}:"):
+        raise PaperReconciliationError("paper status event id is invalid")
+    if payload["reason"] != reason:
+        raise PaperReconciliationError("paper status reason is invalid")
+
+
+def _require_evidence_keys(
+    payload: Mapping[str, object],
+    expected: set[str],
+    label: str,
+) -> None:
+    if set(payload) != expected:
+        raise PaperReconciliationError(f"{label} fields are invalid")
+
+
+def _evidence_timestamp(value: str) -> tuple[str, datetime]:
+    try:
+        return _timestamp(value)
+    except ValueError as error:
+        raise PaperReconciliationError("paper evidence timestamp is invalid") from error
 
 
 def _completed_trades(fills: tuple[PaperFill, ...]) -> tuple[PaperTrade, ...]:
@@ -924,15 +1413,15 @@ def _completed_trades(fills: tuple[PaperFill, ...]) -> tuple[PaperTrade, ...]:
             entries.append(fill)
             position += quantity
             continue
-        if position <= 0 or quantity > position + _TOLERANCE:
+        if position <= 0 or quantity > position:
             raise PaperReconciliationError("paper fills contain an unmatched sell")
         exits.append(fill)
         position -= quantity
-        if abs(position) > _TOLERANCE:
+        if position != 0:
             continue
         entry_quantity = sum(Decimal(str(item.quantity)) for item in entries)
         exit_quantity = sum(Decimal(str(item.quantity)) for item in exits)
-        if abs(entry_quantity - exit_quantity) > _TOLERANCE:
+        if entry_quantity != exit_quantity:
             raise PaperReconciliationError("round-trip fill quantities do not reconcile")
         entry_value = sum(
             Decimal(str(item.quantity)) * Decimal(str(item.fill_price)) for item in entries
@@ -963,16 +1452,69 @@ def _completed_trades(fills: tuple[PaperFill, ...]) -> tuple[PaperTrade, ...]:
 
 def _stop_from_event(event: StoredEvent) -> PaperStop:
     payload = event.payload
+    _require_evidence_keys(
+        payload,
+        {"action", "active_after_utc", "reason", "source_id", "stop_id", "stop_price"},
+        "paper stop metadata",
+    )
     if _payload_text(payload, "action") != "SET":
         raise PaperReconciliationError("stop SET evidence is invalid")
-    _, active_after = _timestamp(_payload_text(payload, "active_after_utc"))
-    return PaperStop(
-        stop_id=_payload_text(payload, "stop_id"),
-        stop_price=_payload_number(payload, "stop_price"),
-        reason=_payload_text(payload, "reason"),
-        observed_at_utc=event.occurred_at_utc,
-        active_after_utc=active_after,
+    reason = _payload_text(payload, "reason")
+    if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", reason) is None:
+        raise PaperReconciliationError("paper stop reason is invalid")
+    source_id = _payload_text(payload, "source_id")
+    observed = event.occurred_at_utc
+    try:
+        _require_boundary(observed, "stop observation")
+    except ValueError as error:
+        raise PaperReconciliationError(str(error)) from error
+    _, active_after = _evidence_timestamp(_payload_text(payload, "active_after_utc"))
+    if active_after != _next_boundary(observed):
+        raise PaperReconciliationError("stop active time is not the next four-hour boundary")
+    identity_material = "|".join(
+        (_MARKET, source_id, _canonical_datetime(observed), reason)
     )
+    expected_stop_id = (
+        f"paper-stop:{sha256(identity_material.encode('utf-8')).hexdigest()}"
+    )
+    stop_id = _payload_text(payload, "stop_id")
+    expected_event_id = f"paper-stop-set:{sha256(stop_id.encode('utf-8')).hexdigest()}"
+    if stop_id != expected_stop_id or event.event_id != expected_event_id:
+        raise PaperReconciliationError("paper stop identity is not deterministic")
+    stop_price = _payload_number(payload, "stop_price")
+    if stop_price <= 0:
+        raise PaperReconciliationError("paper stop price is invalid")
+    return PaperStop(
+        stop_id=stop_id,
+        stop_price=stop_price,
+        reason=reason,
+        observed_at_utc=observed,
+        active_after_utc=active_after,
+        source_id=source_id,
+    )
+
+
+def _validate_stop_terminal(event: StoredEvent, stop: PaperStop) -> None:
+    payload = event.payload
+    _require_evidence_keys(
+        payload,
+        {"action", "identity", "stop_id"},
+        "paper stop terminal metadata",
+    )
+    action = _payload_text(payload, "action")
+    identity = _payload_text(payload, "identity")
+    if _payload_text(payload, "stop_id") != stop.stop_id:
+        raise PaperReconciliationError("paper stop terminal changes stop identity")
+    expected_id = (
+        f"paper-stop-{action.lower()}:"
+        f"{sha256((stop.stop_id + '|' + identity).encode('utf-8')).hexdigest()}"
+    )
+    if event.event_id != expected_id:
+        raise PaperReconciliationError("paper stop terminal identity is not deterministic")
+    if event.occurred_at_utc < stop.observed_at_utc:
+        raise PaperReconciliationError("paper stop terminal time is not causal")
+    if action == "TRIGGERED" and event.occurred_at_utc < stop.active_after_utc:
+        raise PaperReconciliationError("paper stop triggered before it became active")
 
 
 def _order_identity(
@@ -1002,7 +1544,7 @@ def _assert_same_order(
         and order.side == side
         and order.reason == reason
         and order.signal_at_utc == signal_at
-        and _close(order.requested_quantity, quantity)
+        and _exact(order.requested_quantity, quantity)
         and order.parent_order_id == parent_order_id
     ):
         raise IdempotencyConflictError("deterministic order identity has conflicting payload")
@@ -1108,5 +1650,93 @@ def _payload_number(payload: Mapping[str, object], key: str) -> float:
     return float(value)
 
 
-def _close(left: float, right: float) -> bool:
-    return abs(Decimal(str(left)) - Decimal(str(right))) <= _TOLERANCE
+def _decimal(value: object) -> Decimal:
+    return Decimal(str(value))
+
+
+def _exact(left: object, right: object) -> bool:
+    return _decimal(left) == _decimal(right)
+
+
+def _computed_fill_price(reference: float, slippage_rate: float, side: str) -> float:
+    reference_decimal = _decimal(reference)
+    rate = _decimal(slippage_rate)
+    multiplier = Decimal("1") + rate if side == "BUY" else Decimal("1") - rate
+    return float(reference_decimal * multiplier)
+
+
+def _computed_fee(quantity: float, fill_price: float, fee_rate: float) -> float:
+    return float(_decimal(quantity) * _decimal(fill_price) * _decimal(fee_rate))
+
+
+def _computed_slippage(quantity: float, fill_price: float, reference: float) -> float:
+    return float(abs(_decimal(fill_price) - _decimal(reference)) * _decimal(quantity))
+
+
+def _require_boundary(value: datetime, label: str) -> None:
+    if (
+        value.tzinfo is None
+        or value.utcoffset() != timedelta(0)
+        or value.minute != 0
+        or value.second != 0
+        or value.microsecond != 0
+        or value.hour % 4 != 0
+    ):
+        raise ValueError(f"{label} must be an exact four-hour UTC boundary")
+
+
+def _next_boundary(value: datetime) -> datetime:
+    _require_boundary(value, "timestamp")
+    return value + _FOUR_HOURS
+
+
+def _open_entry_identity(ledger: _Ledger) -> str:
+    position = Decimal("0")
+    source: str | None = None
+    for fill in ledger.fills:
+        quantity = _decimal(fill.quantity)
+        if fill.side == "BUY":
+            if position != 0:
+                raise PaperReconciliationError("paper fills contain pyramiding")
+            position = quantity
+            source = fill.order_id
+        else:
+            if quantity > position:
+                raise PaperReconciliationError("paper fills contain an unmatched sell")
+            position -= quantity
+            if position == 0:
+                source = None
+    if position <= 0 or source is None:
+        raise ValueError("stop requires a filled paper entry")
+    return source
+
+
+def _paper_source_at_sequence(
+    before_sequence: int,
+    evidence: tuple[StoredEvent, ...],
+    orders: Mapping[str, PaperOrder],
+) -> str | None:
+    position = Decimal("0")
+    source: str | None = None
+    for event in evidence:
+        if event.sequence >= before_sequence:
+            break
+        if event.event_type != "FILL":
+            continue
+        order_id = _payload_text(event.payload, "order_id")
+        if order_id not in orders:
+            continue
+        quantity = _decimal(_payload_number(event.payload, "quantity"))
+        side = _payload_text(event.payload, "side")
+        if side == "BUY":
+            if position != 0:
+                raise PaperReconciliationError("paper fills contain pyramiding")
+            position = quantity
+            source = order_id
+        else:
+            if quantity > position:
+                raise PaperReconciliationError("paper fills contain an unmatched sell")
+            position -= quantity
+            if position == 0:
+                source = None
+    return source

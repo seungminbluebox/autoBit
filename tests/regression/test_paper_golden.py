@@ -49,7 +49,6 @@ def _paper_golden(path: Path) -> tuple[object, ...]:
                     broker.set_stop(
                         candle_at,
                         fill.fill_price - config.initial_atr_mult * float(row["atr_14"]),
-                        active_after=pending.signal_at_utc,
                         reason="HARD_STOP",
                     )
 
