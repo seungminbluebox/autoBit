@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import ast
+import base64
 import re
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
+
+import pytest
 
 from autobit.cli import build_parser
 
@@ -99,6 +104,33 @@ _LEGACY_IMPORT_TOKENS = tuple(
     )
     for form in ("from {module} import", "import {module}")
 )
+_UNKNOWN = object()
+_DYNAMIC_FIELD = "{dynamic}"
+_PUBLIC_CANDLE_URL = "https://api.upbit.com/v1/candles/minutes/240"
+_TELEGRAM_URL_TEMPLATE = "https://api.telegram.org/bot{dynamic}/sendMessage"
+_ALLOWED_NETWORK_CONTRACTS = frozenset(
+    {("GET", _PUBLIC_CANDLE_URL), ("POST", _TELEGRAM_URL_TEMPLATE)}
+)
+_FORBIDDEN_IMPORT_ROOTS = frozenset(
+    {
+        "base64",
+        "binascii",
+        "ccxt",
+        "importlib",
+        "logutils",
+        "market_mode",
+        "pyupbit",
+        "strategy_loader",
+        "telegram_alert",
+        "trade",
+        "upbit_api",
+    }
+)
+_DYNAMIC_CALLS = frozenset({"__import__", "compile", "eval", "exec"})
+_BASE64_DECODERS = frozenset(
+    {"a2b_base64", "b64decode", "decodebytes", "standard_b64decode", "urlsafe_b64decode"}
+)
+_HTTP_METHOD_NAMES = frozenset({"delete", "get", "patch", "post", "put"})
 
 
 def _git_paths(*arguments: str) -> tuple[Path, ...]:
@@ -141,6 +173,507 @@ def _repository_source_surfaces() -> tuple[tuple[str, str], ...]:
     return tuple(surfaces)
 
 
+def _dotted_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else None
+    return None
+
+
+def _resolve_alias(name: str, aliases: dict[str, str]) -> str:
+    direct = aliases.get(name)
+    if direct is not None:
+        return direct
+    head, separator, tail = name.partition(".")
+    resolved_head = aliases.get(head)
+    if resolved_head is None:
+        return name
+    return resolved_head + (f".{tail}" if separator else "")
+
+
+def _assignment_targets(node: ast.AST) -> tuple[str, ...]:
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        name = _dotted_name(node)
+        return (name,) if name else ()
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return tuple(
+            name
+            for element in node.elts
+            for name in _assignment_targets(element)
+        )
+    return ()
+
+
+def _imports(
+    tree: ast.AST,
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    aliases: dict[str, str] = {}
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                local = item.asname or item.name.split(".")[0]
+                aliases[local] = item.name
+                if item.name.lower().split(".")[0] in _FORBIDDEN_IMPORT_ROOTS:
+                    violations.append(f"forbidden import: {item.name}")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            root = module.lower().split(".")[0]
+            if root in _FORBIDDEN_IMPORT_ROOTS:
+                violations.append(f"forbidden import: {module}")
+            for item in node.names:
+                local = item.asname or item.name
+                aliases[local] = f"{module}.{item.name}" if module else item.name
+    return aliases, tuple(violations)
+
+
+def _constant_value(
+    node: ast.AST,
+    constants: dict[str, object],
+    aliases: dict[str, str],
+) -> object:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id, _UNKNOWN)
+    if isinstance(node, ast.Attribute):
+        name = _dotted_name(node)
+        return constants.get(name or "", _UNKNOWN)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_value(node.left, constants, aliases)
+        right = _constant_value(node.right, constants, aliases)
+        if isinstance(left, str) and isinstance(right, str):
+            return left + right
+        if isinstance(left, bytes) and isinstance(right, bytes):
+            return left + right
+        return _UNKNOWN
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                parts.append(part.value)
+            elif isinstance(part, ast.FormattedValue) and part.format_spec is None:
+                value = _constant_value(part.value, constants, aliases)
+                parts.append(_DYNAMIC_FIELD if value is _UNKNOWN else str(value))
+            else:
+                return _UNKNOWN
+        return "".join(parts)
+    if not isinstance(node, ast.Call):
+        return _UNKNOWN
+
+    function = _dotted_name(node.func) or ""
+    resolved_function = _resolve_alias(function, aliases)
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "decode":
+        raw = _constant_value(node.func.value, constants, aliases)
+        encoding = "utf-8"
+        if node.args:
+            requested = _constant_value(node.args[0], constants, aliases)
+            if not isinstance(requested, str):
+                return _UNKNOWN
+            encoding = requested
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                return bytes(raw).decode(encoding)
+            except (LookupError, UnicodeDecodeError):
+                return _UNKNOWN
+    if isinstance(node.func, ast.Attribute) and node.func.attr.lower() == "fromhex":
+        owner = _dotted_name(node.func.value)
+        if owner in {"bytes", "bytearray"} and len(node.args) == 1:
+            value = _constant_value(node.args[0], constants, aliases)
+            if isinstance(value, str):
+                try:
+                    return bytes.fromhex(value)
+                except ValueError:
+                    return _UNKNOWN
+    if resolved_function.lower().split(".")[-1] in _BASE64_DECODERS and node.args:
+        value = _constant_value(node.args[0], constants, aliases)
+        if isinstance(value, str):
+            value = value.encode("ascii", errors="strict")
+        if isinstance(value, bytes):
+            try:
+                return base64.b64decode(value)
+            except (ValueError, TypeError):
+                return _UNKNOWN
+    if resolved_function.lower().endswith("codecs.decode") and len(node.args) >= 2:
+        value = _constant_value(node.args[0], constants, aliases)
+        encoding = _constant_value(node.args[1], constants, aliases)
+        if isinstance(value, str) and isinstance(encoding, str) and encoding.lower() == "hex":
+            try:
+                return bytes.fromhex(value)
+            except ValueError:
+                return _UNKNOWN
+    return _UNKNOWN
+
+
+def _constant_bindings(
+    tree: ast.AST,
+    aliases: dict[str, str],
+) -> dict[str, object]:
+    assignments: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                for name in _assignment_targets(target):
+                    assignments.setdefault(name, []).append(node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            for name in _assignment_targets(node.target):
+                assignments.setdefault(name, []).append(node.value)
+
+    constants: dict[str, object] = {}
+    for _ in range(len(assignments) + 1):
+        changed = False
+        for name, values in assignments.items():
+            resolved = tuple(_constant_value(value, constants, aliases) for value in values)
+            if not resolved or any(value is _UNKNOWN for value in resolved):
+                continue
+            first = resolved[0]
+            if any(type(value) is not type(first) or value != first for value in resolved[1:]):
+                continue
+            if name not in constants:
+                constants[name] = first
+                changed = True
+        if not changed:
+            break
+    return constants
+
+
+def _annotation_is_httpx_client(
+    annotation: ast.AST | None,
+    aliases: dict[str, str],
+) -> bool:
+    if annotation is None:
+        return False
+    for node in ast.walk(annotation):
+        name = _dotted_name(node)
+        resolved = _resolve_alias(name or "", aliases)
+        if resolved in {"httpx.Client", "httpx.AsyncClient"}:
+            return True
+    return False
+
+
+def _network_symbols(
+    tree: ast.AST,
+    aliases: dict[str, str],
+) -> tuple[set[str], dict[str, str], set[str], set[str]]:
+    httpx_modules = {local for local, target in aliases.items() if target == "httpx"}
+    client_constructors = {
+        local
+        for local, target in aliases.items()
+        if target in {"httpx.Client", "httpx.AsyncClient"}
+    }
+    request_constructors = {
+        local for local, target in aliases.items() if target == "httpx.Request"
+    }
+    network_functions = {
+        local: target.rsplit(".", 1)[-1].upper()
+        for local, target in aliases.items()
+        if target.rsplit(".", 1)[0] == "httpx"
+        and target.rsplit(".", 1)[-1].lower() in (*_HTTP_METHOD_NAMES, "request")
+    }
+    clients: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            for argument in arguments:
+                if _annotation_is_httpx_client(argument.annotation, aliases):
+                    clients.add(argument.arg)
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is None or not isinstance(item.context_expr, ast.Call):
+                    continue
+                constructor = _dotted_name(item.context_expr.func) or ""
+                resolved = _resolve_alias(constructor, aliases)
+                if resolved in {"httpx.Client", "httpx.AsyncClient"}:
+                    clients.update(_assignment_targets(item.optional_vars))
+
+    assignments = tuple(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+    )
+    for _ in range(len(assignments) + 1):
+        changed = False
+        for node in assignments:
+            value = node.value
+            if value is None:
+                continue
+            targets = (
+                tuple(name for target in node.targets for name in _assignment_targets(target))
+                if isinstance(node, ast.Assign)
+                else _assignment_targets(node.target)
+            )
+            call_name = (
+                _dotted_name(value.func) if isinstance(value, ast.Call) else None
+            )
+            resolved_call = _resolve_alias(call_name or "", aliases)
+            value_name = _dotted_name(value)
+            if (
+                resolved_call in {"httpx.Client", "httpx.AsyncClient"}
+                or call_name in client_constructors
+                or value_name in clients
+            ):
+                before = len(clients)
+                clients.update(targets)
+                changed = changed or len(clients) != before
+            if isinstance(value, ast.Attribute):
+                base = _dotted_name(value.value) or ""
+                method = value.attr.lower()
+                if (
+                    (base in httpx_modules or base in clients)
+                    and method in (*_HTTP_METHOD_NAMES, "request")
+                ):
+                    for target in targets:
+                        if target not in network_functions:
+                            network_functions[target] = method.upper()
+                            changed = True
+        if not changed:
+            break
+    return clients, network_functions, httpx_modules, request_constructors
+
+
+def _call_argument(call: ast.Call, position: int, keyword: str) -> ast.AST | None:
+    if len(call.args) > position:
+        return call.args[position]
+    return next((item.value for item in call.keywords if item.arg == keyword), None)
+
+
+def _network_contract(
+    method_node: ast.AST | None,
+    url_node: ast.AST | None,
+    *,
+    fixed_method: str | None,
+    constants: dict[str, object],
+    aliases: dict[str, str],
+) -> tuple[str, str] | None:
+    method_value: object = fixed_method or _UNKNOWN
+    if fixed_method is None and method_node is not None:
+        method_value = _constant_value(method_node, constants, aliases)
+    url_value = (
+        _constant_value(url_node, constants, aliases)
+        if url_node is not None
+        else _UNKNOWN
+    )
+    if not isinstance(method_value, str) or not isinstance(url_value, str):
+        return None
+    return method_value.upper(), url_value
+
+
+def _is_api_destination(value: str) -> bool:
+    lowered = value.lower()
+    return lowered.startswith(
+        (
+            "http://api.",
+            "https://api.",
+            "ws://api.",
+            "wss://api.",
+            "http://sg-api.",
+            "https://sg-api.",
+            "ws://sg-api.",
+            "wss://sg-api.",
+        )
+    )
+
+
+def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    try:
+        tree = ast.parse(source, filename=label)
+    except SyntaxError as error:
+        return (f"{label}: invalid Python syntax: {error.msg}",), ()
+
+    aliases, import_violations = _imports(tree)
+    constants = _constant_bindings(tree, aliases)
+    clients, network_functions, httpx_modules, request_constructors = _network_symbols(
+        tree, aliases
+    )
+    violations = [f"{label}: {item}" for item in import_violations]
+    atoms: list[str] = []
+    api_urls: set[str] = set()
+    request_contracts: dict[str, tuple[str, str] | None] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            atoms.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            atoms.append(node.attr)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            atoms.append(node.name)
+        elif isinstance(node, ast.arg):
+            atoms.append(node.arg)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            atoms.append(node.value)
+
+        value = _constant_value(node, constants, aliases)
+        if isinstance(value, bytes):
+            try:
+                atoms.append(value.decode("utf-8"))
+            except UnicodeDecodeError:
+                pass
+        elif isinstance(value, str):
+            atoms.append(value)
+
+        if isinstance(node, ast.Call):
+            function = _dotted_name(node.func) or ""
+            resolved = _resolve_alias(function, aliases)
+            tail = resolved.lower().split(".")[-1]
+            if function in _DYNAMIC_CALLS or resolved in _DYNAMIC_CALLS:
+                violations.append(f"{label}: dynamic execution/import call: {function}")
+            if isinstance(node.func, ast.Attribute) and node.func.attr.lower() == "fromhex":
+                violations.append(f"{label}: constant decoder is forbidden: {function}")
+            if tail in _BASE64_DECODERS:
+                violations.append(f"{label}: base64 decoder is forbidden: {function}")
+            if resolved.lower().endswith("codecs.decode"):
+                violations.append(f"{label}: codecs.decode is forbidden")
+            if function == "getattr" and node.args:
+                target = _dotted_name(node.args[0]) or ""
+                if target in httpx_modules or target in clients:
+                    violations.append(f"{label}: dynamic network method lookup is forbidden")
+
+    for value in constants.values():
+        if isinstance(value, bytes):
+            try:
+                atoms.append(value.decode("utf-8"))
+            except UnicodeDecodeError:
+                continue
+        elif isinstance(value, str):
+            atoms.append(value)
+            if _is_api_destination(value):
+                api_urls.add(value)
+                if value not in {_PUBLIC_CANDLE_URL, _TELEGRAM_URL_TEMPLATE}:
+                    violations.append(f"{label}: unapproved API URL constant: {value}")
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if value is None or not isinstance(value, ast.Call):
+            continue
+        function = _dotted_name(value.func) or ""
+        resolved = _resolve_alias(function, aliases)
+        is_request = resolved == "httpx.Request" or function in request_constructors
+        if not is_request:
+            continue
+        contract = _network_contract(
+            _call_argument(value, 0, "method"),
+            _call_argument(value, 1, "url"),
+            fixed_method=None,
+            constants=constants,
+            aliases=aliases,
+        )
+        targets = (
+            tuple(name for target in node.targets for name in _assignment_targets(target))
+            if isinstance(node, ast.Assign)
+            else _assignment_targets(node.target)
+        )
+        for target in targets:
+            request_contracts[target] = contract
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = _dotted_name(node.func) or ""
+        resolved = _resolve_alias(function, aliases)
+        contract: tuple[str, str] | None | object = _UNKNOWN
+        if resolved == "httpx.Request" or function in request_constructors:
+            contract = _network_contract(
+                _call_argument(node, 0, "method"),
+                _call_argument(node, 1, "url"),
+                fixed_method=None,
+                constants=constants,
+                aliases=aliases,
+            )
+        elif isinstance(node.func, ast.Attribute):
+            base = _dotted_name(node.func.value) or ""
+            method = node.func.attr.lower()
+            if base in httpx_modules and method in _HTTP_METHOD_NAMES:
+                contract = _network_contract(
+                    None,
+                    _call_argument(node, 0, "url"),
+                    fixed_method=method.upper(),
+                    constants=constants,
+                    aliases=aliases,
+                )
+            elif (base in httpx_modules or base in clients) and method == "request":
+                contract = _network_contract(
+                    _call_argument(node, 0, "method"),
+                    _call_argument(node, 1, "url"),
+                    fixed_method=None,
+                    constants=constants,
+                    aliases=aliases,
+                )
+            elif base in clients and method in _HTTP_METHOD_NAMES:
+                contract = _network_contract(
+                    None,
+                    _call_argument(node, 0, "url"),
+                    fixed_method=method.upper(),
+                    constants=constants,
+                    aliases=aliases,
+                )
+            elif base in clients and method == "send":
+                request_node = _call_argument(node, 0, "request")
+                request_name = _dotted_name(request_node) if request_node is not None else None
+                contract = request_contracts.get(request_name or "")
+        elif isinstance(node.func, ast.Name) and node.func.id in network_functions:
+            method = network_functions[node.func.id]
+            if method == "REQUEST":
+                contract = _network_contract(
+                    _call_argument(node, 0, "method"),
+                    _call_argument(node, 1, "url"),
+                    fixed_method=None,
+                    constants=constants,
+                    aliases=aliases,
+                )
+            else:
+                contract = _network_contract(
+                    None,
+                    _call_argument(node, 0, "url"),
+                    fixed_method=method,
+                    constants=constants,
+                    aliases=aliases,
+                )
+
+        if contract is _UNKNOWN:
+            continue
+        if contract is None:
+            violations.append(f"{label}: unresolved network request contract: {function}")
+            continue
+        method, url = contract
+        if _is_api_destination(url):
+            api_urls.add(url)
+        if contract not in _ALLOWED_NETWORK_CONTRACTS:
+            violations.append(f"{label}: unapproved network request: {method} {url}")
+
+    for atom in atoms:
+        lowered = atom.lower()
+        for token in (*_FORBIDDEN_SOURCE_TOKENS, *_LEGACY_IMPORT_TOKENS):
+            if token.lower() in lowered:
+                violations.append(f"{label}: forbidden token: {token}")
+
+    return tuple(sorted(set(violations))), tuple(sorted(api_urls))
+
+
+def _surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if label.lower().endswith(".py"):
+        return _python_surface_scan(label, source)
+    lowered = source.lower()
+    violations = tuple(
+        sorted(
+            f"{label}: forbidden token: {token}"
+            for token in (*_FORBIDDEN_SOURCE_TOKENS, *_LEGACY_IMPORT_TOKENS)
+            if token.lower() in lowered
+        )
+    )
+    api_urls = tuple(
+        sorted(
+            url
+            for url in re.findall(r'https://[^\s"\']+', source)
+            if _is_api_destination(url)
+        )
+    )
+    return violations, api_urls
+
+
 def test_exact_legacy_source_and_cache_paths_are_absent() -> None:
     tracked = frozenset(path.as_posix() for path in _git_paths("--cached"))
     present = tuple(
@@ -179,11 +712,9 @@ def test_no_tracked_python_bytecode_remains() -> None:
 
 def test_repository_source_has_no_private_upbit_or_live_order_surface() -> None:
     violations: list[str] = []
-    for label, text in _repository_source_surfaces():
-        source = text.lower()
-        for token in (*_FORBIDDEN_SOURCE_TOKENS, *_LEGACY_IMPORT_TOKENS):
-            if token.lower() in source:
-                violations.append(f"{label}: {token}")
+    for label, source in _repository_source_surfaces():
+        surface_violations, _ = _surface_scan(label, source)
+        violations.extend(surface_violations)
 
     assert violations == []
 
@@ -191,14 +722,13 @@ def test_repository_source_has_no_private_upbit_or_live_order_surface() -> None:
 def test_network_api_urls_are_only_public_candles_and_optional_telegram() -> None:
     discovered: list[tuple[str, str]] = []
     for label, source in _repository_source_surfaces():
-        for url in re.findall(r'https://[^\s"\']+', source):
-            if url.startswith("https://api."):
-                discovered.append((label, url))
+        _, urls = _surface_scan(label, source)
+        discovered.extend((label, url) for url in urls)
 
     assert sorted(discovered) == [
         (
             "index:src/autobit/alerts/notifier.py",
-            "https://api.telegram.org/bot{self._token}/sendMessage",
+            _TELEGRAM_URL_TEMPLATE,
         ),
         (
             "index:src/autobit/data/upbit_public.py",
@@ -206,7 +736,7 @@ def test_network_api_urls_are_only_public_candles_and_optional_telegram() -> Non
         ),
         (
             "worktree:src/autobit/alerts/notifier.py",
-            "https://api.telegram.org/bot{self._token}/sendMessage",
+            _TELEGRAM_URL_TEMPLATE,
         ),
         (
             "worktree:src/autobit/data/upbit_public.py",
@@ -255,3 +785,167 @@ def test_cli_exposes_exactly_the_offline_public_commands_and_options() -> None:
         "secret-key",
     ):
         assert token not in rendered
+
+
+@pytest.mark.parametrize(
+    ("case", "label", "source"),
+    [
+        (
+            "adjacent_literals_index_renamed",
+            "index:src/autobit/renamed_adapter.py",
+            'import httpx as h\nURL = "https://" "api.upbit.com" "/v1/" "orders"\nh.post(URL)\n',
+        ),
+        (
+            "literal_plus_worktree_renamed",
+            "worktree:src/autobit/renamed_adapter.py",
+            'import httpx as h\nURL = "https://" + "api.upbit.com" + "/v1/" + "orders"\nh.post(URL)\n',
+        ),
+        (
+            "bytes_fromhex",
+            "index:src/autobit/hex_adapter.py",
+            'import httpx as h\nURL = "https://" + "api.upbit.com" + bytes.fromhex("2f76312f6f7264657273").decode()\nh.post(URL)\n',
+        ),
+        (
+            "bytearray_fromhex",
+            "worktree:src/autobit/bytearray_adapter.py",
+            'import httpx as h\nURL = bytearray.fromhex("68747470733a2f2f6170692e75706269742e636f6d2f76312f6f7264657273").decode()\nh.post(URL)\n',
+        ),
+        (
+            "base64_alias",
+            "index:src/autobit/base64_adapter.py",
+            'import base64 as harmless\nimport httpx as h\nURL = harmless.b64decode("aHR0cHM6Ly9hcGkudXBiaXQuY29tL3YxL29yZGVycw==").decode()\nh.post(URL)\n',
+        ),
+        (
+            "codecs_alias",
+            "worktree:src/autobit/codecs_adapter.py",
+            'import codecs as harmless\nimport httpx as h\nURL = harmless.decode("68747470733a2f2f6170692e75706269742e636f6d2f76312f6f7264657273", "hex").decode()\nh.post(URL)\n',
+        ),
+        (
+            "codecs_alias_without_network_sink",
+            "index:src/autobit/codecs_only.py",
+            'import codecs as harmless\nharmless.decode("61", "hex")\n',
+        ),
+        (
+            "dynamic_dunder_import",
+            "index:src/autobit/dynamic_adapter.py",
+            'h = __import__("http" "x")\nURL = "https://" "api.upbit.com" "/v1/" "orders"\nh.post(URL)\n',
+        ),
+        (
+            "dynamic_importlib_alias",
+            "worktree:src/autobit/dynamic_adapter.py",
+            'import importlib as harmless\nh = harmless.import_module("http" + "x")\nURL = "https://" "api.upbit.com" "/v1/" "orders"\nh.post(URL)\n',
+        ),
+        (
+            "forbidden_client_alias",
+            "index:src/autobit/client_adapter.py",
+            "import pyupbit as public_candles\n",
+        ),
+        (
+            "forbidden_client_from_alias",
+            "worktree:src/autobit/client_adapter.py",
+            "from ccxt import upbit as public_candles\n",
+        ),
+        (
+            "uppercase_destination",
+            "index:src/autobit/uppercase_adapter.py",
+            'import httpx as h\nURL = "HTTPS://" "API.UPBIT.COM" "/V1/" "ORDERS"\nh.post(URL)\n',
+        ),
+        (
+            "network_function_alias",
+            "worktree:src/autobit/function_alias.py",
+            'from httpx import post as publish\nURL = "https://" "api.upbit.com" "/v1/" "orders"\npublish(URL)\n',
+        ),
+        (
+            "network_client_alias",
+            "index:src/autobit/client_alias.py",
+            'import httpx as h\nclient = h.Client()\nURL = "https://" "api.upbit.com" "/v1/" "orders"\nclient.post(URL)\n',
+        ),
+        (
+            "network_client_alias_dynamic_url",
+            "worktree:src/autobit/client_alias_dynamic.py",
+            'import httpx as h\nclient = h.Client()\ndef send(host, path):\n    client.post(host + path)\n',
+        ),
+        (
+            "request_then_send",
+            "worktree:src/autobit/request_alias.py",
+            'import httpx as h\nclient = h.Client()\nURL = "https://" "api.upbit.com" "/v1/" "orders"\nrequest = h.Request("POST", URL)\nclient.send(request)\n',
+        ),
+        (
+            "request_alias_dynamic_contract",
+            "index:src/autobit/request_alias_dynamic.py",
+            'import httpx as h\nclient = h.Client()\ndef send(method, url):\n    request = h.Request(method, url)\n    client.send(request)\n',
+        ),
+        (
+            "unresolved_dynamic_url",
+            "index:src/autobit/dynamic_url.py",
+            'import httpx as h\ndef send(endpoint):\n    h.post("https://api.upbit.com/v1/" + endpoint)\n',
+        ),
+        (
+            "wrong_public_method",
+            "worktree:src/autobit/wrong_method.py",
+            'import httpx as h\nh.post("https://api.upbit.com/v1/candles/minutes/240")\n',
+        ),
+        (
+            "wrong_telegram_method",
+            "index:src/autobit/wrong_telegram.py",
+            'import httpx as h\ndef send(token):\n    h.get(f"https://api.telegram.org/bot{token}/sendMessage")\n',
+        ),
+        (
+            "eval_capability",
+            "index:src/autobit/eval_adapter.py",
+            'URL = eval("\'https://\' + host + path")\n',
+        ),
+        (
+            "exec_capability",
+            "worktree:src/autobit/exec_adapter.py",
+            'exec("URL = endpoint")\n',
+        ),
+        (
+            "compile_capability",
+            "index:src/autobit/compile_adapter.py",
+            'compile("URL = endpoint", "<dynamic>", "exec")\n',
+        ),
+    ],
+)
+def test_scanner_rejects_private_constant_and_dynamic_bypasses(
+    case: str,
+    label: str,
+    source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del case
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_repository_source_surfaces",
+        lambda: ((label, source),),
+    )
+
+    with pytest.raises(AssertionError):
+        test_repository_source_has_no_private_upbit_or_live_order_surface()
+
+
+@pytest.mark.parametrize(
+    ("label", "source"),
+    [
+        (
+            "index:src/autobit/public_control.py",
+            'import httpx as h\nURL = "https://api.upbit.com/v1/candles/minutes/240"\nh.get(URL)\n',
+        ),
+        (
+            "worktree:src/autobit/telegram_control.py",
+            'import httpx as h\ndef send(token):\n    h.post(f"https://api.telegram.org/bot{token}/sendMessage")\n',
+        ),
+    ],
+)
+def test_scanner_allows_only_exact_network_controls(
+    label: str,
+    source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_repository_source_surfaces",
+        lambda: ((label, source),),
+    )
+
+    test_repository_source_has_no_private_upbit_or_live_order_surface()
