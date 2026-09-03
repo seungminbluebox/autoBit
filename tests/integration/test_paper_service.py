@@ -11,8 +11,13 @@ from autobit.config import CostConfig, StrategyConfig
 from autobit.domain.models import PositionState
 from autobit.execution.paper_broker import PaperBroker
 from autobit.paper.scheduler import PaperScheduler
-from autobit.paper.service import CycleStatus, PaperService
-from autobit.persistence.sqlite_store import SQLiteStore
+from autobit.paper.service import (
+    CycleStatus,
+    PaperService,
+    _RiskState,
+    _risk_state_payload,
+)
+from autobit.persistence.sqlite_store import SQLiteStore, StoreCorruptionError
 
 
 UTC = timezone.utc
@@ -124,6 +129,44 @@ def _service(
     return store, service
 
 
+def _append_cycle(
+    store: SQLiteStore,
+    end: datetime,
+    *,
+    created: tuple[str, ...] = (),
+    filled: tuple[str, ...] = (),
+    status: str = "PROCESSED",
+) -> None:
+    end_text = end.isoformat().replace("+00:00", "Z")
+    store.append_event(
+        f"cycle:{end_text}",
+        "PAPER_CYCLE",
+        end,
+        {
+            "created_order_ids": list(created),
+            "end_utc": end_text,
+            "filled_order_ids": list(filled),
+            "reason_codes": [],
+            "status": status,
+        },
+    )
+
+
+def _reopen_service(path: Path) -> tuple[SQLiteStore, _Source, PaperService]:
+    store = SQLiteStore(path)
+    store.initialize()
+    source = _Source(_history(END))
+    _, service = _service(
+        path,
+        source,
+        store=store,
+        broker=PaperBroker(store, CostConfig(0.0, 0.0)),
+        owner="reopened-worker",
+        token="reopened-token",
+    )
+    return store, source, service
+
+
 def test_completed_candle_is_processed_once_without_refetch_or_ledger_growth(
     tmp_path: Path,
 ) -> None:
@@ -146,6 +189,7 @@ def test_completed_candle_is_processed_once_without_refetch_or_ledger_growth(
     ]
     assert len(cycle_events) == 1
     assert cycle_events[0].event_type == "PAPER_CYCLE"
+    assert service.oldest_required_end(END) == END + timedelta(hours=4)
 
 
 def test_brand_new_service_starts_at_the_latest_matured_end(tmp_path: Path) -> None:
@@ -155,6 +199,261 @@ def test_brand_new_service_starts_at_the_latest_matured_end(tmp_path: Path) -> N
 
     assert service.oldest_required_end(latest) == latest
     assert source.calls == []
+
+
+def test_contiguous_cycle_chain_returns_immediate_missing_or_next_future_end(
+    tmp_path: Path,
+) -> None:
+    store, service = _service(tmp_path / "paper.sqlite3", _Source(_history(END)))
+    _append_cycle(store, END - timedelta(hours=8))
+    _append_cycle(store, END - timedelta(hours=4))
+
+    assert service.oldest_required_end(END) == END
+
+    _append_cycle(store, END)
+
+    assert service.oldest_required_end(END) == END + timedelta(hours=4)
+
+
+def test_cursor_rejects_a_future_completed_cycle_before_source_or_mutation(
+    tmp_path: Path,
+) -> None:
+    source = _Source(_history(END))
+    store, service = _service(tmp_path / "paper.sqlite3", source)
+    _append_cycle(store, END + timedelta(hours=4))
+    sequence = store.replay_state().last_sequence
+
+    with pytest.raises((StoreCorruptionError, ValueError), match="cycle|future"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+    assert store.replay_state().last_sequence == sequence
+
+
+def test_cursor_rejects_a_gap_inside_the_immutable_completed_chain(
+    tmp_path: Path,
+) -> None:
+    source = _Source(_history(END))
+    store, service = _service(tmp_path / "paper.sqlite3", source)
+    _append_cycle(store, END - timedelta(hours=8))
+    _append_cycle(store, END)
+
+    with pytest.raises(StoreCorruptionError, match="chronology|contiguous"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+
+
+def test_cursor_rejects_a_future_risk_observation(tmp_path: Path) -> None:
+    source = _Source(_history(END))
+    store, service = _service(tmp_path / "paper.sqlite3", source)
+    future = END + timedelta(hours=4)
+    store.append_event(
+        "future-risk",
+        "BREAKER_STATE",
+        future,
+        _risk_state_payload(
+            _RiskState(
+                risk_started_at=future,
+                last_risk_at=future,
+                equity_history=((future, 100.0),),
+            )
+        ),
+    )
+
+    with pytest.raises((StoreCorruptionError, ValueError), match="risk|future"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+
+
+def test_cursor_rejects_a_future_order_signal(tmp_path: Path) -> None:
+    source = _Source(_history(END))
+    store, service = _service(tmp_path / "paper.sqlite3", source)
+    PaperBroker(store, CostConfig(0.0, 0.0)).submit_entry(END, quantity=0.2)
+
+    with pytest.raises((StoreCorruptionError, ValueError), match="order|future"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+
+
+def test_cursor_rejects_a_future_fill_observation(tmp_path: Path) -> None:
+    source = _Source(_history(END))
+    store, service = _service(tmp_path / "paper.sqlite3", source)
+    broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    order = broker.submit_entry(END - timedelta(hours=4), quantity=0.2)
+    broker.process_open(order.order_id, END, open_price=100.0)
+
+    with pytest.raises((StoreCorruptionError, ValueError), match="fill|future"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+
+
+def test_cursor_rejects_a_future_stop_observation(tmp_path: Path) -> None:
+    source = _Source(_history(END))
+    store, service = _service(tmp_path / "paper.sqlite3", source)
+    broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    order = broker.submit_entry(END - timedelta(hours=8), quantity=0.2)
+    broker.process_open(order.order_id, END - timedelta(hours=4), open_price=100.0)
+    broker.set_stop(END, 95.0)
+
+    with pytest.raises((StoreCorruptionError, ValueError), match="stop|future"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+
+
+def test_cursor_rejects_an_obligation_before_the_first_completed_cycle(
+    tmp_path: Path,
+) -> None:
+    source = _Source(_history(END))
+    store, service = _service(tmp_path / "paper.sqlite3", source)
+    PaperBroker(store, CostConfig(0.0, 0.0)).submit_entry(
+        END - timedelta(hours=12),
+        quantity=0.2,
+    )
+    _append_cycle(store, END - timedelta(hours=4))
+
+    with pytest.raises(StoreCorruptionError, match="chronology|rollback"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+
+
+def test_reopened_cursor_rejects_ghost_cycle_mutation_ids(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    _append_cycle(store, END, created=("ghost-order",), filled=("ghost-fill",))
+    store.close()
+    reopened, source, service = _reopen_service(path)
+
+    with pytest.raises(StoreCorruptionError, match="order|fill|mutation"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+    reopened.close()
+
+
+def test_reopened_cursor_rejects_duplicate_created_and_filled_claims(
+    tmp_path: Path,
+) -> None:
+    for claim in ("created", "filled"):
+        path = tmp_path / f"{claim}.sqlite3"
+        store = SQLiteStore(path)
+        store.initialize()
+        broker = PaperBroker(store, CostConfig(0.0, 0.0))
+        order = broker.submit_entry(END - timedelta(hours=8), quantity=0.2)
+        if claim == "created":
+            _append_cycle(store, END - timedelta(hours=4), created=(order.order_id,) * 2)
+        else:
+            _append_cycle(store, END - timedelta(hours=4), created=(order.order_id,))
+            broker.process_open(order.order_id, END - timedelta(hours=4), open_price=100.0)
+            _append_cycle(store, END, filled=(order.order_id,) * 2)
+        store.close()
+        reopened, source, service = _reopen_service(path)
+
+        with pytest.raises(StoreCorruptionError, match="duplicate|unique"):
+            service.oldest_required_end(END)
+
+        assert source.calls == []
+        reopened.close()
+
+
+def test_reopened_cursor_rejects_created_order_claimed_by_the_wrong_cycle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    order = PaperBroker(store, CostConfig(0.0, 0.0)).submit_entry(
+        END - timedelta(hours=8),
+        quantity=0.2,
+    )
+    _append_cycle(store, END, created=(order.order_id,))
+    store.close()
+    reopened, source, service = _reopen_service(path)
+
+    with pytest.raises(StoreCorruptionError, match="created order|signal bar"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+    reopened.close()
+
+
+def test_reopened_cursor_rejects_filled_order_claimed_by_the_wrong_cycle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    order = broker.submit_entry(END - timedelta(hours=12), quantity=0.2)
+    _append_cycle(store, END - timedelta(hours=8), created=(order.order_id,))
+    broker.process_open(order.order_id, END - timedelta(hours=8), open_price=100.0)
+    _append_cycle(store, END - timedelta(hours=4), filled=(order.order_id,))
+    _append_cycle(store, END, filled=(order.order_id,))
+    store.close()
+    reopened, source, service = _reopen_service(path)
+
+    with pytest.raises(StoreCorruptionError, match="filled order|fill bar"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+    reopened.close()
+
+
+def test_reopened_cursor_rejects_a_stop_order_as_cycle_created_order(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    entry = broker.submit_entry(END - timedelta(hours=16), quantity=0.2)
+    _append_cycle(store, END - timedelta(hours=12), created=(entry.order_id,))
+    broker.process_open(entry.order_id, END - timedelta(hours=12), open_price=100.0)
+    broker.set_stop(END - timedelta(hours=12), 95.0)
+    _append_cycle(store, END - timedelta(hours=8), filled=(entry.order_id,))
+    stopped = broker.process_intrabar_stop(
+        END - timedelta(hours=8),
+        open_price=90.0,
+        low_price=89.0,
+    )
+    assert stopped is not None
+    _append_cycle(
+        store,
+        END - timedelta(hours=4),
+        created=(stopped.order_id,),
+        filled=(stopped.order_id,),
+    )
+    store.close()
+    reopened, source, service = _reopen_service(path)
+
+    with pytest.raises(StoreCorruptionError, match="created order kind"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+    reopened.close()
+
+
+def test_reopened_cursor_rejects_unsafe_completion_with_mutation_claims(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    _append_cycle(store, END, created=("ghost",), status="UNSAFE_DATA")
+    store.close()
+    reopened, source, service = _reopen_service(path)
+
+    with pytest.raises(StoreCorruptionError, match="unsafe.*mutation"):
+        service.oldest_required_end(END)
+
+    assert source.calls == []
+    reopened.close()
 
 
 @pytest.mark.parametrize(

@@ -291,3 +291,15 @@ def test_scheduler_rejects_nonpositive_or_unbounded_retry_delays(delay: float) -
 
     with pytest.raises(ValueError, match="retry delay"):
         PaperScheduler(_RecordingService(), clock, _AdvancingSleeper(clock), delay)
+
+
+def test_scheduler_normalizes_cursor_increment_overflow_to_contract_error() -> None:
+    maximum = datetime(9999, 12, 31, 20, 0, tzinfo=UTC)
+    clock = _MutableClock(datetime(9999, 12, 31, 20, 11, tzinfo=UTC))
+
+    with pytest.raises(ValueError, match="outside datetime range"):
+        PaperScheduler(
+            _RecordingService(maximum),
+            clock,
+            _AdvancingSleeper(clock),
+        ).run_once()

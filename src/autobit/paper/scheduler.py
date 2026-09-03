@@ -98,6 +98,10 @@ class PaperScheduler:
             raise RuntimeError("scheduler has no pending completed candle")
         process_end = self._next_end
         try:
+            following_end = process_end + _FOUR_HOURS
+        except OverflowError as error:
+            raise ValueError("scheduler cursor is outside datetime range") from error
+        try:
             result = self._service.process_completed_candle(process_end)
         except Exception:
             self._sleeper.sleep(self._retry_delay_seconds)
@@ -105,7 +109,7 @@ class PaperScheduler:
         if getattr(result, "status", None) == "LEASE_HELD":
             self._sleeper.sleep(self._retry_delay_seconds)
             return result
-        self._next_end = process_end + _FOUR_HOURS
+        self._next_end = following_end
         return result
 
 
