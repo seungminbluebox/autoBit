@@ -906,8 +906,46 @@ class PaperBroker:
                     raise PaperReconciliationError("remainder child changes cost binding")
                 children.setdefault(parent_id, []).append(order)
             elif parent_id.startswith("paper-stop:"):
-                if order.order_kind != "STOP" or parent_id not in known_stops:
+                stop = known_stops.get(parent_id)
+                if order.order_kind != "STOP" or stop is None:
                     raise PaperReconciliationError("stop order ancestry is invalid")
+                if not (
+                    order.reason == stop.reason
+                    and order.signal_at_utc == stop.observed_at_utc
+                    and order.eligible_open_utc is not None
+                    and order.eligible_open_utc >= stop.active_after_utc
+                    and _exact(order.fee_rate, stop.fee_rate)
+                    and _exact(order.slippage_rate, stop.slippage_rate)
+                ):
+                    raise PaperReconciliationError(
+                        "stop order changes persisted stop binding"
+                    )
+                stop_fills = fills_by_order.get(order.order_id, ())
+                if order.status is not OrderStatus.COMPLETED or len(stop_fills) != 1:
+                    raise PaperReconciliationError("stop exit must complete in one fill")
+                stop_fill = stop_fills[0]
+                inventory_before = _inventory_before_sequence(
+                    stop_fill.sequence,
+                    snapshot.event_evidence,
+                )
+                fill_quantity = _decimal(
+                    _payload_number(stop_fill.payload, "quantity")
+                )
+                if (
+                    _decimal(order.requested_quantity) != inventory_before
+                    or fill_quantity != inventory_before
+                    or inventory_before - fill_quantity != 0
+                ):
+                    raise PaperReconciliationError(
+                        "stop exit does not cover the exact full inventory"
+                    )
+                stop_fill_meta = fill_metadata.get(stop_fill.event_id)
+                if stop_fill_meta is None or _decimal(
+                    _payload_number(stop_fill_meta.payload, "reference_price")
+                ) > _decimal(stop.stop_price):
+                    raise PaperReconciliationError(
+                        "stop exit reference is inconsistent with the stop price"
+                    )
             else:
                 raise PaperReconciliationError("paper order has unknown parent identity")
         if any(len(items) != 1 for items in children.values()):
@@ -1023,6 +1061,7 @@ class PaperBroker:
                 orders,
             ) != stop.source_id:
                 raise PaperReconciliationError("paper stop source was not open when observed")
+        triggered_orders: set[str] = set()
         for event in stop_terminals:
             identity = _payload_text(event.payload, "identity")
             related = orders.get(identity)
@@ -1050,8 +1089,17 @@ class PaperBroker:
             stop_id = _payload_text(event.payload, "stop_id")
             if action == "TRIGGERED" and related.parent_order_id != stop_id:
                 raise PaperReconciliationError("triggered stop exit ancestry is invalid")
+            if action == "TRIGGERED":
+                triggered_orders.add(identity)
             if action == "CANCELED" and related.parent_order_id == stop_id:
                 raise PaperReconciliationError("canceled stop is bound to a trigger order")
+        stop_order_ids = {
+            order.order_id for order in orders.values() if order.order_kind == "STOP"
+        }
+        if triggered_orders != stop_order_ids:
+            raise PaperReconciliationError(
+                "stop exit lifecycle lacks exactly one triggered terminal"
+            )
 
         return _Ledger(
             snapshot=snapshot,
@@ -1787,3 +1835,26 @@ def _paper_source_at_sequence(
             if position == 0:
                 source = None
     return source
+
+
+def _inventory_before_sequence(
+    before_sequence: int,
+    evidence: tuple[StoredEvent, ...],
+) -> Decimal:
+    inventory = Decimal("0")
+    for event in evidence:
+        if event.sequence >= before_sequence:
+            break
+        if event.event_type != "FILL":
+            continue
+        quantity = _decimal(_payload_number(event.payload, "quantity"))
+        side = _payload_text(event.payload, "side")
+        if side == "BUY":
+            inventory += quantity
+        elif side == "SELL":
+            inventory -= quantity
+        else:
+            raise PaperReconciliationError("fill side is invalid")
+        if inventory < 0:
+            raise PaperReconciliationError("fill history has negative inventory")
+    return inventory

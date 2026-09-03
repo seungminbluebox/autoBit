@@ -1076,6 +1076,103 @@ def test_reconcile_rejects_stop_terminal_before_its_future_trigger_lifecycle(
         broker.reconcile()
 
 
+def test_reconcile_rejects_partial_stop_trigger_that_leaves_unprotected_btc(
+    tmp_path: Path,
+) -> None:
+    store, broker = _broker(tmp_path / "paper.sqlite3", CostConfig(0.0, 0.0))
+    _enter(broker, quantity=0.2)
+    stop = broker.set_stop(UTC_4, 95.0, reason="HARD_STOP")
+    key = f"KRW-BTC:{UTC_4}:SELL:HARD_STOP:{stop.stop_id}"
+    order_id = f"paper-order:{sha256(key.encode('utf-8')).hexdigest()}"
+    store.record_order_once(
+        key,
+        "SELL",
+        0.1,
+        order_id=order_id,
+        occurred_at=UTC_8,
+        status=OrderStatus.CREATED,
+    )
+    store.transition_order_status(
+        order_id,
+        f"{key}:submitted",
+        OrderStatus.SUBMITTED,
+        UTC_8,
+    )
+    store.transition_order_status(
+        order_id,
+        f"{key}:accepted",
+        OrderStatus.ACCEPTED,
+        UTC_8,
+    )
+    store.append_event(
+        f"paper-order-meta:{sha256(order_id.encode('utf-8')).hexdigest()}",
+        "PAPER_ORDER",
+        UTC_8,
+        {
+            "eligible_open_utc": UTC_8,
+            "fee_rate": 0.0,
+            "idempotency_key": key,
+            "order_id": order_id,
+            "order_kind": "STOP",
+            "parent_order_id": stop.stop_id,
+            "reason": "HARD_STOP",
+            "requested_quantity": 0.1,
+            "side": "SELL",
+            "signal_at_utc": UTC_4,
+            "slippage_rate": 0.0,
+        },
+    )
+    fill_material = "|".join((order_id, UTC_8, repr(0.1)))
+    fill_id = f"paper-fill:{sha256(fill_material.encode('utf-8')).hexdigest()}"
+    store.append_fill(
+        order_id,
+        "SELL",
+        0.1,
+        95.0,
+        0.0,
+        UTC_8,
+        fill_id=fill_id,
+    )
+    store.transition_order_status(
+        order_id,
+        f"{key}:completed:{UTC_8}",
+        OrderStatus.COMPLETED,
+        UTC_8,
+        reason="HARD_STOP",
+    )
+    store.append_event(
+        f"paper-fill-meta:{sha256(fill_id.encode('utf-8')).hexdigest()}",
+        "PAPER_FILL",
+        UTC_8,
+        {
+            "fee": 0.0,
+            "fee_rate": 0.0,
+            "fill_id": fill_id,
+            "fill_price": 95.0,
+            "order_id": order_id,
+            "quantity": 0.1,
+            "reason": "HARD_STOP",
+            "reference_price": 95.0,
+            "side": "SELL",
+            "slippage": 0.0,
+            "slippage_rate": 0.0,
+        },
+    )
+    terminal_id = (
+        "paper-stop-triggered:"
+        f"{sha256((stop.stop_id + '|' + order_id).encode('utf-8')).hexdigest()}"
+    )
+    store.append_event(
+        terminal_id,
+        "PAPER_STOP",
+        UTC_8,
+        {"action": "TRIGGERED", "identity": order_id, "stop_id": stop.stop_id},
+    )
+
+    with pytest.raises(PaperReconciliationError, match="full|inventory|residual"):
+        broker.reconcile()
+
+
 def test_reconcile_preserves_generic_store_orders_without_treating_them_as_broker_orders(
     tmp_path: Path,
 ) -> None:
