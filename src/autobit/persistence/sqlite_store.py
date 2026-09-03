@@ -35,6 +35,7 @@ _TOLERANCE = 1e-10
 _EPOCH = "1970-01-01T00:00:00Z"
 _EMPTY_EVENT_DIGEST = sha256(b"").hexdigest()
 _CYCLE_LEASE_KEY = "paper_cycle_lease"
+_FileIdentity = tuple[int, int, int, int, int, int, int]
 _UTC_Z_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$",
 )
@@ -272,12 +273,20 @@ class SQLiteStore:
     def open_read_only(cls, path: str | Path) -> SQLiteStore:
         """Open and fully verify an existing ledger without initialization writes."""
         resolved = Path(os.path.abspath(path))
-        _literal_regular_file_identity(resolved, required=True)
+        main_identity = _literal_regular_file_identity(resolved, required=True)
+        if main_identity is None:  # Defensive: ``required=True`` rejects absence.
+            raise StoreError("read-only store requires an existing regular database file")
+        wal_identity = _literal_regular_file_identity(Path(f"{resolved}-wal"), required=False)
         temporary = tempfile.TemporaryDirectory(prefix="autobit-status-")
         snapshot_path = Path(temporary.name) / resolved.name
         try:
-            _copy_stable_sqlite_snapshot(resolved, snapshot_path)
-        except Exception:
+            _copy_stable_sqlite_snapshot(
+                resolved,
+                snapshot_path,
+                expected_main_identity=main_identity,
+                expected_wal_identity=wal_identity,
+            )
+        except BaseException:
             temporary.cleanup()
             raise
         store = cls(
@@ -291,7 +300,7 @@ class SQLiteStore:
             store._validate_schema_and_identity(connection)
             store._replay_and_verify(connection)
             store._initialized = True
-        except Exception:
+        except BaseException:
             store.close()
             raise
         return store
@@ -1473,15 +1482,37 @@ class SQLiteStore:
             raise StoreError("store is read-only")
 
 
-def _copy_stable_sqlite_snapshot(source: Path, destination: Path) -> None:
+def _copy_stable_sqlite_snapshot(
+    source: Path,
+    destination: Path,
+    *,
+    expected_main_identity: _FileIdentity,
+    expected_wal_identity: _FileIdentity | None,
+) -> None:
     """Copy a stable main/WAL pair without opening or mutating the source."""
     wal_source = Path(f"{source}-wal")
-
     def capture() -> tuple[bytes, bytes | None]:
-        main = _read_literal_regular_file(source, required=True)
-        if main is None:  # Defensive: ``required=True`` rejects absence.
-            raise StoreError("read-only store requires an existing regular database file")
-        wal = _read_literal_regular_file(wal_source, required=False)
+        main_identity = _literal_regular_file_identity(source, required=True)
+        if main_identity is None or not _same_file_object(
+            expected_main_identity,
+            main_identity,
+        ):
+            raise OSError("SQLite main file changed before snapshot capture")
+        wal_identity = _literal_regular_file_identity(wal_source, required=False)
+        if expected_wal_identity is None:
+            if wal_identity is not None:
+                raise OSError("SQLite WAL appeared after snapshot preflight")
+        elif wal_identity is None or not _same_file_object(
+            expected_wal_identity,
+            wal_identity,
+        ):
+            raise OSError("SQLite WAL changed after snapshot preflight")
+        main = _read_preflighted_regular_file(source, main_identity)
+        wal = _read_preflighted_regular_file(wal_source, wal_identity)
+        if _literal_regular_file_identity(source, required=True) != main_identity:
+            raise OSError("SQLite main file changed during snapshot capture")
+        if _literal_regular_file_identity(wal_source, required=False) != wal_identity:
+            raise OSError("SQLite WAL changed during snapshot capture")
         return main, wal
 
     stable: tuple[bytes, bytes | None] | None = None
@@ -1503,12 +1534,28 @@ def _copy_stable_sqlite_snapshot(source: Path, destination: Path) -> None:
 
 
 def _read_literal_regular_file(path: Path, *, required: bool) -> bytes | None:
-    before = _literal_regular_file_identity(path, required=required)
-    if before is None:
+    identity = _literal_regular_file_identity(path, required=required)
+    return _read_preflighted_regular_file(path, identity)
+
+
+def _read_preflighted_regular_file(
+    path: Path,
+    identity: _FileIdentity | None,
+) -> bytes | None:
+    if identity is None:
+        if _literal_regular_file_identity(path, required=False) is not None:
+            raise OSError("SQLite source appeared during read-only snapshot capture")
         return None
-    contents = path.read_bytes()
-    after = _literal_regular_file_identity(path, required=True)
-    if before != after:
+    with path.open("rb") as handle:
+        opened = _regular_file_identity(os.fstat(handle.fileno()))
+        if not _same_file_binding(identity, opened):
+            raise OSError("SQLite source open handle identity changed")
+        contents = handle.read()
+        after_read = _regular_file_identity(os.fstat(handle.fileno()))
+        if opened != after_read or len(contents) != opened[4]:
+            raise OSError("SQLite source changed while reading its open handle")
+    after_path = _literal_regular_file_identity(path, required=True)
+    if identity != after_path:
         raise OSError("SQLite source changed while taking a read-only snapshot")
     return contents
 
@@ -1517,7 +1564,7 @@ def _literal_regular_file_identity(
     path: Path,
     *,
     required: bool,
-) -> tuple[int, int, int, int, int, int] | None:
+) -> _FileIdentity | None:
     _require_safe_parent_chain(path.parent)
     try:
         details = os.lstat(path)
@@ -1525,6 +1572,12 @@ def _literal_regular_file_identity(
         if required:
             raise StoreError("read-only store requires an existing regular database file") from None
         return None
+    return _regular_file_identity(details)
+
+
+def _regular_file_identity(
+    details: os.stat_result,
+) -> _FileIdentity:
     if (
         not stat.S_ISREG(details.st_mode)
         or details.st_nlink != 1
@@ -1534,11 +1587,21 @@ def _literal_regular_file_identity(
     return (
         details.st_dev,
         details.st_ino,
+        stat.S_IFMT(details.st_mode),
         details.st_nlink,
         details.st_size,
         details.st_mtime_ns,
         details.st_ctime_ns,
     )
+
+
+def _same_file_binding(left: _FileIdentity, right: _FileIdentity) -> bool:
+    comparable = slice(0, 6) if os.name == "nt" else slice(None)
+    return left[comparable] == right[comparable]
+
+
+def _same_file_object(left: _FileIdentity, right: _FileIdentity) -> bool:
+    return left[:4] == right[:4]
 
 
 def _require_safe_parent_chain(parent: Path) -> None:

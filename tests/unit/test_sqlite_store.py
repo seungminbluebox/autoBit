@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from autobit.domain.models import OrderStatus, PositionState
+from autobit.persistence import sqlite_store as sqlite_store_module
 from autobit.persistence.sqlite_store import (
     IdempotencyConflictError,
     SQLiteStore,
@@ -1264,25 +1265,427 @@ def test_read_only_open_detects_file_swap_between_identity_check_and_read(
     store = _open_store(path)
     store.close()
     original = path.read_bytes()
-    backup = tmp_path / "original.sqlite3"
-    original_read_bytes = Path.read_bytes
+    replacement = tmp_path / "replacement.sqlite3"
+    replacement.write_bytes(original)
+    original_open = Path.open
     swapped = False
 
-    def swap_before_read(candidate: Path) -> bytes:
+    def swap_before_read(candidate: Path, *args: object, **kwargs: object):
         nonlocal swapped
-        if candidate == path and not swapped:
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if candidate == path and mode == "rb":
             swapped = True
-            path.replace(backup)
-            path.symlink_to(backup)
-        return original_read_bytes(candidate)
+            return original_open(replacement, *args, **kwargs)
+        return original_open(candidate, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", swap_before_read)
+    monkeypatch.setattr(Path, "open", swap_before_read)
 
-    with pytest.raises(StoreError, match="alias|regular"):
+    with pytest.raises(StoreError, match="stable|changed|identity"):
         SQLiteStore.open_read_only(path)
 
     assert swapped
-    assert original_read_bytes(backup) == original
+    with original_open(path, "rb") as source_handle:
+        assert source_handle.read() == original
+    with original_open(replacement, "rb") as replacement_handle:
+        assert replacement_handle.read() == original
+
+
+def test_read_only_open_rejects_parent_aba_open_of_alternate_valid_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_dir = tmp_path / "live"
+    alternate_dir = tmp_path / "alternate"
+    live_dir.mkdir()
+    alternate_dir.mkdir()
+    path = live_dir / "paper.sqlite3"
+    alternate = alternate_dir / path.name
+    primary_store = _open_store(path)
+    primary_store.close()
+    alternate_store = _open_store(alternate)
+    alternate_store.append_event(
+        "alternate-ledger",
+        "CYCLE_EVIDENCE",
+        UTC_0,
+        {"value": "must-not-be-returned"},
+    )
+    alternate_store.close()
+    symlink_probe = tmp_path / "symlink-probe"
+    try:
+        symlink_probe.symlink_to(alternate_dir, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symbolic links are unavailable: {error}")
+    symlink_probe.unlink()
+    source_before = {
+        candidate: (
+            candidate.read_bytes(),
+            candidate.stat().st_size,
+            candidate.stat().st_mtime_ns,
+        )
+        for candidate in (path, alternate)
+    }
+    listing_before = tuple(sorted(item.relative_to(tmp_path) for item in tmp_path.rglob("*")))
+    original_open = Path.open
+    swaps = 0
+
+    def open_through_alternate_parent(candidate: Path, *args: object, **kwargs: object):
+        nonlocal swaps
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if candidate == path and mode == "rb":
+            swaps += 1
+            held = tmp_path / "held-live"
+            live_dir.replace(held)
+            live_dir.symlink_to(alternate_dir, target_is_directory=True)
+            try:
+                handle = original_open(candidate, *args, **kwargs)
+            finally:
+                live_dir.unlink()
+                held.replace(live_dir)
+            return handle
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_through_alternate_parent)
+    reader: SQLiteStore | None = None
+    try:
+        with pytest.raises(StoreError, match="stable|changed|identity"):
+            reader = SQLiteStore.open_read_only(path)
+    finally:
+        if reader is not None:
+            reader.close()
+
+    assert swaps >= 1
+    source_after = {}
+    for candidate in (path, alternate):
+        with original_open(candidate, "rb") as handle:
+            contents = handle.read()
+        source_after[candidate] = (
+            contents,
+            candidate.stat().st_size,
+            candidate.stat().st_mtime_ns,
+        )
+    assert source_after == source_before
+    assert tuple(sorted(item.relative_to(tmp_path) for item in tmp_path.rglob("*"))) == listing_before
+
+
+@pytest.mark.parametrize("filename", ["paper.sqlite3", "paper.sqlite3-wal"])
+def test_literal_reader_rejects_file_aba_even_when_replacement_bytes_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    path = tmp_path / filename
+    replacement = tmp_path / f"replacement-{filename}"
+    path.write_bytes(b"same-stable-bytes")
+    replacement.write_bytes(b"same-stable-bytes")
+    original_open = Path.open
+    swaps = 0
+
+    def open_replacement(candidate: Path, *args: object, **kwargs: object):
+        nonlocal swaps
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if candidate == path and mode == "rb":
+            swaps += 1
+            return original_open(replacement, *args, **kwargs)
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_replacement)
+
+    with pytest.raises(OSError, match="changed|identity"):
+        sqlite_store_module._read_literal_regular_file(path, required=True)
+
+    assert swaps == 1
+    with original_open(path, "rb") as source_handle:
+        assert source_handle.read() == b"same-stable-bytes"
+    with original_open(replacement, "rb") as replacement_handle:
+        assert replacement_handle.read() == b"same-stable-bytes"
+
+
+def test_snapshot_capture_rejects_replacement_wal_handle_after_main_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "paper.sqlite3"
+    wal = Path(f"{source}-wal")
+    replacement_wal = tmp_path / "replacement-wal"
+    destination = tmp_path / "snapshot.sqlite3"
+    source.write_bytes(b"main-bytes")
+    wal.write_bytes(b"same-wal-bytes")
+    replacement_wal.write_bytes(b"same-wal-bytes")
+    main_identity = sqlite_store_module._literal_regular_file_identity(source, required=True)
+    wal_identity = sqlite_store_module._literal_regular_file_identity(wal, required=True)
+    assert main_identity is not None
+    assert wal_identity is not None
+    original_open = Path.open
+    wal_opens = 0
+
+    def open_replacement_wal(candidate: Path, *args: object, **kwargs: object):
+        nonlocal wal_opens
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if candidate == wal and mode == "rb":
+            wal_opens += 1
+            return original_open(replacement_wal, *args, **kwargs)
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_replacement_wal)
+
+    with pytest.raises(StoreError, match="stable"):
+        sqlite_store_module._copy_stable_sqlite_snapshot(
+            source,
+            destination,
+            expected_main_identity=main_identity,
+            expected_wal_identity=wal_identity,
+        )
+
+    assert wal_opens == 5
+    assert not destination.exists()
+    with original_open(source, "rb") as main_handle:
+        assert main_handle.read() == b"main-bytes"
+    with original_open(wal, "rb") as wal_handle:
+        assert wal_handle.read() == b"same-wal-bytes"
+
+
+def test_snapshot_capture_binds_wal_file_across_double_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "paper.sqlite3"
+    wal = Path(f"{source}-wal")
+    replacement_wal = tmp_path / "replacement-wal"
+    destination = tmp_path / "snapshot.sqlite3"
+    source.write_bytes(b"main-bytes")
+    wal.write_bytes(b"same-wal-bytes")
+    replacement_wal.write_bytes(b"same-wal-bytes")
+    main_identity = sqlite_store_module._literal_regular_file_identity(source, required=True)
+    wal_identity = sqlite_store_module._literal_regular_file_identity(wal, required=True)
+    assert main_identity is not None
+    assert wal_identity is not None
+    original_identity = sqlite_store_module._literal_regular_file_identity
+    wal_checks = 0
+
+    def swap_after_first_capture(
+        candidate: Path,
+        *,
+        required: bool,
+    ):
+        nonlocal wal_checks
+        identity = original_identity(candidate, required=required)
+        if candidate == wal:
+            wal_checks += 1
+            if wal_checks == 3:
+                held = tmp_path / "held-wal"
+                wal.replace(held)
+                replacement_wal.replace(wal)
+                held.replace(replacement_wal)
+        return identity
+
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_literal_regular_file_identity",
+        swap_after_first_capture,
+    )
+
+    with pytest.raises(StoreError, match="stable|changed"):
+        sqlite_store_module._copy_stable_sqlite_snapshot(
+            source,
+            destination,
+            expected_main_identity=main_identity,
+            expected_wal_identity=wal_identity,
+        )
+
+    assert wal_checks >= 3
+    assert not destination.exists()
+
+
+def test_literal_reader_rejects_handle_switch_after_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    path.write_bytes(b"same-stable-bytes")
+    replacement.write_bytes(b"same-stable-bytes")
+    original_open = Path.open
+
+    class SwitchingHandle:
+        def __init__(self) -> None:
+            self._handle = original_open(path, "rb")
+
+        def __enter__(self) -> SwitchingHandle:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+            self._handle.close()
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
+
+        def read(self) -> bytes:
+            contents = self._handle.read()
+            self._handle.close()
+            self._handle = original_open(replacement, "rb")
+            return contents
+
+    switching = SwitchingHandle()
+
+    def open_switching(candidate: Path, *args: object, **kwargs: object):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if candidate == path and mode == "rb":
+            return switching
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_switching)
+
+    with pytest.raises(OSError, match="open handle"):
+        sqlite_store_module._read_literal_regular_file(path, required=True)
+
+    assert switching._handle.closed
+    with original_open(path, "rb") as source_handle:
+        assert source_handle.read() == b"same-stable-bytes"
+
+
+def test_read_only_open_cleans_temporary_snapshot_on_baseexception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.close()
+    real_temporary_directory = sqlite_store_module.tempfile.TemporaryDirectory
+    created: list[Path] = []
+    cleaned: list[Path] = []
+
+    class TrackingTemporaryDirectory:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._inner = real_temporary_directory(*args, **kwargs)
+            self.name = self._inner.name
+            created.append(Path(self.name))
+
+        def cleanup(self) -> None:
+            cleaned.append(Path(self.name))
+            self._inner.cleanup()
+
+    def interrupt_copy(
+        source: Path,
+        destination: Path,
+        *,
+        expected_main_identity: object,
+        expected_wal_identity: object,
+    ) -> None:
+        del source, destination, expected_main_identity, expected_wal_identity
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        sqlite_store_module.tempfile,
+        "TemporaryDirectory",
+        TrackingTemporaryDirectory,
+    )
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_copy_stable_sqlite_snapshot",
+        interrupt_copy,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        SQLiteStore.open_read_only(path)
+
+    assert len(created) == 1
+    assert cleaned == created
+    assert not created[0].exists()
+
+
+def test_literal_reader_closes_open_handle_on_baseexception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    path.write_bytes(b"source-bytes")
+    original_open = Path.open
+
+    class InterruptingHandle:
+        def __init__(self) -> None:
+            self._handle = original_open(path, "rb")
+            self.exited = False
+
+        def __enter__(self) -> InterruptingHandle:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+            self.exited = True
+            self._handle.close()
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
+
+        def read(self) -> bytes:
+            raise KeyboardInterrupt
+
+    interrupting = InterruptingHandle()
+
+    def open_interrupting(candidate: Path, *args: object, **kwargs: object):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if candidate == path and mode == "rb":
+            return interrupting
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_interrupting)
+
+    with pytest.raises(KeyboardInterrupt):
+        sqlite_store_module._read_literal_regular_file(path, required=True)
+
+    assert interrupting.exited
+    assert interrupting._handle.closed
+    with original_open(path, "rb") as source_handle:
+        assert source_handle.read() == b"source-bytes"
+
+
+def test_read_only_open_cleans_store_snapshot_on_validation_baseexception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.close()
+    source_before = path.read_bytes()
+    listing_before = tuple(sorted(item.name for item in tmp_path.iterdir()))
+    real_temporary_directory = sqlite_store_module.tempfile.TemporaryDirectory
+    created: list[Path] = []
+    cleaned: list[Path] = []
+
+    class TrackingTemporaryDirectory:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._inner = real_temporary_directory(*args, **kwargs)
+            self.name = self._inner.name
+            created.append(Path(self.name))
+
+        def cleanup(self) -> None:
+            cleaned.append(Path(self.name))
+            self._inner.cleanup()
+
+    def interrupt_validation(self: SQLiteStore, connection: sqlite3.Connection) -> None:
+        del self, connection
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        sqlite_store_module.tempfile,
+        "TemporaryDirectory",
+        TrackingTemporaryDirectory,
+    )
+    monkeypatch.setattr(
+        SQLiteStore,
+        "_validate_schema_and_identity",
+        interrupt_validation,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        SQLiteStore.open_read_only(path)
+
+    assert len(created) == 1
+    assert cleaned == created
+    assert not created[0].exists()
+    assert path.read_bytes() == source_before
+    assert tuple(sorted(item.name for item in tmp_path.iterdir())) == listing_before
 
 
 def _table_names(path: Path) -> set[str]:
