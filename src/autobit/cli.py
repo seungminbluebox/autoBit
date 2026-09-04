@@ -739,10 +739,14 @@ def _status_equity(
     reconciliation: PaperReconciliation,
     completed: frozenset[datetime],
 ) -> _StatusEquity:
-    if reconciliation.fills:
+    raw_fills = tuple(
+        event for event in snapshot.event_evidence if event.event_type == "FILL"
+    )
+    if raw_fills:
+        latest_fill = max(raw_fills, key=lambda event: event.sequence)
         fallback = _StatusEquity(
             value=reconciliation.equity,
-            as_of_utc=max(fill.fill_time for fill in reconciliation.fills),
+            as_of_utc=latest_fill.occurred_at_utc,
             status="STALE",
             provenance="LAST_FILL_BROKER_EQUITY",
         )
@@ -775,13 +779,7 @@ def _status_equity(
         raise StoreError("unsafe cycle contradicts a completed-close risk mark")
     if risk_event.sequence >= cycle.sequence:
         raise StoreError("completed-close risk mark is not prior to its terminal cycle")
-    reconciled_fill_ids = frozenset(fill.fill_id for fill in reconciliation.fills)
-    if any(
-        event.event_type == "FILL"
-        and event.event_id in reconciled_fill_ids
-        and event.sequence > cycle.sequence
-        for event in snapshot.event_evidence
-    ):
+    if any(event.sequence > cycle.sequence for event in raw_fills):
         return fallback
 
     equity = chain.projection.last_equity

@@ -1093,10 +1093,30 @@ def test_no_tracked_python_bytecode_remains() -> None:
     assert tracked_bytecode == ()
 
 
-def test_generated_pytest_basetemp_is_not_a_repository_source_surface() -> None:
-    labels = tuple(label for label, _ in _repository_source_surfaces())
+def test_only_root_generated_pytest_basetemp_is_not_a_repository_source_surface() -> None:
+    root_probe = Path(".test-tmp/_safety_root_fixture/probe.py")
+    nested_probe = Path("src/autobit/.test-tmp/_safety_nested_fixture/probe.py")
+    assert not root_probe.exists()
+    assert not nested_probe.exists()
+    root_probe.parent.mkdir(parents=True)
+    nested_probe.parent.mkdir(parents=True)
+    root_probe.write_text("import pyupbit\n", encoding="utf-8")
+    nested_probe.write_text("import pyupbit\n", encoding="utf-8")
+    try:
+        surfaces = dict(_repository_source_surfaces())
+        root_label = f"worktree:{root_probe.as_posix()}"
+        nested_label = f"worktree:{nested_probe.as_posix()}"
 
-    assert not any(label.startswith("worktree:.test-tmp/") for label in labels)
+        assert root_label not in surfaces
+        assert nested_label in surfaces
+        violations, _ = _surface_scan(nested_label, surfaces[nested_label])
+        assert f"{nested_label}: forbidden import: pyupbit" in violations
+    finally:
+        root_probe.unlink()
+        root_probe.parent.rmdir()
+        nested_probe.unlink()
+        nested_probe.parent.rmdir()
+        nested_probe.parent.parent.rmdir()
 
 
 def test_worktree_surface_scan_still_includes_an_unignored_package_module() -> None:

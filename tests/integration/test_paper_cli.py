@@ -422,6 +422,199 @@ def test_paper_status_sell_crash_window_later_fill_sequence_forces_last_fill_fal
     assert _ledger_file_image(path) == before
 
 
+@pytest.mark.parametrize("reopen", [False, True], ids=["active-wal", "reopened"])
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_paper_status_generic_fill_after_cycle_uses_raw_last_fill_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reopen: bool,
+    side: str,
+) -> None:
+    """Validated generic fills are balance-changing broker evidence too."""
+    path = tmp_path / f"generic-{side.lower()}.sqlite3"
+    fill_at = END + (timedelta(hours=8) if side == "SELL" else timedelta(hours=4))
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: fill_at + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    _process_cycle(store, _history(END))
+    if side == "SELL":
+        store.append_fill(
+            "foreign-entry",
+            "BUY",
+            0.2,
+            100.0,
+            0.02,
+            END + timedelta(hours=4),
+            fill_id="foreign-entry-fill",
+        )
+    store.append_fill(
+        f"foreign-{side.lower()}",
+        side,
+        0.2,
+        100.0,
+        0.02,
+        fill_at,
+        fill_id=f"foreign-{side.lower()}-fill",
+    )
+    reconciliation = PaperBroker(store).reconcile()
+    expected_equity = 99.98 if side == "BUY" else 99.96
+    assert reconciliation.fills == ()
+    assert reconciliation.equity == pytest.approx(expected_equity)
+    snapshot = store.replay_state()
+    cycle = next(
+        event
+        for event in snapshot.event_evidence
+        if event.event_type == "PAPER_CYCLE" and event.occurred_at_utc == END
+    )
+    raw_fill = next(
+        event
+        for event in snapshot.event_evidence
+        if event.event_id == f"foreign-{side.lower()}-fill"
+    )
+    assert raw_fill.sequence > cycle.sequence
+    if reopen:
+        store.close()
+    before = _ledger_file_image(path)
+
+    assert main(["paper-status", "--db", str(path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["normalized_equity"] == pytest.approx(expected_equity)
+    assert payload["equity_as_of_utc"] == fill_at.isoformat().replace("+00:00", "Z")
+    assert payload["equity_status"] == "STALE"
+    assert payload["equity_provenance"] == "LAST_FILL_BROKER_EQUITY"
+    assert _ledger_file_image(path) == before
+
+
+def test_paper_status_generic_fill_without_cycle_uses_raw_last_fill_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "generic-no-cycle.sqlite3"
+    fill_at = END
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: fill_at + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    store.append_fill(
+        "foreign-entry",
+        "BUY",
+        0.2,
+        100.0,
+        0.02,
+        fill_at,
+        fill_id="foreign-no-cycle-fill",
+    )
+    assert PaperBroker(store).reconcile().fills == ()
+    before = _ledger_file_image(path)
+
+    assert main(["paper-status", "--db", str(path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["normalized_equity"] == pytest.approx(99.98)
+    assert payload["equity_as_of_utc"] == fill_at.isoformat().replace("+00:00", "Z")
+    assert payload["equity_status"] == "STALE"
+    assert payload["equity_provenance"] == "LAST_FILL_BROKER_EQUITY"
+    assert _ledger_file_image(path) == before
+
+
+@pytest.mark.parametrize("latest_kind", ["generic", "paper"])
+def test_paper_status_mixed_fill_evidence_uses_newest_raw_fill_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    latest_kind: str,
+) -> None:
+    path = tmp_path / f"mixed-{latest_kind}.sqlite3"
+    fill_at = END + timedelta(hours=4)
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: fill_at + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    if latest_kind == "generic":
+        broker = PaperBroker(store, CostConfig(0.0, 0.0))
+        entry = broker.submit_entry(
+            END - timedelta(hours=16),
+            quantity=0.2,
+            reason="ENTRY_BREAKOUT",
+        )
+        broker.process_open(entry.order_id, END - timedelta(hours=12), open_price=100.0)
+        exit_order = broker.submit_exit(
+            END - timedelta(hours=12),
+            quantity=0.2,
+            owned_quantity=0.2,
+            reason="EXIT_SIGNAL",
+        )
+        assert broker.process_open(
+            exit_order.order_id,
+            END - timedelta(hours=8),
+            open_price=100.0,
+        ) is not None
+        _process_cycle(store, _history(END))
+        store.append_fill(
+            "foreign-entry",
+            "BUY",
+            0.2,
+            100.0,
+            0.02,
+            fill_at,
+            fill_id="foreign-latest-fill",
+        )
+        expected_equity = 99.98
+    else:
+        store.append_fill(
+            "foreign-entry",
+            "BUY",
+            0.2,
+            100.0,
+            0.0,
+            END - timedelta(hours=12),
+            fill_id="foreign-earlier-fill",
+        )
+        store.append_fill(
+            "foreign-exit",
+            "SELL",
+            0.2,
+            100.0,
+            0.0,
+            END - timedelta(hours=8),
+            fill_id="foreign-earlier-exit-fill",
+        )
+        _process_cycle(store, _history(END))
+        broker = PaperBroker(store, CostConfig(fee_rate=0.001, slippage_rate=0.002))
+        entry = broker.submit_entry(
+            END,
+            quantity=0.2,
+            reason="ENTRY_BREAKOUT",
+        )
+        assert broker.process_open(entry.order_id, fill_at, open_price=100.0) is not None
+        expected_equity = 99.97996
+    reconciliation = PaperBroker(store).reconcile()
+    assert reconciliation.equity == pytest.approx(expected_equity)
+    snapshot = store.replay_state()
+    cycle = next(
+        event
+        for event in snapshot.event_evidence
+        if event.event_type == "PAPER_CYCLE" and event.occurred_at_utc == END
+    )
+    latest_raw_fill = max(
+        (event for event in snapshot.event_evidence if event.event_type == "FILL"),
+        key=lambda event: event.sequence,
+    )
+    assert latest_raw_fill.sequence > cycle.sequence
+    assert latest_raw_fill.occurred_at_utc == fill_at
+    before = _ledger_file_image(path)
+
+    assert main(["paper-status", "--db", str(path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["normalized_equity"] == pytest.approx(expected_equity)
+    assert payload["equity_as_of_utc"] == fill_at.isoformat().replace("+00:00", "Z")
+    assert payload["equity_status"] == "STALE"
+    assert payload["equity_provenance"] == "LAST_FILL_BROKER_EQUITY"
+    assert _ledger_file_image(path) == before
+
+
 def test_paper_status_labels_latest_cycle_without_mark_as_stale_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
