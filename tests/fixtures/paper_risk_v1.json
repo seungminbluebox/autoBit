@@ -1,0 +1,106 @@
+[
+  {
+    "consecutive_losses": 0,
+    "daily_baseline_equity": 100.0,
+    "daily_date": "2026-01-01",
+    "daily_halt_started_at_utc": "2026-01-01T00:00:00Z",
+    "decision_exposure_cap": 0.0,
+    "decision_halted_until_utc": "2026-01-04T00:00:00Z",
+    "decision_reasons": [
+      "drawdown_halt",
+      "daily_loss_halt",
+      "weekly_loss_halt"
+    ],
+    "decision_risk_rate": 0.0,
+    "equity_history": [
+      {
+        "at_utc": "2026-01-01T00:00:00Z",
+        "equity": 84.0
+      }
+    ],
+    "equity_peak": 100.0,
+    "halt_entries": true,
+    "last_equity": 84.0,
+    "last_risk_at_utc": "2026-01-01T00:00:00Z",
+    "processed_trade_count": 0,
+    "profitable_trades_since_streak_halt": 0,
+    "recovery_started_at_utc": "2026-01-01T00:00:00Z",
+    "risk_started_at_utc": "2026-01-01T00:00:00Z",
+    "streak_halt_started_at_utc": null,
+    "version": 1,
+    "volatility_halted": false,
+    "volatility_stable_bars": 0,
+    "weekly_halt_started_at_utc": "2026-01-01T00:00:00Z"
+  },
+  {
+    "consecutive_losses": 0,
+    "daily_baseline_equity": 84.0,
+    "daily_date": "2026-01-04",
+    "daily_halt_started_at_utc": null,
+    "decision_exposure_cap": 0.0,
+    "decision_halted_until_utc": null,
+    "decision_reasons": [
+      "drawdown_halt",
+      "weekly_loss_reduced"
+    ],
+    "decision_risk_rate": 0.0,
+    "equity_history": [
+      {
+        "at_utc": "2026-01-01T00:00:00Z",
+        "equity": 84.0
+      },
+      {
+        "at_utc": "2026-01-04T00:00:00Z",
+        "equity": 84.0
+      }
+    ],
+    "equity_peak": 100.0,
+    "halt_entries": true,
+    "last_equity": 84.0,
+    "last_risk_at_utc": "2026-01-04T00:00:00Z",
+    "processed_trade_count": 0,
+    "profitable_trades_since_streak_halt": 0,
+    "recovery_started_at_utc": "2026-01-01T00:00:00Z",
+    "risk_started_at_utc": "2026-01-01T00:00:00Z",
+    "streak_halt_started_at_utc": null,
+    "version": 1,
+    "volatility_halted": false,
+    "volatility_stable_bars": 0,
+    "weekly_halt_started_at_utc": "2026-01-01T00:00:00Z"
+  },
+  {
+    "consecutive_losses": 0,
+    "daily_baseline_equity": 84.0,
+    "daily_date": "2026-01-11",
+    "daily_halt_started_at_utc": null,
+    "decision_exposure_cap": 0.0,
+    "decision_halted_until_utc": null,
+    "decision_reasons": [
+      "drawdown_halt"
+    ],
+    "decision_risk_rate": 0.0,
+    "equity_history": [
+      {
+        "at_utc": "2026-01-04T00:00:00Z",
+        "equity": 84.0
+      },
+      {
+        "at_utc": "2026-01-11T00:00:00Z",
+        "equity": 84.0
+      }
+    ],
+    "equity_peak": 100.0,
+    "halt_entries": true,
+    "last_equity": 84.0,
+    "last_risk_at_utc": "2026-01-11T00:00:00Z",
+    "processed_trade_count": 0,
+    "profitable_trades_since_streak_halt": 0,
+    "recovery_started_at_utc": "2026-01-01T00:00:00Z",
+    "risk_started_at_utc": "2026-01-01T00:00:00Z",
+    "streak_halt_started_at_utc": null,
+    "version": 1,
+    "volatility_halted": false,
+    "volatility_stable_bars": 0,
+    "weekly_halt_started_at_utc": null
+  }
+]

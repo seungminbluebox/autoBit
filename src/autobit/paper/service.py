@@ -49,7 +49,7 @@ from autobit.strategy.donchian_trend import (
 _FOUR_HOURS = timedelta(hours=4)
 _MATURITY_DELAY = timedelta(minutes=10)
 _DEFAULT_LEASE_TTL = timedelta(minutes=5)
-_RISK_STATE_VERSION = 1
+_RISK_STATE_VERSION = 2
 _CYCLE_ATTEMPT_VERSION = 1
 _UTC = timezone.utc
 _ALERT_SOURCE_TYPES = frozenset({"HEALTH_STATE", "PAPER_CYCLE"})
@@ -1361,7 +1361,11 @@ def _risk_state_from_payload(payload: Mapping[str, object]) -> _RiskState:
     if not payload:
         return _RiskState()
     expected = set(_risk_state_payload(_RiskState()))
-    if set(payload) != expected or payload.get("version") != _RISK_STATE_VERSION:
+    if (
+        set(payload) != expected
+        or type(payload.get("version")) is not int
+        or payload["version"] not in (1, _RISK_STATE_VERSION)
+    ):
         raise StoreCorruptionError("persisted breaker state has an invalid schema")
     try:
         daily_value = payload["daily_date"]
@@ -1564,7 +1568,12 @@ def _health_risk_followup_id(bar_at: datetime, health: _HealthGate) -> str:
 
 
 def _validate_health_and_risk_chain(snapshot: PaperSnapshot) -> _ValidatedRiskChain:
-    """Validate every breaker transition and its health evidence before mutation."""
+    """Validate stored risk provenance and health projections before mutation.
+
+    V1 omitted raw volatility and pre-transition inputs, so historical base
+    decisions cannot be fully recomputed. Preserve their strict evidence checks
+    without applying today's policy to immutable historical decisions.
+    """
     _health_gate_from_snapshot(snapshot)
     health_events: list[StoredEvent] = []
     latest_base = _RiskState()
@@ -1572,6 +1581,7 @@ def _validate_health_and_risk_chain(snapshot: PaperSnapshot) -> _ValidatedRiskCh
     latest_base_event: StoredEvent | None = None
     latest_risk_event: StoredEvent | None = None
     previous_event: StoredEvent | None = None
+    latest_risk_version = 1
 
     for event in snapshot.event_evidence:
         if event.event_type == "HEALTH_STATE":
@@ -1580,7 +1590,13 @@ def _validate_health_and_risk_chain(snapshot: PaperSnapshot) -> _ValidatedRiskCh
             previous_event = event
             continue
 
+        if not event.payload:
+            raise StoreCorruptionError("persisted breaker event has an empty schema")
         candidate = _risk_state_from_payload(event.payload)
+        version = event.payload["version"]
+        if version < latest_risk_version:
+            raise StoreCorruptionError("breaker policy version downgrade is invalid")
+        latest_risk_version = version
         if event.event_id.startswith("risk-health:"):
             if latest_base_event is None or latest_base.last_risk_at is None:
                 raise StoreCorruptionError("health risk followup lacks canonical base")
@@ -1635,7 +1651,10 @@ def _validate_health_and_risk_chain(snapshot: PaperSnapshot) -> _ValidatedRiskCh
     if latest_risk_event is None:
         if snapshot.breaker_state:
             raise StoreCorruptionError("breaker projection has no event evidence")
-    elif _risk_state_from_payload(snapshot.breaker_state) != projection:
+    elif (
+        _risk_state_from_payload(snapshot.breaker_state) != projection
+        or snapshot.breaker_state["version"] != latest_risk_version
+    ):
         raise StoreCorruptionError("breaker projection contradicts event evidence")
     return _ValidatedRiskChain(
         projection=projection,

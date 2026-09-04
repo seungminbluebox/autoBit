@@ -121,9 +121,6 @@ def evaluate_risk(
         if now_utc < recovery_expiry:
             reasons.append("drawdown_halt")
             halts.append(recovery_expiry)
-        elif drawdown_value >= _HARD_DRAWDOWN:
-            reasons.append("drawdown_halt")
-            halts.append(None)
         else:
             risk_rate, exposure_cap = _recovery_ladder(drawdown_value)
             if drawdown_value > 0.0:

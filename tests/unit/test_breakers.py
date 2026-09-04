@@ -104,14 +104,14 @@ def test_drawdown_recovery_does_not_release_before_exact_expiry() -> None:
     assert decision == RiskDecision(0.0, 0.0, NOW + timedelta(hours=72), ("drawdown_halt",))
 
 
-def test_drawdown_recovery_stays_halted_if_drawdown_remains_fifteen_percent() -> None:
+def test_drawdown_recovery_resumes_if_drawdown_remains_fifteen_percent() -> None:
     decision = _evaluate(
         now=NOW + timedelta(hours=73),
         drawdown=0.15,
         recovery_started_at=NOW,
     )
 
-    assert decision == RiskDecision(0.0, 0.0, None, ("drawdown_halt",))
+    assert decision == RiskDecision(0.0025, 0.15, None, ("recovery",))
 
 
 def test_daily_loss_halt_persists_for_24_hours_even_if_rolling_loss_clears() -> None:
@@ -289,7 +289,7 @@ def test_indefinite_volatility_halt_overrides_daily_timed_expiry() -> None:
     )
 
 
-def test_persistent_drawdown_halt_overrides_weekly_timed_expiry() -> None:
+def test_drawdown_recovery_preserves_weekly_timed_halt() -> None:
     decision = _evaluate(
         now=NOW + timedelta(hours=73),
         drawdown=0.15,
@@ -300,8 +300,8 @@ def test_persistent_drawdown_halt_overrides_weekly_timed_expiry() -> None:
     assert decision == RiskDecision(
         0.0,
         0.0,
-        None,
-        ("drawdown_halt", "weekly_loss_halt"),
+        NOW + timedelta(hours=121),
+        ("recovery", "weekly_loss_halt"),
     )
 
 
