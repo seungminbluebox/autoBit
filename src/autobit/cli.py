@@ -775,6 +775,14 @@ def _status_equity(
         raise StoreError("unsafe cycle contradicts a completed-close risk mark")
     if risk_event.sequence >= cycle.sequence:
         raise StoreError("completed-close risk mark is not prior to its terminal cycle")
+    reconciled_fill_ids = frozenset(fill.fill_id for fill in reconciliation.fills)
+    if any(
+        event.event_type == "FILL"
+        and event.event_id in reconciled_fill_ids
+        and event.sequence > cycle.sequence
+        for event in snapshot.event_evidence
+    ):
+        return fallback
 
     equity = chain.projection.last_equity
     cash = reconciliation.cash

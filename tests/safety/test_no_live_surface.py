@@ -1093,6 +1093,27 @@ def test_no_tracked_python_bytecode_remains() -> None:
     assert tracked_bytecode == ()
 
 
+def test_generated_pytest_basetemp_is_not_a_repository_source_surface() -> None:
+    labels = tuple(label for label, _ in _repository_source_surfaces())
+
+    assert not any(label.startswith("worktree:.test-tmp/") for label in labels)
+
+
+def test_worktree_surface_scan_still_includes_an_unignored_package_module() -> None:
+    probe = Path("src/autobit/_safety_surface_probe.py")
+    assert not probe.exists()
+    probe.write_text("import pyupbit\n", encoding="utf-8")
+    try:
+        surfaces = dict(_repository_source_surfaces())
+        label = f"worktree:{probe.as_posix()}"
+
+        assert label in surfaces
+        violations, _ = _surface_scan(label, surfaces[label])
+        assert f"{label}: forbidden import: pyupbit" in violations
+    finally:
+        probe.unlink()
+
+
 def test_repository_source_has_no_private_upbit_or_live_order_surface() -> None:
     violations: list[str] = []
     for label, source in _repository_source_surfaces():

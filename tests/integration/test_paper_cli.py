@@ -261,7 +261,7 @@ def test_paper_status_reports_flat_completed_close_mtm_provenance(
     assert _ledger_file_image(path) == before
 
 
-def test_paper_status_uses_active_wal_completed_close_mtm_after_no_fill_price_change(
+def test_paper_status_uses_active_wal_completed_close_mtm_when_fill_precedes_terminal_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -284,6 +284,17 @@ def test_paper_status_uses_active_wal_completed_close_mtm_after_no_fill_price_ch
     frame.iloc[-1, frame.columns.get_loc("close")] = 70.0
     _process_cycle(store, frame)
     assert broker.reconcile().equity == 100.0
+    snapshot = store.replay_state()
+    latest_cycle = next(
+        event
+        for event in snapshot.event_evidence
+        if event.event_type == "PAPER_CYCLE" and event.occurred_at_utc == END
+    )
+    latest_fill = max(
+        (event for event in snapshot.event_evidence if event.event_type == "FILL"),
+        key=lambda event: event.sequence,
+    )
+    assert latest_fill.sequence < latest_cycle.sequence
 
     before = _ledger_file_image(path)
     assert main(["paper-status", "--db", str(path)]) == 0
@@ -295,6 +306,119 @@ def test_paper_status_uses_active_wal_completed_close_mtm_after_no_fill_price_ch
     assert payload["equity_as_of_utc"] == END.isoformat().replace("+00:00", "Z")
     assert payload["equity_status"] == "CURRENT"
     assert payload["equity_provenance"] == "COMPLETED_CLOSE_MTM"
+    assert _ledger_file_image(path) == before
+
+
+@pytest.mark.parametrize("reopen", [False, True], ids=["active-wal", "reopened"])
+def test_paper_status_buy_crash_window_later_fill_sequence_forces_last_fill_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reopen: bool,
+) -> None:
+    """The durable post-cycle BUY is the state left by a pre-risk/cycle crash."""
+    path = tmp_path / "paper.sqlite3"
+    fill_at = END + timedelta(hours=4)
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: fill_at + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    _process_cycle(store, _history(END))
+    broker = PaperBroker(store, CostConfig(fee_rate=0.001, slippage_rate=0.002))
+    entry = broker.submit_entry(END, quantity=0.2, reason="ENTRY_BREAKOUT")
+    fill = broker.process_open(entry.order_id, fill_at, open_price=100.0)
+    assert fill is not None
+    reconciliation = broker.reconcile()
+    assert reconciliation.position_state.value == "LONG"
+    assert reconciliation.total_fees > 0.0
+    assert reconciliation.equity == pytest.approx(99.97996)
+    snapshot = store.replay_state()
+    cycle = next(
+        event
+        for event in snapshot.event_evidence
+        if event.event_type == "PAPER_CYCLE" and event.occurred_at_utc == END
+    )
+    fill_event = next(
+        event
+        for event in snapshot.event_evidence
+        if event.event_type == "FILL" and event.payload["order_id"] == entry.order_id
+    )
+    assert fill_event.sequence > cycle.sequence
+    if reopen:
+        store.close()
+    before = _ledger_file_image(path)
+
+    assert main(["paper-status", "--db", str(path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["position_state"] == "LONG"
+    assert payload["normalized_equity"] == pytest.approx(99.97996)
+    assert payload["normalized_equity"] == pytest.approx(reconciliation.equity)
+    assert payload["equity_as_of_utc"] == fill_at.isoformat().replace("+00:00", "Z")
+    assert payload["equity_status"] == "STALE"
+    assert payload["equity_provenance"] == "LAST_FILL_BROKER_EQUITY"
+    assert _ledger_file_image(path) == before
+
+
+@pytest.mark.parametrize("reopen", [False, True], ids=["active-wal", "reopened"])
+def test_paper_status_sell_crash_window_later_fill_sequence_forces_last_fill_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reopen: bool,
+) -> None:
+    """The durable post-cycle SELL is the state left by a pre-risk/cycle crash."""
+    path = tmp_path / "paper.sqlite3"
+    fill_at = END + timedelta(hours=4)
+    monkeypatch.setattr("autobit.cli._utc_now", lambda: fill_at + timedelta(minutes=10))
+    store = SQLiteStore(path)
+    store.initialize()
+    prior_broker = PaperBroker(store, CostConfig(0.0, 0.0))
+    entry = prior_broker.submit_entry(
+        END - timedelta(hours=8),
+        quantity=0.2,
+        reason="ENTRY_BREAKOUT",
+    )
+    prior_broker.process_open(entry.order_id, END - timedelta(hours=4), open_price=100.0)
+    _process_cycle(store, _history(END))
+    broker = PaperBroker(store, CostConfig(fee_rate=0.001, slippage_rate=0.002))
+    owned = broker.reconcile().btc_quantity
+    exit_order = broker.submit_exit(
+        END,
+        quantity=owned,
+        owned_quantity=owned,
+        reason="EXIT_SIGNAL",
+    )
+    fill = broker.process_open(exit_order.order_id, fill_at, open_price=100.0)
+    assert fill is not None
+    reconciliation = broker.reconcile()
+    assert reconciliation.position_state.value == "FLAT"
+    assert reconciliation.total_fees > 0.0
+    assert reconciliation.equity == pytest.approx(99.94004)
+    snapshot = store.replay_state()
+    cycle = next(
+        event
+        for event in snapshot.event_evidence
+        if event.event_type == "PAPER_CYCLE" and event.occurred_at_utc == END
+    )
+    fill_event = next(
+        event
+        for event in snapshot.event_evidence
+        if event.event_type == "FILL" and event.payload["order_id"] == exit_order.order_id
+    )
+    assert fill_event.sequence > cycle.sequence
+    if reopen:
+        store.close()
+    before = _ledger_file_image(path)
+
+    assert main(["paper-status", "--db", str(path)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["position_state"] == "FLAT"
+    assert payload["normalized_equity"] == pytest.approx(99.94004)
+    assert payload["normalized_equity"] == pytest.approx(reconciliation.equity)
+    assert payload["equity_as_of_utc"] == fill_at.isoformat().replace("+00:00", "Z")
+    assert payload["equity_status"] == "STALE"
+    assert payload["equity_provenance"] == "LAST_FILL_BROKER_EQUITY"
     assert _ledger_file_image(path) == before
 
 

@@ -1,5 +1,6 @@
 .env
 .worktrees/
+.test-tmp/
 .venv/
 data/raw/
 data/processed/
