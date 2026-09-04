@@ -220,7 +220,17 @@ the nested `src/autobit/.test-tmp/_task8_probe.py` is not ignored.
 The historical selector is corrected to
 `-k "later_fill_sequence or fill_precedes_terminal_cycle"`, matching the
 committed paper BUY/SELL crash tests and the completed-current positive
-control.
+control. A fresh execution selected exactly five nodes and passed:
+
+```
+.venv\\Scripts\\python.exe -m pytest tests/integration/test_paper_cli.py -k
+'later_fill_sequence or fill_precedes_terminal_cycle' --basetemp
+C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-selector-5662e05098e14f55902039cd14bd584d\\basetemp
+-p no:cacheprovider
+```
+
+Result: `5 passed, 49 deselected in 4.44s`; durable output is
+`C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-selector-5662e05098e14f55902039cd14bd584d\\selector.log`.
 
 Fresh amendment-covering suite:
 
