@@ -44,6 +44,8 @@ class LivePosition:
     realized_pnl: Decimal = Decimal(0)
     pending_stop: float | None = None
     pending_stop_at: datetime | None = None
+    completed_bar_at: datetime | None = None
+    completed_bar_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +114,8 @@ def _position(value):
         data[name] = Decimal(data[name])
     for name in ('entry_at','pending_stop_at'):
         data[name] = datetime.fromisoformat(data[name]) if data[name] else None
+    if data.get('completed_bar_at') is not None:
+        data['completed_bar_at'] = datetime.fromisoformat(data['completed_bar_at'])
     return LivePosition(**data)
 
 
@@ -198,6 +202,12 @@ def _state(value):
                 or (position.pending_stop is not None and (not math.isfinite(position.pending_stop)
                     or position.pending_stop < position.current_stop or position.pending_stop_at.tzinfo is None))):
             raise LiveJournalError('Invalid position facts')
+        if ((position.completed_bar_at is None) != (position.completed_bar_fingerprint is None)
+                or (position.completed_bar_at is not None and
+                    (position.completed_bar_at.tzinfo is None or position.completed_bar_at.utcoffset() is None
+                     or not isinstance(position.completed_bar_fingerprint,str)
+                     or not re.fullmatch(r'[0-9a-f]{64}',position.completed_bar_fingerprint)))):
+            raise LiveJournalError('Invalid position candle provenance')
     return state
 
 

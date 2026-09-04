@@ -59,7 +59,7 @@ class Venue:
                 bid_account=self.accounts()[0],ask_account=self.accounts()[1]))
         if request.method == 'POST':
             data=json.loads(request.content)
-            value=order(data['identifier'],data['side'],price=data.get('price'),volume=data.get('volume'),remaining_volume=data.get('volume'),created_at=self.now.isoformat())
+            value=order(data['identifier'],data['side'],price=data.get('price'),volume=data.get('volume'),remaining_volume=data.get('volume'),created_at=self.now.replace(microsecond=0).isoformat())
             self.orders[data['identifier']]=value
             if self.timeout:
                 raise httpx.ReadTimeout('offline',request=request)
@@ -428,4 +428,139 @@ def test_invalid_current_price_persists_health_and_valid_price_records_actual_hi
     service.on_price(float('nan'))
     assert not service.journal.state().health['schema_valid']
     assert len(venue.posts)==1
+    service.close()
+
+
+def test_second_resolution_order_time_accepts_fractional_intent_and_preserves_fill_time(monkeypatch,tmp_path):
+    venue=Venue(); venue.now=NOW+timedelta(microseconds=500000)
+    service=make(monkeypatch,tmp_path,venue)
+    service.process_completed_candle(*facts())
+    identifier=json.loads(venue.posts[0].content)['identifier']
+    assert service.journal.pending()[0].created_at==NOW+timedelta(microseconds=500000)
+    # Upbit order creation is second-resolution and may use its +09:00 offset.
+    venue.orders[identifier]['created_at']='2026-09-05T09:00:00+09:00'
+    service.reconcile()
+    assert service.journal.state().health['schema_valid']
+    venue.fill(identifier)
+    venue.orders[identifier]['trades'][0]['created_at']='2026-09-05T09:00:00.750000+09:00'
+    service.reconcile()
+    position=service.journal.state().position
+    assert position.quantity==Decimal('.001') and position.current_stop==9750000
+    assert position.entry_at==NOW+timedelta(microseconds=750000)
+    assert not service.journal.pending() and len(venue.posts)==1
+    service.close()
+
+
+def test_second_resolution_order_time_still_rejects_the_previous_second(monkeypatch,tmp_path):
+    venue=Venue(); venue.now=NOW+timedelta(microseconds=500000)
+    service=make(monkeypatch,tmp_path,venue)
+    service.process_completed_candle(*facts())
+    identifier=json.loads(venue.posts[0].content)['identifier']
+    venue.orders[identifier]['created_at']='2026-09-05T08:59:59+09:00'
+    service.reconcile()
+    assert not service.journal.state().health['schema_valid']
+    assert len(service.journal.pending())==1
+    service.close()
+
+
+def test_pending_partial_keeps_bar_facts_across_restart_and_real_trailing_recovery(monkeypatch,tmp_path):
+    venue=Venue(); service=make(monkeypatch,tmp_path,venue)
+    service.process_completed_candle(*facts())
+    identifier=json.loads(venue.posts[0].content)['identifier']
+    venue.fill(identifier,quantity='.0006',fee='3',terminal=False)
+    original=Venue.__call__
+    def uncertain_cancel(self,request):
+        if request.method=='DELETE':
+            return httpx.Response(200,json=self.orders[request.url.params['identifier']])
+        return original(self,request)
+    monkeypatch.setattr(Venue,'__call__',uncertain_cancel)
+    service.reconcile()
+    frozen_risk=service.journal.state().risk
+    frozen_cursor=service.journal.state().completed_at
+    service.clock=lambda:NOW+timedelta(hours=4,minutes=1)
+    entry_bar=facts(NOW+timedelta(hours=4))
+    service.process_completed_candle(*entry_bar)
+    service.clock=lambda:NOW+timedelta(hours=8,minutes=1)
+    high_snapshot,high_observation=facts(NOW+timedelta(hours=8))
+    high_snapshot=replace(high_snapshot,row={**high_snapshot.row,'high':11_000_000})
+    service.process_completed_candle(high_snapshot,high_observation)
+    saved=service.journal.state()
+    assert saved.position.high_water==11000000 and saved.position.held_bars==2
+    assert saved.position.completed_bar_at==NOW+timedelta(hours=4)
+    assert saved.position.completed_bar_fingerprint
+    assert saved.risk==frozen_risk and saved.completed_at==frozen_cursor
+    assert len(service.journal.pending())==1
+    service.close()
+    service=make(monkeypatch,tmp_path,venue)
+    service.clock=lambda:NOW+timedelta(hours=8,minutes=2)
+    # Older bars cannot move age/protection backward or apply the later high to
+    # an earlier policy bar. Changed same-bar OHLC cannot replace saved facts.
+    service.process_completed_candle(*entry_bar)
+    assert not service.journal.state().health['timestamps_monotonic']
+    changed=replace(high_snapshot,row={**high_snapshot.row,'high':12_000_000})
+    service.process_completed_candle(changed,high_observation)
+    assert not service.journal.state().health['schema_valid']
+    assert service.journal.state().position==saved.position
+    service.process_completed_candle(high_snapshot,high_observation)
+    assert service.journal.state().position==saved.position
+    assert service.journal.state().risk==frozen_risk
+    assert service.journal.state().completed_at==frozen_cursor
+
+    venue.orders[identifier]['state']='cancel'
+    for minute in (3,4,5):
+        service.clock=lambda m=minute:NOW+timedelta(hours=8,minutes=m)
+        service.reconcile()
+    assert not service.journal.pending()
+    service.clock=lambda:NOW+timedelta(hours=12,minutes=1)
+    later,cutoff=facts(NOW+timedelta(hours=12),close=10_800_000)
+    later=replace(later,row={**later.row,'open':10_800_000,'high':10_900_000,'low':10_700_000})
+    decision=service.process_completed_candle(later,cutoff)
+    # Real shared policy: entry 10m, R=.25m, high 11m, ATR .1m;
+    # +2R is attained and high-3*ATR is 10.7m, above entry/old stop.
+    assert decision.action=='hold' and decision.next_stop==10700000
+    recovered=service.journal.state()
+    assert recovered.position.high_water==11000000
+    assert recovered.position.pending_stop==10700000
+    assert recovered.position.current_stop==9750000
+    assert recovered.position.completed_bar_at==NOW+timedelta(hours=8)
+    assert recovered.risk.last_risk_at==NOW+timedelta(hours=12)
+    assert len(venue.posts)==1
+    service.close()
+
+
+@pytest.mark.parametrize('changes', [
+    {'completed_bar_at': '2026-09-05T00:00:00', 'completed_bar_fingerprint': 'a'*64},
+    {'completed_bar_at': '2026-09-05T00:00:00+00:00', 'completed_bar_fingerprint': None},
+    {'completed_bar_at': '2026-09-05T00:00:00+00:00', 'completed_bar_fingerprint': 'invalid'},
+])
+def test_restart_rejects_invalid_independent_position_candle_provenance(monkeypatch,tmp_path,changes):
+    venue=Venue(); service=make(monkeypatch,tmp_path,venue)
+    service.process_completed_candle(*facts())
+    venue.fill(json.loads(venue.posts[0].content)['identifier'])
+    service.reconcile(); service.close()
+    with sqlite3.connect(tmp_path/'live.sqlite') as db:
+        payload=json.loads(db.execute('SELECT payload FROM live_state').fetchone()[0])
+        payload['position'].update(changes)
+        db.execute('UPDATE live_state SET payload=?',(json.dumps(payload),))
+    *_,j,s=modules()
+    with pytest.raises(j.LiveJournalError):
+        make(monkeypatch,tmp_path,venue)
+
+
+def test_older_position_payload_defaults_missing_candle_provenance_without_reset(monkeypatch,tmp_path):
+    venue=Venue(); service=make(monkeypatch,tmp_path,venue)
+    service.process_completed_candle(*facts())
+    venue.fill(json.loads(venue.posts[0].content)['identifier'])
+    service.reconcile()
+    saved=service.journal.state()
+    service.close()
+    with sqlite3.connect(tmp_path/'live.sqlite') as db:
+        payload=json.loads(db.execute('SELECT payload FROM live_state').fetchone()[0])
+        del payload['position']['completed_bar_at']
+        del payload['position']['completed_bar_fingerprint']
+        db.execute('UPDATE live_state SET payload=?',(json.dumps(payload),))
+    service=make(monkeypatch,tmp_path,venue)
+    assert service.journal.state()==saved
+    assert service.journal.state().position.completed_bar_at is None
+    assert service.journal.state().position.completed_bar_fingerprint is None
     service.close()

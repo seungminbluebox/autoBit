@@ -117,7 +117,10 @@ class LiveService:
         if state is None:
             raise LiveJournalError('Intent has no live state')
         if (actual.side != intent.side or actual.identifier != intent.identifier
-                or actual.created_at < intent.created_at or actual.created_at > at
+                # Venue order creation is documented to whole seconds; its
+                # represented interval may include a fractional local intent.
+                # Trade timestamps remain exact and are never rounded here.
+                or actual.created_at < intent.created_at.replace(microsecond=0) or actual.created_at > at
                 or (intent.venue_uuid and actual.uuid != intent.venue_uuid)
                 or actual.executed_funds is None or actual.executed_volume < intent.quantity
                 or actual.executed_funds < intent.funds or actual.paid_fee < intent.fee
@@ -241,6 +244,19 @@ class LiveService:
         if not valid or not monotonic:
             risk = apply_health_recovery(state.risk.decision,system_healthy=False,resume_reduced=False)
             return self.engine.decide(DecisionInput(row,float(state.cash),state.risk.last_equity,_context(state.position),bool(self.journal.pending()),risk))
+        if state.position and state.position.completed_bar_at is not None:
+            older = bar_at < state.position.completed_bar_at
+            changed = (bar_at == state.position.completed_bar_at
+                       and fingerprint != state.position.completed_bar_fingerprint)
+            if older or changed:
+                if older:
+                    health.record_timestamp_check(False,at)
+                if changed:
+                    health.record_schema_check(False,at)
+                self._persist_health(health)
+                overlay = apply_health_recovery(state.risk.decision,system_healthy=False,resume_reduced=False)
+                return self.engine.decide(DecisionInput(row,float(state.cash),state.risk.last_equity,
+                                          _context(state.position),True,overlay))
         position = self._activate(state.position,end)
         if position:
             age = max(0,int(end.timestamp()//14400-position.entry_at.timestamp()//14400))
@@ -248,7 +264,14 @@ class LiveService:
             # only its post-entry close is evidence of an attained price.
             if position.entry_at > bar_at:
                 row = {**row,'high':max(position.high_water,float(row['close']))}
-            position = replace(position,held_bars=age,high_water=max(position.high_water,float(row['high'])))
+            position = replace(position,held_bars=max(position.held_bars,age),
+                               high_water=max(position.high_water,float(row['high'])),
+                               completed_bar_at=bar_at,completed_bar_fingerprint=fingerprint)
+            # Completed position facts/protection progress are independently
+            # durable even while an uncertain exit freezes canonical risk.
+            # The separate provenance prevents replay against an older bar.
+            state = replace(state,position=position)
+            self.journal.save(state)
         equity = float(state.cash+(position.quantity if position else Decimal(0))*Decimal(str(row['close'])))
         if balances:
             equity = float(balances[0].balance+balances[0].locked+(balances[1].balance+balances[1].locked)*Decimal(str(row['close'])))
