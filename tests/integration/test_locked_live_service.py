@@ -485,7 +485,7 @@ def test_pending_partial_keeps_bar_facts_across_restart_and_real_trailing_recove
     high_snapshot=replace(high_snapshot,row={**high_snapshot.row,'high':11_000_000})
     service.process_completed_candle(high_snapshot,high_observation)
     saved=service.journal.state()
-    assert saved.position.high_water==11000000 and saved.position.held_bars==2
+    assert saved.position.high_water==11000000 and saved.position.held_bars==1
     assert saved.position.completed_bar_at==NOW+timedelta(hours=4)
     assert saved.position.completed_bar_fingerprint
     assert saved.risk==frozen_risk and saved.completed_at==frozen_cursor

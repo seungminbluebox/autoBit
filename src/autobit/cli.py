@@ -95,7 +95,10 @@ class _StatusEquity:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="autobit", description="KRW-BTC research tools")
+    parser = argparse.ArgumentParser(
+        prog="autobit", description="KRW-BTC research tools",
+        epilog="Live trading is locked; paper and backtest remain available. No activation switch is provided.",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     download = commands.add_parser("data-download", help="Download public candles")

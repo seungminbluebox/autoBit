@@ -12,6 +12,7 @@
 
 - `DecisionInput.row['timestamp']`는 기존 공개 데이터와 같은 **UTC 4시간봉 시작 시각**이다. UTC-aware, 0/4/8/12/16/20시 정각이어야 한다. OHLC는 양의 유한 숫자이고 고저 관계가 맞아야 한다.
 - 봉 끝은 시작+4시간이다. `봉 끝 <= RiskObservation.now <= clock()`을 요구한다. 위험 관측 cutoff와 봉 라벨, 실제 체결 시각은 서로 다른 사실이다. 체결 시각을 봉에 맞춰 재작성하지 않는다.
+- 보유 봉수는 진입 봉0을 기준으로 완료 봉의 시작 bucket에서 실제 체결이 속한 봉 bucket을 뺀다. 봉 끝/cutoff 때문에1을 추가하지 않는다. 포지션 관측 provenance와 보유 봉수의 단조성은 유지한다.
 - `HealthMonitor`의 기존 10분 지연 판정과 API 연속 성공, 스키마, 시각, 미확정 주문, 원장 일치, 체결 편차 조건을 함께 적용한다. 건강 상태는 실전 원장에 저장한다. paper 원장이나 monitor의 paper persistence 메서드를 사용하지 않는다.
 - caller가 넘긴 모의 cash/equity/position/closed_trades는 실전 사실이 아니다. 서비스는 조회된 KRW/BTC 잔고와 실제 체결 원장의 포지션/거래를 사용한다. 최초 equity 및 일간·주간·최고자산 기준을 동일한 실제 KRW 기준으로 초기화한다.
 - 숫자 `100` 자체는 금지하지 않는다. 실제 100 KRW는 유효한 잔고지만 거래소 최소 주문액 때문에 주문할 수 없을 수 있다. `normalized100` 또는 paper 원장 provenance는 거부한다.

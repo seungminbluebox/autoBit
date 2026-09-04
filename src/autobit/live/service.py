@@ -259,7 +259,10 @@ class LiveService:
                                           _context(state.position),True,overlay))
         position = self._activate(state.position,end)
         if position:
-            age = max(0,int(end.timestamp()//14400-position.entry_at.timestamp()//14400))
+            # Shared holding age labels the entry candle zero. Completion is
+            # a separate cutoff, not an extra held bar; actual fill time stays
+            # unchanged even when the venue fills partway through that candle.
+            age = max(0,int(bar_at.timestamp()//14400-position.entry_at.timestamp()//14400))
             # Candle extremes have no intra-bar timestamps. In the entry bar,
             # only its post-entry close is evidence of an attained price.
             if position.entry_at > bar_at:
