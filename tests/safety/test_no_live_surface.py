@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import re
 import subprocess
 import sys
@@ -172,6 +173,33 @@ _HTTPX_NETWORK_ATTRIBUTES = frozenset(
     (*_HTTP_METHOD_NAMES, "request", "stream", "Client", "AsyncClient", "Request")
 )
 _PROCESS_EXECUTION_REFERENCES = frozenset({"os.popen", "os.system"})
+
+# Exact reviewed ASTs, not a live-directory exemption. Changes to any of these
+# modules fail closed until a new code/security review updates the fingerprint.
+# Runtime tests separately prove the fixed guard precedes credentials, private
+# request creation and journal mutation; fingerprints do not prove safety alone.
+_AUDITED_LIVE_AST = {
+    'src/autobit/live/__init__.py': '5b059888223aaecda805e67e81a4cb26bd1c975b827d76624dbcf6f74a71c5e4',
+    'src/autobit/live/guard.py': '5fc5efbe8896d18e2cbafee8f45cf517096591af38d708058806c18a6fbab238',
+    'src/autobit/live/client.py': '701ba171ea856be962e426b104a25ff247699e876bb9983817d8a2464931f98c',
+    'src/autobit/live/journal.py': '65bcc395edf375675cb4bc66e645991b640bc93e7c94b49270338dbc63cc9d96',
+    'src/autobit/live/service.py': '8f261366ae13263e9a3a1bc8b481606e1dfc14437574864d0ec519335a220c50',
+}
+_LIVE_API_URLS = tuple('https://api.upbit.com' + path for path in (
+    '/v1/accounts', '/v1/order', '/v1/orders', '/v1/orders/chance',
+))
+
+
+def _audited_live_scan(label: str, source: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    path = _surface_path(label)
+    try:
+        tree = ast.parse(source, filename=label)
+    except SyntaxError:
+        return (f'{label}: invalid audited live source',), ()
+    fingerprint = hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
+    if fingerprint != _AUDITED_LIVE_AST[path]:
+        return (f'{label}: unaudited change to locked live boundary',), ()
+    return (), _LIVE_API_URLS if path == 'src/autobit/live/client.py' else ()
 
 
 def _git_paths(*arguments: str) -> tuple[Path, ...]:
@@ -727,6 +755,12 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
         f"{label}: {item}"
         for item in (*import_violations, *_httpx_import_form_violations(tree, path))
     ]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            module = getattr(node, 'module', '') or ''
+            targets = [module, *(item.name for item in node.names)]
+            if any('live' in target.split('.') for target in targets):
+                violations.append(f'{label}: non-live code cannot import live boundary')
     for target in sorted(set(aliases.values()) & _PROCESS_EXECUTION_REFERENCES):
         violations.append(
             f"{label}: process execution import is forbidden: {target}"
@@ -1029,6 +1063,8 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
 
     for atom in atoms:
         lowered = atom.lower()
+        if 'autobit.live' in lowered or lowered == 'live':
+            violations.append(f'{label}: non-live code cannot reference live boundary')
         for token in (*_FORBIDDEN_SOURCE_TOKENS, *_LEGACY_IMPORT_TOKENS):
             if token.lower() in lowered:
                 violations.append(f"{label}: forbidden token: {token}")
@@ -1037,6 +1073,8 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
 
 
 def _surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if _surface_path(label) in _AUDITED_LIVE_AST:
+        return _audited_live_scan(label, source)
     if label.lower().endswith(".py"):
         return _python_surface_scan(label, source)
     lowered = source.lower()
@@ -1160,7 +1198,7 @@ def test_worktree_surface_scan_still_includes_an_unignored_package_module() -> N
         probe.unlink()
 
 
-def test_repository_source_has_no_private_upbit_or_live_order_surface() -> None:
+def test_repository_source_has_only_the_audited_locked_live_surface() -> None:
     violations: list[str] = []
     for label, source in _repository_source_surfaces():
         surface_violations, _ = _surface_scan(label, source)
@@ -1169,13 +1207,13 @@ def test_repository_source_has_no_private_upbit_or_live_order_surface() -> None:
     assert violations == []
 
 
-def test_network_api_urls_are_only_public_candles_and_optional_telegram() -> None:
+def test_network_api_urls_are_public_or_exact_audited_locked_live_contracts() -> None:
     discovered: list[tuple[str, str]] = []
     for label, source in _repository_source_surfaces():
         _, urls = _surface_scan(label, source)
         discovered.extend((label, url) for url in urls)
 
-    assert sorted(discovered) == [
+    expected = [
         (
             "index:src/autobit/alerts/notifier.py",
             _TELEGRAM_URL_TEMPLATE,
@@ -1193,6 +1231,12 @@ def test_network_api_urls_are_only_public_candles_and_optional_telegram() -> Non
             "https://api.upbit.com/v1/candles/minutes/240",
         ),
     ]
+    # During staged development the new boundary may exist only in worktree;
+    # each actually present indexed/worktree client must contribute exact URLs.
+    for label, _ in _repository_source_surfaces():
+        if _surface_path(label) == 'src/autobit/live/client.py':
+            expected.extend((label, url) for url in _LIVE_API_URLS)
+    assert sorted(discovered) == sorted(expected)
 
 
 def test_package_exposes_only_one_safe_console_script_and_dependency_set() -> None:
@@ -1431,7 +1475,7 @@ def test_scanner_rejects_private_constant_and_dynamic_bypasses(
     )
 
     with pytest.raises(AssertionError):
-        test_repository_source_has_no_private_upbit_or_live_order_surface()
+        test_repository_source_has_only_the_audited_locked_live_surface()
 
 
 @pytest.mark.parametrize(
@@ -1473,7 +1517,7 @@ def test_scanner_rejects_httpx_callable_capture_in_every_approved_context(
     )
 
     with pytest.raises(AssertionError):
-        test_repository_source_has_no_private_upbit_or_live_order_surface()
+        test_repository_source_has_only_the_audited_locked_live_surface()
 
 
 @pytest.mark.parametrize(
@@ -1506,7 +1550,7 @@ def test_scanner_rejects_chained_get_in_cli_wiring(
     )
 
     with pytest.raises(AssertionError):
-        test_repository_source_has_no_private_upbit_or_live_order_surface()
+        test_repository_source_has_only_the_audited_locked_live_surface()
 
 
 @pytest.mark.parametrize(
@@ -1543,7 +1587,7 @@ def test_scanner_rejects_captured_client_methods_and_benign_name_collision(
     )
 
     with pytest.raises(AssertionError):
-        test_repository_source_has_no_private_upbit_or_live_order_surface()
+        test_repository_source_has_only_the_audited_locked_live_surface()
 
 
 def test_scanner_allows_real_cli_fills_dictionary_get(
@@ -1559,7 +1603,7 @@ def test_scanner_allows_real_cli_fills_dictionary_get(
         lambda: (("worktree:src/autobit/cli.py", source),),
     )
 
-    test_repository_source_has_no_private_upbit_or_live_order_surface()
+    test_repository_source_has_only_the_audited_locked_live_surface()
 
 
 @pytest.mark.parametrize(
@@ -1604,7 +1648,7 @@ def test_scanner_rejects_raw_network_and_process_escape_hatches(
     )
 
     with pytest.raises(AssertionError):
-        test_repository_source_has_no_private_upbit_or_live_order_surface()
+        test_repository_source_has_only_the_audited_locked_live_surface()
 
 
 @pytest.mark.parametrize(
@@ -1635,4 +1679,4 @@ def test_scanner_allows_only_exact_network_controls(
         lambda: ((label, source),),
     )
 
-    test_repository_source_has_no_private_upbit_or_live_order_surface()
+    test_repository_source_has_only_the_audited_locked_live_surface()
