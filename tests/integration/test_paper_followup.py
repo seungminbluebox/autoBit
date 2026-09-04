@@ -274,6 +274,43 @@ def test_legacy_pending_history_api_failure_survives_return_and_reopen(tmp_path)
     assert PaperBroker(store).reconcile().fills == ()
     store.close()
 
+    store = SQLiteStore(path)
+    store.initialize()
+    clock.value += timedelta(hours=4)
+    with pytest.raises(RuntimeError, match="legacy signal public outage"):
+        _PaperApplication(
+            source=Source(), store=store, clock=clock, sleeper=_Sleeper(clock),
+            notifier=None, costs=CostConfig(0, 0), lease_owner="legacy-history-api",
+            lease_token="legacy-history-api-retry",
+        ).run_once()
+    repeated = HealthMonitor.from_store(store).snapshot()
+    health_events = [
+        event for event in store.replay_state().event_evidence
+        if event.event_type == "HEALTH_STATE"
+    ]
+    failures = [event for event in health_events if event.payload["api_failures"] == 1]
+    assert repeated.api_failures == 1
+    assert repeated.last_failure_at_utc > health.last_failure_at_utc
+    assert [event.payload["api_successes"] for event in health_events] == [1, 0, 1, 0]
+    assert [event.payload["api_failures"] for event in health_events] == [0, 1, 0, 1]
+    assert len(failures) == 2
+    assert failures[-1].payload["last_failure_at_utc"] > failures[-2].payload["last_failure_at_utc"]
+    assert failures[-1].sequence > failures[-2].sequence
+    assert PaperBroker(store).reconcile().active_orders == (order,)
+    assert PaperBroker(store).reconcile().fills == ()
+    assert PaperBroker(store).order(order.order_id).execution_context is None
+    store.close()
+
+    store = SQLiteStore(path)
+    store.initialize()
+    reopened_again = HealthMonitor.from_store(store).snapshot()
+    assert reopened_again.api_failures == 1
+    assert reopened_again.last_failure_at_utc == repeated.last_failure_at_utc
+    assert PaperBroker(store).reconcile().active_orders == (order,)
+    assert PaperBroker(store).reconcile().fills == ()
+    assert PaperBroker(store).order(order.order_id).execution_context is None
+    store.close()
+
 
 def test_legacy_pending_history_schema_failure_halts_durably(tmp_path):
     """Malformed original-signal evidence must remain HALTED after the failed fill."""
