@@ -18,7 +18,7 @@
 - KRW-BTC spot only; completed UTC 4-hour bars; existing strategy/cost/sizing numbers are unchanged except the specified drawdown recovery repair.
 - Initial stop is actual entry fill minus 2.5 entry ATR. Trailing activates at +2R and takes effect next bar. Stagnant 60 bars without +1R; maximum 1095 bars.
 - Risk policy v2 resumes after 72 hours at drawdown >=15% with risk 0.0025 and exposure 0.15, subject to every other independent gate. Preserve the original equity peak and episode start.
-- Old v1 risk events validate under historical semantics; new events use v2. Reject corrupt history and version downgrade; do not rewrite the ledger.
+- Old v1 risk events retain existing strict schema/envelope/chronology/health-projection validation; missing raw inputs prevent full historical canonical recomputation. New events use v2; reject detectable corruption and version downgrade without rewriting history or inventing inputs.
 - Shared decisions do not imply identical fills, returns, hot reload, or completed seven-year performance validation.
 - The production live gate always denies before credentials/signing/private I/O. No CLI/env/test-unlock switch ships; tests may monkeypatch the gate and use MockTransport only.
 - One implementation worker at a time. Each task uses RED→GREEN, commits, retained evidence, and a separate task review. Controller writes docs/coordination, not production/test fixes.
@@ -26,7 +26,7 @@
 
 ## File and responsibility map
 
-- `risk/breakers.py`: authoritative current restrictions; `risk/legacy_v1.py`: read-only historical evaluation.
+- `risk/breakers.py`: authoritative current restrictions; paper replay retains version-aware historical validation without an unused duplicate evaluator.
 - `core/models.py`: immutable decision inputs/outputs; `core/risk_state.py`: normalized risk state/observations and reducer; `core/engine.py`: common trading policy.
 - `backtest/engine.py`, `paper/service.py`: adapters invoking core; existing broker/store/health mechanics stay mode-specific.
 - `live/guard.py`: fixed release lock; `live/client.py`: isolated authenticated HTTP contract; `live/journal.py`: durable real-order state; `live/service.py`: real execution/reconciliation adapter invoking core.
@@ -35,9 +35,9 @@
 
 ### Task 1: Repair drawdown recovery and version historical replay
 
-**Files:** Modify `src/autobit/risk/breakers.py`, `src/autobit/paper/service.py`, affected strict payload validation in `src/autobit/persistence/`; create `src/autobit/risk/legacy_v1.py`; tests in `tests/unit/test_drawdown_recovery_v2.py` and `tests/integration/test_paper_risk_policy_migration.py`; update directly affected existing risk expectations, not unrelated tests.
+**Files:** Modify `src/autobit/risk/breakers.py`, `src/autobit/paper/service.py`, affected strict payload validation in `src/autobit/persistence/`; tests in `tests/unit/test_drawdown_recovery_v2.py` and `tests/integration/test_paper_risk_policy_migration.py`; update directly affected existing risk expectations, not unrelated tests. Do not create an unused legacy evaluator.
 
-**Interfaces:** Preserve the exact keyword-only `evaluate_risk(...) -> RiskDecision` public interface currently in `risk/breakers.py`. New evaluations use v2 unconditionally. Historical replay selects `evaluate_legacy_v1_risk(**same_snapshot_fields) -> RiskDecision` only from immutable v1 payload provenance, never from a current mode/config option. Paper risk payload version becomes 2 for new writes and admits 1 for strict historical reads.
+**Interfaces:** Preserve the exact keyword-only `evaluate_risk(...) -> RiskDecision` public interface currently in `risk/breakers.py`. New evaluations use v2 unconditionally. Paper risk payload version becomes 2 for new writes and admits 1 for strict historical reads. Existing v1 lacks raw volatility/pre-transition inputs: preserve existing validation strength rather than claim full canonical decision recomputation. No legacy policy selector for new decisions.
 
 - [ ] Read current evaluator, PaperService `_advance_risk_state`, risk payload parser, `_validate_health_and_risk_chain`, and Backtrader `_evaluate_current_risk`; trace how starts are preserved/cleared and what triggers force exit.
 - [ ] Add a parameterized RED test with an otherwise healthy snapshot and fixed episode start. Use this concrete boundary assertion:
@@ -71,7 +71,7 @@ else:
         reasons.append('recovery')
 ```
 
-- [ ] Preserve strict v1 recomputation with the previous post-expiry halt behavior. Write a real old-valid SQLite history fixture, open it under new code, append v2 decisions, restart, and compare preserved peak/start/history. Reject altered old decisions, unknown versions, and v2→v1 downgrade. Historical evaluation must not mutate or become selectable for new decisions.
+- [ ] Preserve strict v1 schema/envelope/cursor/projection/health validation and check contradictions derivable from stored facts, without inventing raw volatility inputs. Write a real old-valid SQLite history fixture, open it under new code, append v2 decisions, restart, and compare preserved peak/start/history. Reject detectable altered schema/health projections, unknown versions, and v2→v1 downgrade. Name exactly what each mutation test detects; do not claim all old canonical decisions can be reconstructed. No raw-input persistence redesign is required in this task.
 - [ ] Add 71:59:59/72:00:00/240-hour, DD exactly .15, simultaneous daily/weekly/volatility/unhealthy gates, repeated bars/restarts, no recurring recovery-entry force exits, peak recovery followed by a new drawdown episode tests. Verify existing entry/stop/health replay contracts.
 - [ ] Run new tests and affected existing risk/paper restart suites; record exact commands/counts/exits and full retained output. Self-review, explicitly stage changed source/tests, commit `fix: resume drawdown recovery with versioned ledger replay`, and report. Do not run the full suite here.
 
