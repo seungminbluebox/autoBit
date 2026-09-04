@@ -186,9 +186,11 @@ Full result: **ABORTED, NOT PASSING**. Started `2026-09-04T10:01:13.8746225Z` on
 `C:/Users/boxma/AppData/Local/Temp/autobit-final-followup-full-85887b2b806f4647a8ca23b1dd828f1f`.
 Exact command-line identity was checked: venv launcher PID30496, runtime worker
 PID25128 (parent30496), shell parent29052. There was one full run, tool session77767.
-The directory retains `head.txt`, empty `working-diff-stat.txt`,
-`started.txt`, `finished.txt`, `command.txt`, complete `stdout.log`, complete
-`stderr.log`, isolated `.coverage`, and `exit-code.txt`.
+The directory retains `head.txt`, `started.txt`, `finished.txt`, `command.txt`,
+captured `stdout.log`, `stderr.log`, `exit-code.txt`, and the test temporary
+directory. The clean-tree `git diff --stat` produced no file through PowerShell's
+empty pipeline; clean source identity was separately checked before and after
+the run. Hard termination produced no `.coverage` artifact or coverage summary.
 
 At `2026-09-04T10:15:40.7624094Z`, after the user approved N1 follow-up, the
 controller explicitly instructed this worker to abort the superseded frozen run.
