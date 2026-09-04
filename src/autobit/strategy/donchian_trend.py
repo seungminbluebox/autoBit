@@ -19,6 +19,18 @@ class PositionSnapshot:
     high_water: float
 
 
+def initial_stop_price(entry_price: float, entry_atr: float, initial_atr_mult: float) -> float:
+    """Use the entry's recorded multiplier, including historical/actual-fill caps.
+
+    Invalid inputs return NaN so callers fail closed through sizing or their
+    execution-boundary validation; a nonpositive calculated stop stays invalid.
+    """
+    values = (entry_price, entry_atr, initial_atr_mult)
+    if any(isinstance(value, bool) or not _is_finite(value) or float(value) <= 0. for value in values):
+        return math.nan
+    return float(entry_price) - float(initial_atr_mult) * float(entry_atr)
+
+
 def evaluate_entry(
     row: pd.Series,
     *,

@@ -36,14 +36,14 @@ from autobit.paper.health import (
     HealthSnapshot,
     HealthStateError,
 )
-from autobit.risk.breakers import RiskDecision, evaluate_risk
-from autobit.risk.position_sizer import calculate_size
-from autobit.strategy.donchian_trend import (
-    PositionSnapshot,
-    evaluate_close_exit,
-    evaluate_entry,
-    next_stop,
+from autobit.risk.breakers import RiskDecision
+from autobit.core.engine import StrategyEngine, forced_exit_reason
+from autobit.core.models import DecisionInput, PositionContext
+from autobit.core.risk_state import (
+    RiskState as _RiskState, RiskObservation, ClosedTradeObservation,
+    advance_risk_state, apply_health_recovery,
 )
+from autobit.strategy.donchian_trend import initial_stop_price
 
 
 _FOUR_HOURS = timedelta(hours=4)
@@ -98,27 +98,6 @@ class _OpenPosition:
 
 
 @dataclass(frozen=True, slots=True)
-class _RiskState:
-    equity_peak: float = 100.0
-    daily_date: date | None = None
-    daily_baseline_equity: float = 100.0
-    equity_history: tuple[tuple[datetime, float], ...] = ()
-    risk_started_at: datetime | None = None
-    last_equity: float = 100.0
-    last_risk_at: datetime | None = None
-    consecutive_losses: int = 0
-    processed_trade_count: int = 0
-    recovery_started_at: datetime | None = None
-    daily_halt_started_at: datetime | None = None
-    weekly_halt_started_at: datetime | None = None
-    streak_halt_started_at: datetime | None = None
-    profitable_trades_since_streak_halt: int = 0
-    volatility_halted: bool = False
-    volatility_stable_bars: int = 0
-    decision: RiskDecision = RiskDecision(0.02, 0.70, None, ())
-
-
-@dataclass(frozen=True, slots=True)
 class _HealthGate:
     action: HealthAction | None
     evidence_event_id: str | None
@@ -167,6 +146,7 @@ class PaperService:
         self._strategy = strategy_config
         self._risk = risk_config
         self._costs = costs
+        self._engine = StrategyEngine(strategy_config, costs)
         self._lease_ttl = lease_ttl
         self._fault_hook = fault_hook
 
@@ -515,54 +495,33 @@ class PaperService:
             )
             reconciliation = self._broker.reconcile()
 
-            if reconciliation.btc_quantity > 0.0 and not reconciliation.active_orders:
-                exit_reason = self._exit_reason(
-                    bar_at,
-                    row,
-                    reconciliation,
-                    risk_decision,
-                    enriched,
-                )
-                if exit_reason is not None:
+            position = None
+            if reconciliation.btc_quantity > 0.0:
+                position = _position_context(_open_position(
+                    self._broker, reconciliation, enriched, bar_at, self._strategy,
+                ), reconciliation.btc_quantity)
+            decision = self._engine.decide(DecisionInput(
+                row=row, cash=reconciliation.cash, equity=equity, position=position,
+                has_pending_order=bool(reconciliation.active_orders), risk=risk_decision,
+            ))
+            if decision.action == "sell":
+                # Broker-owned partial BUY remainders are already canceled at
+                # process_open. A pending SELL coalesces a repeated exit intent.
+                if not reconciliation.active_orders:
                     order = self._broker.submit_exit(
-                        bar_at,
-                        quantity=reconciliation.btc_quantity,
-                        owned_quantity=reconciliation.btc_quantity,
-                        reason=exit_reason,
+                        bar_at, quantity=decision.quantity,
+                        owned_quantity=reconciliation.btc_quantity, reason=decision.reason,
                     )
                     created_ids.append(order.order_id)
-                else:
-                    self._ensure_stop(bar_at, row, reconciliation, enriched)
-            elif (
-                reconciliation.btc_quantity == 0.0
-                and not reconciliation.active_orders
-                and risk_decision.risk_rate > 0.0
-                and risk_decision.exposure_cap > 0.0
-                and evaluate_entry(row, is_flat=True, config=self._strategy)
-            ):
-                close = float(row["close"])
-                atr = float(row[f"atr_{self._strategy.atr_period}"])
-                initial_stop = close - self._strategy.initial_atr_mult * atr
-                size = calculate_size(
-                    equity=equity,
-                    cash=reconciliation.cash,
-                    entry=close,
-                    stop=initial_stop,
-                    current_atr_pct=atr / close,
-                    baseline_atr_pct=float(row["baseline_atr_pct"]),
-                    risk_rate=risk_decision.risk_rate,
-                    exposure_cap=risk_decision.exposure_cap,
-                    costs=self._costs,
+            elif decision.action == "buy":
+                order = self._broker.submit_entry(
+                    bar_at, quantity=decision.quantity, reason=decision.reason,
+                    execution_context=self._entry_context(bar_at, row, decision.risk),
                 )
-                if size.quantity > 0.0:
-                    order = self._broker.submit_entry(
-                        bar_at,
-                        quantity=size.quantity,
-                        reason="ENTRY",
-                        execution_context=self._entry_context(bar_at, row, risk_decision),
-                    )
-                    created_ids.append(order.order_id)
-                    self._fault("after_order_acceptance")
+                created_ids.append(order.order_id)
+                self._fault("after_order_acceptance")
+            elif position is not None and not reconciliation.active_orders:
+                self._ensure_stop(bar_at, row, reconciliation, enriched, candidate=decision.next_stop)
 
             result = CycleResult(
                 CycleStatus.PROCESSED,
@@ -743,38 +702,6 @@ class PaperService:
             self._fault("after_health_risk_followup")
         return final
 
-    def _exit_reason(
-        self,
-        bar_at: datetime,
-        row: pd.Series,
-        reconciliation: PaperReconciliation,
-        risk: RiskDecision,
-        enriched: pd.DataFrame,
-    ) -> str | None:
-        forced = _forced_exit_reason(risk)
-        if forced is not None:
-            return forced
-        position = _open_position(
-            self._broker,
-            reconciliation,
-            enriched,
-            bar_at,
-            self._strategy,
-        )
-        if evaluate_close_exit(row):
-            return "CLOSE_EXIT"
-        risk_unit = position.entry_price - position.initial_stop
-        if (
-            position.held_bars >= self._strategy.stagnant_bars
-            and risk_unit > 0.0
-            and position.high_water
-            < position.entry_price + self._strategy.stagnant_min_r * risk_unit
-        ):
-            return "STAGNANT_EXIT"
-        if position.held_bars >= self._strategy.max_holding_bars:
-            return "MAX_HOLD_EXIT"
-        return None
-
     def _ensure_stop(
         self,
         bar_at: datetime,
@@ -782,6 +709,8 @@ class PaperService:
         reconciliation: PaperReconciliation,
         enriched: pd.DataFrame,
         active_after: datetime | None = None,
+        *,
+        candidate: float | None = None,
     ) -> None:
         position = _open_position(
             self._broker,
@@ -800,17 +729,7 @@ class PaperService:
                 source_id=position.order.order_id,
             )
             return
-        candidate = next_stop(
-            PositionSnapshot(
-                entry_price=position.entry_price,
-                initial_stop=position.initial_stop,
-                current_stop=position.current_stop,
-                high_water=position.high_water,
-            ),
-            row,
-            self._strategy,
-        )
-        if Decimal(str(candidate)) > Decimal(str(active.stop_price)):
+        if candidate is not None and Decimal(str(candidate)) > Decimal(str(active.stop_price)):
             self._broker.set_stop(
                 bar_at,
                 candidate,
@@ -1120,6 +1039,11 @@ def _future_obligation_end(
     return obligation
 
 
+def _position_context(position: _OpenPosition, quantity: float) -> PositionContext:
+    return PositionContext(position.entry_price, position.initial_stop, position.current_stop,
+                           position.high_water, quantity, position.held_bars)
+
+
 def _open_position(
     broker: PaperBroker,
     reconciliation: PaperReconciliation,
@@ -1141,14 +1065,14 @@ def _open_position(
     initial_stop = broker.initial_stop(order.order_id)
     if initial_stop is None and order.execution_context is not None:
         atr = float(order.execution_context["entry_atr"])
-        initial_stop = open_entry.fill_price - config.initial_atr_mult * atr
+        initial_stop = initial_stop_price(open_entry.fill_price, atr, float(order.execution_context["initial_atr_mult"]))
     elif initial_stop is None:
         signal_at = pd.Timestamp(order.signal_at_utc)
         if signal_at not in enriched.index:
             raise PaperServiceError("entry signal candle is absent from public history")
         signal_row = enriched.loc[signal_at]
         atr = _positive_finite(signal_row.get(f"atr_{config.atr_period}"), "entry ATR")
-        initial_stop = open_entry.fill_price - config.initial_atr_mult * atr
+        initial_stop = initial_stop_price(open_entry.fill_price, atr, config.initial_atr_mult)
     if not math.isfinite(initial_stop) or initial_stop <= 0.0:
         raise PaperServiceError("reconstructed initial stop is invalid")
     held = enriched.loc[(enriched.index >= open_entry.fill_time) & (enriched.index <= bar_at)]
@@ -1199,132 +1123,24 @@ def _validated_position_frame(frame: pd.DataFrame, start: datetime, end: datetim
 
 
 def _advance_risk_state(
-    prior: _RiskState,
-    *,
-    bar_at: datetime,
-    equity: float,
-    row: pd.Series,
-    completed_trades: tuple[PaperTrade, ...],
-    risk_config: RiskConfig,
+    prior: _RiskState, *, bar_at: datetime, equity: float, row: pd.Series,
+    completed_trades: tuple[PaperTrade, ...], risk_config: RiskConfig,
     system_healthy: bool,
 ) -> _RiskState:
-    if not math.isfinite(equity) or equity < 0.0:
-        raise PaperServiceError("mark-to-market equity is invalid")
-    if prior.processed_trade_count > len(completed_trades):
-        raise PaperServiceError("risk trade cursor is ahead of broker history")
-
-    consecutive_losses = prior.consecutive_losses
-    profitable_since_halt = prior.profitable_trades_since_streak_halt
-    for trade in completed_trades[prior.processed_trade_count :]:
-        if trade.net_pnl < 0.0:
-            consecutive_losses += 1
-        else:
-            consecutive_losses = 0
-        if (
-            prior.streak_halt_started_at is not None
-            and trade.net_pnl > 0.0
-            and trade.exit_time > prior.streak_halt_started_at
-        ):
-            profitable_since_halt += 1
-
-    equity_peak = max(prior.equity_peak, equity)
-    drawdown = max(0.0, 1.0 - equity / equity_peak) if equity_peak > 0.0 else math.nan
-    daily_date = prior.daily_date or bar_at.date()
-    daily_baseline = prior.daily_baseline_equity
-    if bar_at.date() != daily_date:
-        daily_date = bar_at.date()
-        daily_baseline = prior.last_equity
-    daily_loss = _loss_from_baseline(equity, daily_baseline)
-
-    risk_started_at = prior.risk_started_at or bar_at
-    history = (*prior.equity_history, (bar_at, equity))
-    cutoff = bar_at - timedelta(days=7)
-    recent_history = tuple(item for item in history if item[0] >= cutoff)
-    if bar_at - risk_started_at < timedelta(days=7):
-        weekly_baseline = 100.0
-    else:
-        weekly_baseline = recent_history[0][1]
-    weekly_loss = _loss_from_baseline(equity, weekly_baseline)
-
-    recovery_start = prior.recovery_started_at
-    daily_start = prior.daily_halt_started_at
-    weekly_start = prior.weekly_halt_started_at
-    streak_start = prior.streak_halt_started_at
-    if drawdown >= risk_config.hard_drawdown and recovery_start is None:
-        recovery_start = bar_at
-    if daily_loss >= risk_config.daily_loss_limit and daily_start is None:
-        daily_start = bar_at
-    if weekly_loss >= risk_config.weekly_halt_limit and weekly_start is None:
-        weekly_start = bar_at
-    if consecutive_losses >= 5 and streak_start is None:
-        streak_start = bar_at
-        profitable_since_halt = 0
-
+    """Normalize public/broker facts; durable v1/v2 validation stays above."""
     close = _positive_finite(row.get("close"), "risk close")
     atr = _positive_finite(row.get(f"atr_{StrategyConfig().atr_period}"), "risk ATR")
-    baseline_atr_pct = _positive_finite(row.get("baseline_atr_pct"), "baseline ATR percent")
-    volatility_ratio = (atr / close) / baseline_atr_pct
-    volatility_halted = prior.volatility_halted
-    stable_bars = prior.volatility_stable_bars
-    volatility_bar_valid = bool(row.get("warmup_complete")) and bool(
-        row.get("entry_data_valid")
-    )
-    if volatility_halted:
-        stable_bars = stable_bars + 1 if volatility_bar_valid and volatility_ratio <= 1.5 else 0
-    elif volatility_ratio > 3.0:
-        volatility_halted = True
-        stable_bars = 0
-
-    decision = evaluate_risk(
-        now=bar_at,
-        drawdown=drawdown,
-        daily_loss=daily_loss,
-        weekly_loss=weekly_loss,
-        consecutive_losses=consecutive_losses,
-        volatility_ratio=volatility_ratio,
-        system_healthy=system_healthy,
-        config=risk_config,
-        recovery_started_at=recovery_start,
-        daily_halt_started_at=daily_start,
-        weekly_halt_started_at=weekly_start,
-        streak_halt_started_at=streak_start,
-        volatility_halted=volatility_halted,
-        volatility_stable_bars=stable_bars,
-        profitable_trades_since_streak_halt=profitable_since_halt,
-    )
-
-    if recovery_start is not None and bar_at >= recovery_start + timedelta(hours=72) and drawdown == 0.0:
-        recovery_start = None
-    if daily_start is not None and bar_at >= daily_start + timedelta(hours=24) and daily_loss < risk_config.daily_loss_limit:
-        daily_start = None
-    if weekly_start is not None and bar_at >= weekly_start + timedelta(hours=48) and weekly_loss < risk_config.weekly_halt_limit:
-        weekly_start = None
-    if streak_start is not None and bar_at >= streak_start + timedelta(hours=48) and profitable_since_halt >= 2:
-        streak_start = None
-        profitable_since_halt = 0
-    if volatility_halted and volatility_bar_valid and volatility_ratio <= 1.5 and stable_bars >= 3:
-        volatility_halted = False
-        stable_bars = 0
-
-    return _RiskState(
-        equity_peak=equity_peak,
-        daily_date=daily_date,
-        daily_baseline_equity=daily_baseline,
-        equity_history=recent_history,
-        risk_started_at=risk_started_at,
-        last_equity=equity,
-        last_risk_at=bar_at,
-        consecutive_losses=consecutive_losses,
-        processed_trade_count=len(completed_trades),
-        recovery_started_at=recovery_start,
-        daily_halt_started_at=daily_start,
-        weekly_halt_started_at=weekly_start,
-        streak_halt_started_at=streak_start,
-        profitable_trades_since_streak_halt=profitable_since_halt,
-        volatility_halted=volatility_halted,
-        volatility_stable_bars=stable_bars,
-        decision=decision,
-    )
+    baseline = _positive_finite(row.get("baseline_atr_pct"), "baseline ATR percent")
+    try:
+        return advance_risk_state(prior, RiskObservation(
+            now=bar_at, equity=equity,
+            closed_trades=tuple(ClosedTradeObservation(t.net_pnl, t.exit_time) for t in completed_trades),
+            volatility_ratio=(atr / close) / baseline,
+            volatility_bar_valid=bool(row.get("warmup_complete")) and bool(row.get("entry_data_valid")),
+            system_healthy=system_healthy,
+        ), config=risk_config)
+    except ValueError as error:
+        raise PaperServiceError(str(error)) from error
 
 
 def _risk_state_payload(state: _RiskState) -> dict[str, object]:
@@ -1471,11 +1287,7 @@ def _mark_to_market(reconciliation: PaperReconciliation, close: float) -> float:
 
 
 def _forced_exit_reason(decision: RiskDecision) -> str | None:
-    if "drawdown_halt" in decision.reasons:
-        return "RISK_EXIT"
-    if any(reason in {"system_unhealthy", "invalid_input", "invalid_config"} for reason in decision.reasons):
-        return "SYSTEM_EXIT"
-    return None
+    return forced_exit_reason(decision)
 
 
 def _health_gate_from_snapshot(snapshot: PaperSnapshot) -> _HealthGate:
@@ -1664,34 +1476,12 @@ def _validate_health_and_risk_chain(snapshot: PaperSnapshot) -> _ValidatedRiskCh
     )
 
 
-def _apply_health_action(
-    decision: RiskDecision,
-    health: HealthAction | None,
-) -> RiskDecision:
-    if health is None or health.halt_entries:
-        if decision.reasons == ("system_unhealthy",):
-            return decision
-        return RiskDecision(0.0, 0.0, None, ("system_unhealthy",))
-    if not health.resume_reduced:
-        return decision
-    if (
-        decision.halted_until is not None
-        or decision.risk_rate <= 0.0
-        or decision.exposure_cap <= 0.0
-    ):
-        return decision
-    return RiskDecision(
-        risk_rate=decision.risk_rate / 2.0,
-        exposure_cap=decision.exposure_cap / 2.0,
-        halted_until=decision.halted_until,
-        reasons=decision.reasons + ("health_recovery_reduced",),
+def _apply_health_action(decision: RiskDecision, health: HealthAction | None) -> RiskDecision:
+    """Compatibility/provenance boundary for the shared pure health policy."""
+    return apply_health_recovery(
+        decision, system_healthy=health is not None and not health.halt_entries,
+        resume_reduced=health is not None and health.resume_reduced,
     )
-
-
-def _loss_from_baseline(equity: float, baseline: float) -> float:
-    if baseline <= 0.0:
-        return 0.0
-    return max(0.0, 1.0 - equity / baseline)
 
 
 def _validate_operational_alert_chain(events: Sequence[StoredEvent]) -> None:

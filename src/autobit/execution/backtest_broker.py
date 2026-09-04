@@ -5,6 +5,7 @@ from backtrader.order import BuyOrder, SellOrder
 
 from autobit.config import CostConfig
 from autobit.risk.position_sizer import calculate_size
+from autobit.strategy.donchian_trend import initial_stop_price
 
 
 class OneShotFractionalFiller:
@@ -26,7 +27,7 @@ class OneShotFractionalFiller:
             return requested_fill
 
         atr = float(order.info.execution_atr)
-        actual_stop = float(price) - float(order.info.initial_atr_mult) * atr
+        actual_stop = initial_stop_price(float(price), atr, float(order.info.initial_atr_mult))
         decision = calculate_size(
             equity=float(self._broker.getvalue()),
             cash=float(self._broker.getcash()),

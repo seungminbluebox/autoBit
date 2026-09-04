@@ -19,6 +19,7 @@ from types import MappingProxyType
 from autobit.config import CostConfig
 from autobit.domain.models import OrderStatus, PositionState
 from autobit.risk.position_sizer import calculate_size
+from autobit.strategy.donchian_trend import initial_stop_price
 from autobit.persistence.sqlite_store import (
     IdempotencyConflictError,
     PaperSnapshot,
@@ -1663,7 +1664,7 @@ def _validated_position_observations(
         expected_initial = initial_stops.get(order_id)
         context = orders[order_id].execution_context
         if context is not None:
-            expected_initial = fill.fill_price - float(context["initial_atr_mult"]) * float(context["entry_atr"])
+            expected_initial = initial_stop_price(fill.fill_price, float(context["entry_atr"]), float(context["initial_atr_mult"]))
         if (expected_initial is None or initial <= 0.0 or initial >= fill.fill_price
             or initial != expected_initial or (prior and initial != prior.payload["initial_stop"])):
             raise PaperReconciliationError("position observation changes immutable initial risk")
@@ -1740,7 +1741,7 @@ def _validate_entry_context_binding(
     close = float(context["signal_price"])
     size = calculate_size(
         equity=float(cash), cash=float(cash), entry=close,
-        stop=close - float(context["initial_atr_mult"]) * float(context["entry_atr"]),
+        stop=initial_stop_price(close, float(context["entry_atr"]), float(context["initial_atr_mult"])),
         current_atr_pct=float(context["entry_atr"]) / close,
         baseline_atr_pct=float(context["baseline_atr_pct"]),
         risk_rate=float(context["risk_rate"]), exposure_cap=float(context["exposure_cap"]),
@@ -1755,7 +1756,7 @@ def _execution_quantity(order: PaperOrder, fill_price: float, cash: float) -> fl
     atr = float(context["entry_atr"])
     result = calculate_size(
         equity=cash, cash=cash, entry=fill_price,
-        stop=fill_price - float(context["initial_atr_mult"]) * atr,
+        stop=initial_stop_price(fill_price, atr, float(context["initial_atr_mult"])),
         current_atr_pct=atr / fill_price, baseline_atr_pct=float(context["baseline_atr_pct"]),
         risk_rate=float(context["risk_rate"]), exposure_cap=float(context["exposure_cap"]),
         costs=CostConfig(order.fee_rate, 0.0),

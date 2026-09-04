@@ -10,14 +10,11 @@ import pandas as pd
 from autobit.config import CostConfig, RiskConfig, StrategyConfig
 from autobit.domain.models import OrderStatus
 from autobit.execution.backtest_broker import EventBacktestBroker, OneShotFractionalFiller
-from autobit.risk.breakers import RiskDecision, evaluate_risk
-from autobit.risk.position_sizer import calculate_size
-from autobit.strategy.donchian_trend import (
-    PositionSnapshot,
-    evaluate_close_exit,
-    evaluate_entry,
-    next_stop,
-)
+from autobit.risk.breakers import RiskDecision
+from autobit.core.engine import StrategyEngine, forced_exit_reason
+from autobit.core.models import DecisionInput, PositionContext
+from autobit.core.risk_state import RiskState, RiskObservation, ClosedTradeObservation, advance_risk_state
+from autobit.strategy.donchian_trend import initial_stop_price
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,20 +155,11 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self.entry_signal_time: datetime | None = None
         self._entry_fill_bar: int | None = None
         self._run_start_equity = float(self.broker.getvalue())
-        self._equity_peak = self._run_start_equity
-        self._risk_equity_history: list[tuple[datetime, float]] = []
-        self._daily_date = None
-        self._daily_baseline_equity = self._run_start_equity
-        self._last_equity = self._run_start_equity
-        self._last_risk_time: datetime | None = None
-        self._consecutive_losses = 0
-        self._recovery_started_at: datetime | None = None
-        self._daily_halt_started_at: datetime | None = None
-        self._weekly_halt_started_at: datetime | None = None
-        self._streak_halt_started_at: datetime | None = None
-        self._profitable_trades_since_streak_halt = 0
-        self._volatility_halted = False
-        self._volatility_stable_bars = 0
+        self._engine = StrategyEngine(self.adapter_config.strategy, self.adapter_config.costs)
+        self._risk_state = RiskState(
+            initial_equity=self._run_start_equity, equity_peak=self._run_start_equity,
+            daily_baseline_equity=self._run_start_equity, last_equity=self._run_start_equity,
+        )
         self._gap_handled_current_bar = False
         self._terminal_final_equity: float | None = None
         self.broker.set_pre_submit_hook(self._on_order_created)
@@ -197,65 +185,44 @@ class _DonchianBacktestStrategy(bt.Strategy):
             self._reissue_exit_remainder()
             return
 
-        if self.position.size > 0.0:
-            if self.stop_order is None:
-                self._submit_stop()
-            if self._requires_forced_exit(risk_decision):
-                self._submit_forced_exit(risk_decision)
-                return
-            if self.exit_order is None and evaluate_close_exit(self._row()):
-                self._submit_close_exit()
-                return
-            self.high_water = max(float(self.high_water), float(self.data.high[0]))
-            if self.exit_order is None and self._stagnant_exit_due():
-                self._submit_market_exit("STAGNANT_EXIT")
-                return
-            if self.exit_order is None and self._max_hold_exit_due():
-                self._submit_market_exit("MAX_HOLD_EXIT")
-                return
-            self._update_trailing_stop()
-            return
-        if self.entry_order is not None:
-            return
-
         row = self._row()
-        if risk_decision.risk_rate <= 0.0 or risk_decision.exposure_cap <= 0.0:
+        position = self._position_context()
+        decision = self._engine.decide(DecisionInput(
+            row=row, cash=float(self.broker.getcash()), equity=equity,
+            position=position, has_pending_order=self.entry_order is not None or self.exit_order is not None,
+            risk=risk_decision,
+        ))
+        if position is not None:
+            if self.stop_order is None and self.exit_order is None:
+                self._submit_stop()
+            if decision.action == "sell":
+                if self.exit_order is None:
+                    self._cancel_entry_remainder()
+                    self._submit_market_exit(decision.reason, quantity=decision.quantity)
+            elif decision.next_stop is not None and self.exit_order is None:
+                self._update_trailing_stop(decision.next_stop)
+            self.high_water = max(float(self.high_water), float(self.data.high[0]))
             return
-        if not evaluate_entry(row, is_flat=True, config=self.adapter_config.strategy):
+        if decision.action != "buy":
             return
 
-        entry_reference = float(self.data.close[0])
+        stop, size = decision.next_stop, decision.quantity
         atr = float(self.data.atr_value[0])
-        stop = entry_reference - self.adapter_config.strategy.initial_atr_mult * atr
         baseline_atr_pct = float(self.data.baseline_atr_pct[0])
-        size = calculate_size(
-            equity=float(self.broker.getvalue()),
-            cash=float(self.broker.getcash()),
-            entry=entry_reference,
-            stop=stop,
-            current_atr_pct=atr / entry_reference,
-            baseline_atr_pct=baseline_atr_pct,
-            risk_rate=risk_decision.risk_rate,
-            exposure_cap=risk_decision.exposure_cap,
-            costs=self.adapter_config.costs,
-        ).quantity
-        if size <= 0.0:
-            return
-
         self.initial_stop = stop
         self.current_stop = stop
         self.entry_signal_time = self._now()
         self.entry_order = self.buy(
             size=size,
             signal_time=self.entry_signal_time.isoformat(),
-            reason="ENTRY",
+            reason=decision.reason,
             fill_fraction=self.adapter_config.entry_fill_fraction,
             execution_cap_enabled=True,
             execution_atr=atr,
             initial_atr_mult=self.adapter_config.strategy.initial_atr_mult,
             baseline_atr_pct=baseline_atr_pct,
-            risk_rate=risk_decision.risk_rate,
-            exposure_cap=risk_decision.exposure_cap,
+            risk_rate=decision.risk.risk_rate,
+            exposure_cap=decision.risk.exposure_cap,
             fee_rate=self.adapter_config.costs.fee_rate,
         )
 
@@ -302,7 +269,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
         self.entry_price = float(order.executed.price)
         entry_atr = float(order.info.execution_atr)
         initial_atr_mult = float(order.info.initial_atr_mult)
-        self.initial_stop = self.entry_price - initial_atr_mult * entry_atr
+        self.initial_stop = initial_stop_price(self.entry_price, entry_atr, initial_atr_mult)
         self.current_stop = self.initial_stop
         self.high_water = self.entry_price
         if self._entry_fill_bar is None:
@@ -425,21 +392,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
         ):
             self.broker.reconcile_same_bar_stop(self.stop_order)
 
-    def _update_trailing_stop(self) -> None:
-        if None in (self.entry_price, self.initial_stop, self.current_stop, self.high_water):
-            return
-        row = self._row()
-        candidate = next_stop(
-            PositionSnapshot(
-                entry_price=float(self.entry_price),
-                initial_stop=float(self.initial_stop),
-                current_stop=float(self.current_stop),
-                high_water=float(self.high_water),
-            ),
-            row,
-            self.adapter_config.strategy,
-        )
-        self.high_water = max(float(self.high_water), float(self.data.high[0]))
+    def _update_trailing_stop(self, candidate: float) -> None:
         if candidate <= float(self.current_stop):
             return
         if self.stop_order is not None:
@@ -457,44 +410,26 @@ class _DonchianBacktestStrategy(bt.Strategy):
             fill_fraction=self.adapter_config.exit_fill_fraction,
         )
 
-    def _submit_close_exit(self) -> None:
-        self._submit_market_exit("CLOSE_EXIT")
-
-    def _submit_market_exit(self, reason: str) -> None:
+    def _submit_market_exit(self, reason: str, *, quantity: float | None = None) -> None:
         signal_time = self._now()
         if self.stop_order is not None:
             self.cancel(self.stop_order)
             self.stop_order = None
         self.exit_order = self.sell(
-            size=float(self.position.size),
+            size=float(self.position.size) if quantity is None else quantity,
             signal_time=signal_time.isoformat(),
             reason=reason,
             fill_fraction=self.adapter_config.exit_fill_fraction,
         )
 
-    def _stagnant_exit_due(self) -> bool:
-        if None in (
-            self._entry_fill_bar,
-            self.entry_price,
-            self.initial_stop,
-            self.high_water,
-        ):
-            return False
-        completed_held_bars = len(self.data) - int(self._entry_fill_bar)
-        if completed_held_bars < self.adapter_config.strategy.stagnant_bars:
-            return False
-        risk_per_unit = float(self.entry_price) - float(self.initial_stop)
-        threshold = (
-            float(self.entry_price)
-            + self.adapter_config.strategy.stagnant_min_r * risk_per_unit
+    def _position_context(self) -> PositionContext | None:
+        if self.position.size <= 0.:
+            return None
+        return PositionContext(
+            float(self.entry_price), float(self.initial_stop), float(self.current_stop),
+            float(self.high_water), float(self.position.size),
+            len(self.data) - int(self._entry_fill_bar),
         )
-        return float(self.high_water) < threshold
-
-    def _max_hold_exit_due(self) -> bool:
-        if self._entry_fill_bar is None:
-            return False
-        completed_held_bars = len(self.data) - self._entry_fill_bar
-        return completed_held_bars >= self.adapter_config.strategy.max_holding_bars
 
     def _reset_position_tracking(self) -> None:
         self.initial_stop = None
@@ -556,160 +491,31 @@ class _DonchianBacktestStrategy(bt.Strategy):
                 "previous_entry_high": float(self.data.previous_entry_high[0]),
                 f"atr_{config.atr_period}": float(self.data.atr_value[0]),
                 "exit_low": float(self.data.exit_low[0]),
+                "baseline_atr_pct": float(self.data.baseline_atr_pct[0]),
             }
         )
 
     def _evaluate_current_risk(self, now: datetime, equity: float) -> RiskDecision:
-        system_healthy = self._risk_inputs_are_healthy(now, equity)
-        if math.isfinite(equity):
-            self._equity_peak = max(self._equity_peak, equity)
-        drawdown = (
-            max(0.0, 1.0 - equity / self._equity_peak)
-            if system_healthy and self._equity_peak > 0.0
-            else math.nan
-        )
-
-        current_date = now.date()
-        if self._daily_date is None:
-            self._daily_date = current_date
-        elif current_date != self._daily_date:
-            self._daily_date = current_date
-            self._daily_baseline_equity = self._last_equity
-        daily_loss = _loss_from_baseline(equity, self._daily_baseline_equity)
-        if (
-            daily_loss >= self.adapter_config.risk.daily_loss_limit
-            and self._daily_halt_started_at is None
-        ):
-            self._daily_halt_started_at = now
-
-        self._risk_equity_history.append((now, equity))
-        cutoff = now - timedelta(days=7)
-        if now - self._risk_equity_history[0][0] < timedelta(days=7):
-            weekly_baseline = self._run_start_equity
-        else:
-            weekly_baseline = next(
-                value
-                for timestamp, value in self._risk_equity_history
-                if timestamp >= cutoff
-            )
-        weekly_loss = _loss_from_baseline(equity, weekly_baseline)
-        if (
-            drawdown >= self.adapter_config.risk.hard_drawdown
-            and self._recovery_started_at is None
-        ):
-            self._recovery_started_at = now
-        if (
-            weekly_loss >= self.adapter_config.risk.weekly_halt_limit
-            and self._weekly_halt_started_at is None
-        ):
-            self._weekly_halt_started_at = now
-        if self._consecutive_losses >= 5 and self._streak_halt_started_at is None:
-            self._streak_halt_started_at = now
-            self._profitable_trades_since_streak_halt = 0
-
-        close = float(self.data.close[0])
-        atr = float(self.data.atr_value[0])
-        baseline_atr_pct = float(self.data.baseline_atr_pct[0])
-        volatility_ratio = (
-            (atr / close) / baseline_atr_pct
-            if close > 0.0 and baseline_atr_pct > 0.0
-            else math.nan
-        )
-        volatility_bar_valid = (
-            system_healthy
-            and bool(self.data.warmup_complete[0])
-            and bool(self.data.entry_data_valid[0])
-            and math.isfinite(volatility_ratio)
-        )
-        if self._volatility_halted:
-            if volatility_bar_valid and volatility_ratio <= 1.5:
-                self._volatility_stable_bars += 1
-            else:
-                self._volatility_stable_bars = 0
-        elif math.isfinite(volatility_ratio) and volatility_ratio > 3.0:
-            self._volatility_halted = True
-            self._volatility_stable_bars = 0
-        volatility_recovered = (
-            self._volatility_halted
-            and volatility_bar_valid
-            and volatility_ratio <= 1.5
-            and self._volatility_stable_bars >= 3
-        )
-        decision = evaluate_risk(
-            now=now,
-            drawdown=drawdown,
-            daily_loss=daily_loss,
-            weekly_loss=weekly_loss,
-            consecutive_losses=self._consecutive_losses,
-            volatility_ratio=volatility_ratio,
-            system_healthy=system_healthy,
-            config=self.adapter_config.risk,
-            recovery_started_at=self._recovery_started_at,
-            daily_halt_started_at=self._daily_halt_started_at,
-            weekly_halt_started_at=self._weekly_halt_started_at,
-            streak_halt_started_at=self._streak_halt_started_at,
-            volatility_halted=self._volatility_halted,
-            volatility_stable_bars=self._volatility_stable_bars,
-            profitable_trades_since_streak_halt=(
-                self._profitable_trades_since_streak_halt
-            ),
-        )
-        if (
-            self._recovery_started_at is not None
-            and now >= self._recovery_started_at + timedelta(hours=72)
-            and drawdown == 0.0
-        ):
-            self._recovery_started_at = None
-        if (
-            self._daily_halt_started_at is not None
-            and now >= self._daily_halt_started_at + timedelta(hours=24)
-            and daily_loss < self.adapter_config.risk.daily_loss_limit
-        ):
-            self._daily_halt_started_at = None
-        if (
-            self._weekly_halt_started_at is not None
-            and now >= self._weekly_halt_started_at + timedelta(hours=48)
-            and weekly_loss < self.adapter_config.risk.weekly_halt_limit
-        ):
-            self._weekly_halt_started_at = None
-        if (
-            self._streak_halt_started_at is not None
-            and now >= self._streak_halt_started_at + timedelta(hours=48)
-            and self._profitable_trades_since_streak_halt >= 2
-        ):
-            self._streak_halt_started_at = None
-            self._profitable_trades_since_streak_halt = 0
-        if volatility_recovered:
-            self._volatility_halted = False
-            self._volatility_stable_bars = 0
-        self._last_equity = equity
-        self._last_risk_time = now
-        return decision
+        healthy = self._risk_inputs_are_healthy(now, equity)
+        close, atr, baseline = (float(self.data.close[0]), float(self.data.atr_value[0]),
+                                float(self.data.baseline_atr_pct[0]))
+        ratio = (atr / close) / baseline if close > 0. and baseline > 0. else math.nan
+        if not math.isfinite(equity) or equity < 0.:
+            return RiskDecision(0., 0., None, ("system_unhealthy",))
+        self._risk_state = advance_risk_state(self._risk_state, RiskObservation(
+            now=now, equity=equity,
+            closed_trades=tuple(ClosedTradeObservation(t.net_pnl, t.exit_time) for t in self.trade_records),
+            volatility_ratio=ratio,
+            volatility_bar_valid=healthy and bool(self.data.warmup_complete[0])
+                                 and bool(self.data.entry_data_valid[0]) and math.isfinite(ratio),
+            system_healthy=healthy,
+        ), config=self.adapter_config.risk)
+        return self._risk_state.decision
 
     @staticmethod
     def _requires_forced_exit(decision: RiskDecision) -> bool:
-        return any(
-            reason in {"drawdown_halt", "system_unhealthy", "invalid_input", "invalid_config"}
-            for reason in decision.reasons
-        )
-
-    def _submit_forced_exit(self, decision: RiskDecision) -> None:
-        if self.exit_order is not None:
-            return
-        if self.stop_order is not None:
-            self.cancel(self.stop_order)
-            self.stop_order = None
-        reason = (
-            "RISK_EXIT"
-            if "drawdown_halt" in decision.reasons
-            else "SYSTEM_EXIT"
-        )
-        self.exit_order = self.sell(
-            size=float(self.position.size),
-            signal_time=self._now().isoformat(),
-            reason=reason,
-            fill_fraction=self.adapter_config.exit_fill_fraction,
-        )
+        """Compatibility predicate; current policy lives in the common engine."""
+        return forced_exit_reason(decision) is not None
 
     def _risk_inputs_are_healthy(self, now: datetime, equity: float) -> bool:
         prices = tuple(
@@ -723,7 +529,7 @@ class _DonchianBacktestStrategy(bt.Strategy):
             and low <= min(open_price, high, close)
             and math.isfinite(equity)
             and equity >= 0.0
-            and (self._last_risk_time is None or now > self._last_risk_time)
+            and (self._risk_state.last_risk_at is None or now > self._risk_state.last_risk_at)
         )
 
     def _on_order_created(self, order: bt.Order) -> None:
@@ -841,16 +647,6 @@ class _DonchianBacktestStrategy(bt.Strategy):
                 exit_reason=exit_reason,
             )
         )
-        if self.trade_records[-1].net_pnl < 0.0:
-            self._consecutive_losses += 1
-        else:
-            self._consecutive_losses = 0
-        if (
-            self._streak_halt_started_at is not None
-            and self.trade_records[-1].net_pnl > 0.0
-            and self.trade_records[-1].exit_time > self._streak_halt_started_at
-        ):
-            self._profitable_trades_since_streak_halt += 1
         self._entry_fill_bits.clear()
         self._exit_fill_bits.clear()
 
@@ -954,9 +750,3 @@ def _bt_utc(value: float) -> datetime:
 
 def _same_order(left: bt.Order, right: bt.Order | None) -> bool:
     return right is not None and left.ref == right.ref
-
-
-def _loss_from_baseline(equity: float, baseline: float) -> float:
-    if not all(math.isfinite(value) for value in (equity, baseline)) or baseline <= 0.0:
-        return math.nan
-    return max(0.0, 1.0 - equity / baseline)

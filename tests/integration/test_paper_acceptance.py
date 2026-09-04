@@ -10,7 +10,7 @@ import pytest
 
 from autobit.cli import _PaperApplication
 from autobit.execution.paper_broker import PaperBroker
-from autobit.paper import service as paper_service
+from autobit.core import engine as shared_engine
 from autobit.paper.health import HealthMonitor, HealthStage
 from autobit.persistence.sqlite_store import SQLiteStore
 from autobit.risk.position_sizer import SizeDecision, calculate_size
@@ -286,13 +286,13 @@ def test_paper_acceptance_scenario(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, object]] = []
-    production_size = paper_service.calculate_size
+    production_size = shared_engine.calculate_size
 
     def capture_size(**kwargs: object):
         calls.append(kwargs)
         return production_size(**kwargs)
 
-    monkeypatch.setattr(paper_service, "calculate_size", capture_size)
+    monkeypatch.setattr(shared_engine, "calculate_size", capture_size)
     result = app_harness.run("tests/fixtures/paper_acceptance.json")
 
     assert result.duplicate_orders == 0
@@ -318,7 +318,7 @@ def test_paper_acceptance_rejects_risk_agnostic_service_sizing(
         calls.append(kwargs)
         return SizeDecision(quantity=0.5, binding_constraint="constant", estimated_loss=0.0)
 
-    monkeypatch.setattr(paper_service, "calculate_size", constant_size)
+    monkeypatch.setattr(shared_engine, "calculate_size", constant_size)
     from autobit.execution.paper_broker import PaperReconciliationError
 
     with pytest.raises(PaperReconciliationError, match="signal sizing"):
