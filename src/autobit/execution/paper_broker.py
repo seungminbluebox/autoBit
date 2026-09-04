@@ -14,9 +14,11 @@ from decimal import Decimal
 from hashlib import sha256
 import math
 import re
+from types import MappingProxyType
 
 from autobit.config import CostConfig
 from autobit.domain.models import OrderStatus, PositionState
+from autobit.risk.position_sizer import calculate_size
 from autobit.persistence.sqlite_store import (
     IdempotencyConflictError,
     PaperSnapshot,
@@ -58,6 +60,7 @@ class PaperOrder:
     eligible_open_utc: datetime | None = None
     fee_rate: float = 0.0
     slippage_rate: float = 0.0
+    execution_context: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +127,7 @@ class _Ledger:
     open_stops: tuple[PaperStop, ...]
     total_fees: float
     total_slippage: float
+    position_observations: Mapping[str, StoredEvent]
 
 
 class PaperBroker:
@@ -178,6 +182,7 @@ class PaperBroker:
         *,
         quantity: float,
         reason: str = "ENTRY",
+        execution_context: Mapping[str, object] | None = None,
     ) -> PaperOrder:
         signal_text, signal_time = _timestamp(signal_at)
         normalized_quantity = _positive(quantity, "quantity")
@@ -201,10 +206,12 @@ class PaperBroker:
                     quantity=normalized_quantity,
                     parent_order_id=None,
                 )
+                if execution_context is not None:
+                    return self.bind_entry_context(order_id, execution_context)
                 return existing
             if ledger.snapshot.btc_quantity > 0.0 or ledger.snapshot.pending_orders:
                 raise ValueError("entry requires a flat account with no active order")
-            return self._submit_order_in_transaction(
+            order = self._submit_order_in_transaction(
                 signal_text=signal_text,
                 signal_time=signal_time,
                 occurred_at=signal_text,
@@ -217,6 +224,30 @@ class PaperBroker:
                 order_kind="MARKET",
                 eligible_open=_next_boundary(signal_time),
             )
+            if execution_context is not None:
+                return self.bind_entry_context(order_id, execution_context)
+            return order
+
+    def bind_entry_context(
+        self, order_id: str, context: Mapping[str, object],
+    ) -> PaperOrder:
+        """Bind immutable sizing evidence, including a legacy pending service BUY."""
+        normalized = _entry_context(context)
+        with self._store.transaction():
+            order = self.order(order_id)
+            if order.execution_context is not None:
+                if order.execution_context != normalized:
+                    raise IdempotencyConflictError("entry execution context conflicts")
+                return order
+            if order.side != "BUY" or order.status is not OrderStatus.ACCEPTED:
+                raise ValueError("entry context requires an unfilled accepted BUY")
+            evidence = self._store.replay_state().event_evidence
+            occurred_at = max(order.signal_at_utc, evidence[-1].occurred_at_utc)
+            self._store.append_event(
+                _entry_context_id(order_id), "PAPER_ENTRY_CONTEXT", occurred_at,
+                {"order_id": order_id, "context": dict(normalized), "version": 1},
+            )
+            return self.order(order_id)
 
     def submit_exit(
         self,
@@ -501,6 +532,39 @@ class PaperBroker:
     def active_stop(self) -> PaperStop | None:
         return self._build_ledger().active_stop
 
+    def position_observation(self, order_id: str) -> StoredEvent | None:
+        return self._build_ledger().position_observations.get(order_id)
+
+    def initial_stop(self, order_id: str) -> float | None:
+        ledger = self._build_ledger()
+        for event in ledger.snapshot.event_evidence:
+            if (event.event_type == "PAPER_STOP" and event.payload.get("action") == "SET"
+                and event.payload.get("source_id") == order_id
+                and event.payload.get("reason") == "HARD_STOP"):
+                return float(event.payload["stop_price"])
+        return None
+
+    def observe_position(
+        self, order_id: str, candle_highs: list[list[object]], initial_stop: float,
+    ) -> None:
+        """Persist only the next contiguous portion of the open position's history."""
+        with self._store.transaction():
+            ledger = self._build_ledger()
+            prior = ledger.position_observations.get(order_id)
+            fill = next(fill for fill in ledger.fills if fill.order_id == order_id)
+            at = _evidence_timestamp(candle_highs[-1][0])[1]
+            high_water = max(float(item[1]) for item in candle_highs)
+            if prior is not None:
+                high_water = max(high_water, float(prior.payload["high_water"]))
+            self._store.append_event(
+                _position_observation_id(order_id, at), "PAPER_POSITION", at,
+                {"version": 1, "order_id": order_id, "fill_id": fill.fill_id,
+                 "previous_event_id": prior.event_id if prior else None,
+                 "initial_stop": initial_stop, "high_water": high_water,
+                 "candle_highs": candle_highs},
+            )
+            self._build_ledger()
+
     def order(self, order_id: str) -> PaperOrder:
         normalized_id = _text(order_id, "order id")
         order = self._build_ledger().orders.get(normalized_id)
@@ -637,8 +701,25 @@ class PaperBroker:
         )
         if not math.isfinite(fill_price) or fill_price <= 0.0:
             raise ValueError("slippage produces a non-positive fill price")
-        fee = _computed_fee(quantity, fill_price, order.fee_rate)
         current = self._store.replay_state()
+        execution_capped = False
+        if order.side == "BUY" and order.execution_context is not None:
+            self._store.append_event(
+                _execution_id(order.order_id), "PAPER_EXECUTION", candle_time,
+                {"version": 1, "order_id": order.order_id,
+                 "reference_price": reference_price, "attempted_quantity": quantity},
+            )
+            cap = _execution_quantity(order, fill_price, current.cash)
+            execution_capped = cap < quantity
+            quantity = min(quantity, cap)
+            if quantity <= 0.0:
+                self._store.transition_order_status(
+                    order.order_id, f"{order.idempotency_key}:execution-cap:{candle_text}",
+                    OrderStatus.REJECTED, candle_text, reason="EXECUTION_CAP",
+                )
+                return None
+            quantity_decimal = _decimal(quantity)
+        fee = _computed_fee(quantity, fill_price, order.fee_rate)
         cash_required = _decimal(quantity) * _decimal(fill_price) + _decimal(fee)
         if order.side == "BUY" and cash_required > _decimal(current.cash):
             self._store.transition_order_status(
@@ -715,7 +796,7 @@ class PaperBroker:
                 f"{order.idempotency_key}:cancel-remainder:{candle_text}",
                 OrderStatus.CANCELED,
                 candle_text,
-                reason="PARTIAL_REMAINDER",
+                reason="EXECUTION_CAP" if execution_capped else "PARTIAL_REMAINDER",
             )
             if order.side == "SELL":
                 if order.parent_order_id is not None and order.parent_order_id.startswith(
@@ -799,6 +880,8 @@ class PaperBroker:
         raw_fills: dict[str, StoredEvent] = {}
         order_metadata: dict[str, StoredEvent] = {}
         fill_metadata: dict[str, StoredEvent] = {}
+        entry_contexts: dict[str, StoredEvent] = {}
+        executions: dict[str, StoredEvent] = {}
         active_stop: PaperStop | None = None
         known_stops: dict[str, PaperStop] = {}
         open_stops: dict[str, PaperStop] = {}
@@ -833,6 +916,16 @@ class PaperBroker:
                 if fill_id in fill_metadata:
                     raise PaperReconciliationError("duplicate paper fill metadata")
                 fill_metadata[fill_id] = event
+            elif event.event_type == "PAPER_ENTRY_CONTEXT":
+                order_id = _payload_text(payload, "order_id")
+                if order_id in entry_contexts:
+                    raise PaperReconciliationError("duplicate entry context")
+                entry_contexts[order_id] = event
+            elif event.event_type == "PAPER_EXECUTION":
+                order_id = _payload_text(payload, "order_id")
+                if order_id in executions:
+                    raise PaperReconciliationError("duplicate paper execution evidence")
+                executions[order_id] = event
             elif event.event_type == "PAPER_STOP":
                 action = _payload_text(payload, "action")
                 if action == "SET":
@@ -874,7 +967,17 @@ class PaperBroker:
                 raw_fill_events=tuple(fills_by_order.get(order_id, ())),
                 metadata_event=metadata,
                 fill_metadata=fill_metadata,
+                execution_context=(
+                    _entry_context(entry_contexts[order_id].payload.get("context"))
+                    if order_id in entry_contexts else None
+                ),
             )
+
+        for order_id, event in entry_contexts.items():
+            if order_id not in orders:
+                raise PaperReconciliationError("entry context has no paper order")
+            _validate_entry_context_binding(event, orders[order_id], snapshot, order_metadata[order_id])
+        _validate_executions(snapshot, orders, executions, entry_contexts, fills_by_order, status_events)
 
         paper_fill_ids = {
             event.event_id
@@ -988,6 +1091,20 @@ class PaperBroker:
             fill_price = _decimal(_payload_number(payload, "price"))
             fee = _decimal(_payload_number(payload, "fee"))
             side = _payload_text(payload, "side")
+            if fill_id in paper_fill_ids:
+                bound_order = orders[_payload_text(payload, "order_id")]
+                if bound_order.execution_context is not None:
+                    context_event = entry_contexts[bound_order.order_id]
+                    if context_event.sequence >= raw.sequence or btc != 0:
+                        raise PaperReconciliationError("entry context is not before a flat BUY fill")
+                    cap = _execution_quantity(bound_order, float(fill_price), float(cash))
+                    if quantity > _decimal(min(bound_order.requested_quantity, cap)):
+                        raise PaperReconciliationError("paper fill exceeds actual-open execution cap")
+                    terminal_reason = status_events[bound_order.order_id][-1].payload["reason"]
+                    if terminal_reason == "EXECUTION_CAP" and not (
+                        cap < bound_order.requested_quantity and quantity == _decimal(cap)
+                    ):
+                        raise PaperReconciliationError("execution-cap cancellation contradicts fill")
             if side == "BUY":
                 cash -= quantity * fill_price + fee
                 btc += quantity
@@ -1165,6 +1282,7 @@ class PaperBroker:
 
         return _Ledger(
             snapshot=snapshot,
+            position_observations=_validated_position_observations(snapshot, orders, tuple(paper_fills)),
             orders=orders,
             active_orders=tuple(
                 sorted(active_orders, key=lambda item: (item.signal_at_utc, item.order_id))
@@ -1186,6 +1304,7 @@ def _paper_order_from_evidence(
     raw_fill_events: tuple[StoredEvent, ...],
     metadata_event: StoredEvent,
     fill_metadata: Mapping[str, StoredEvent],
+    execution_context: Mapping[str, object] | None = None,
 ) -> PaperOrder:
     metadata = metadata_event.payload
     _require_evidence_keys(
@@ -1351,6 +1470,14 @@ def _paper_order_from_evidence(
                 reason="INSUFFICIENT_CASH",
             )
             final_status = OrderStatus.INSUFFICIENT_CASH
+        elif execution_context is not None and status_values == [
+            OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.REJECTED,
+        ]:
+            _validate_status_identity(
+                status_events[2], key, f"{key}:execution-cap:{eligible_text}",
+                reason="EXECUTION_CAP",
+            )
+            final_status = OrderStatus.REJECTED
         else:
             raise PaperReconciliationError("paper no-fill lifecycle is invalid")
         if len(status_events) == 3:
@@ -1402,7 +1529,10 @@ def _paper_order_from_evidence(
             canceled,
             key,
             f"{key}:cancel-remainder:{eligible_text}",
-            reason="PARTIAL_REMAINDER",
+            reason=(
+                "EXECUTION_CAP" if execution_context is not None
+                and canceled.payload["reason"] == "EXECUTION_CAP" else "PARTIAL_REMAINDER"
+            ),
         )
         meta_fill = fill_metadata.get(raw_fill.event_id)
         if meta_fill is None or not (
@@ -1430,7 +1560,210 @@ def _paper_order_from_evidence(
         eligible_open_utc=eligible_time,
         fee_rate=fee_rate,
         slippage_rate=slippage_rate,
+        execution_context=execution_context,
     )
+
+
+def _entry_context_id(order_id: str) -> str:
+    return f"paper-entry-context:{sha256(order_id.encode('utf-8')).hexdigest()}"
+
+
+def _execution_id(order_id: str) -> str:
+    return f"paper-execution:{sha256(order_id.encode('utf-8')).hexdigest()}"
+
+
+def _validate_executions(snapshot, orders, executions, contexts, fills, statuses) -> None:
+    for order_id, event in executions.items():
+        payload = event.payload
+        _require_evidence_keys(payload, {"version", "order_id", "reference_price", "attempted_quantity"}, "execution")
+        order = orders.get(order_id)
+        context = contexts.get(order_id)
+        if (order is None or context is None or order.side != "BUY"
+            or type(payload["version"]) is not int or payload["version"] != 1
+            or event.event_id != _execution_id(order_id)
+            or event.occurred_at_utc != order.eligible_open_utc
+            or event.sequence <= context.sequence):
+            raise PaperReconciliationError("execution ancestry is invalid")
+        reference = _payload_number(payload, "reference_price")
+        attempted = _payload_number(payload, "attempted_quantity")
+        if reference <= 0 or not 0 < attempted <= order.requested_quantity:
+            raise PaperReconciliationError("execution prices or quantities are invalid")
+        cash = Decimal("100")
+        btc = Decimal("0")
+        for raw in snapshot.event_evidence:
+            if raw.sequence >= event.sequence:
+                break
+            if raw.event_type == "FILL":
+                quantity = _decimal(raw.payload["quantity"])
+                value = quantity * _decimal(raw.payload["price"])
+                fee = _decimal(raw.payload["fee"])
+                if raw.payload["side"] == "BUY":
+                    cash -= value + fee
+                    btc += quantity
+                else:
+                    cash += value - fee
+                    btc -= quantity
+        if btc != 0:
+            raise PaperReconciliationError("execution must begin flat")
+        price = _computed_fill_price(reference, order.slippage_rate, "BUY")
+        cap = _execution_quantity(order, price, float(cash))
+        quantity = min(attempted, cap)
+        raw_fills = fills.get(order_id, ())
+        terminal = statuses[order_id][-1]
+        if terminal.sequence <= event.sequence:
+            raise PaperReconciliationError("execution is not before terminal evidence")
+        if quantity <= 0:
+            if raw_fills or order.status is not OrderStatus.REJECTED or terminal.payload["reason"] != "EXECUTION_CAP":
+                raise PaperReconciliationError("zero execution cap lacks exact rejection")
+        else:
+            if (len(raw_fills) != 1 or raw_fills[0].sequence <= event.sequence
+                or raw_fills[0].payload["quantity"] != quantity or raw_fills[0].payload["price"] != price):
+                raise PaperReconciliationError("execution contradicts actual-open fill")
+            if quantity < order.requested_quantity:
+                expected_reason = "EXECUTION_CAP" if cap < attempted else "PARTIAL_REMAINDER"
+                if terminal.payload["reason"] != expected_reason:
+                    raise PaperReconciliationError("execution cap or partial reason is inconsistent")
+    for order in orders.values():
+        if (order.execution_context is not None and order.status is not OrderStatus.ACCEPTED
+            and order.order_id not in executions):
+            raise PaperReconciliationError("bound entry terminal lacks execution evidence")
+
+
+def _position_observation_id(order_id: str, at: datetime) -> str:
+    identity = f"{order_id}|{_canonical_datetime(at)}"
+    return f"paper-position:{sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def _validated_position_observations(
+    snapshot: PaperSnapshot, orders: Mapping[str, PaperOrder], fills: tuple[PaperFill, ...],
+) -> Mapping[str, StoredEvent]:
+    observations: dict[str, StoredEvent] = {}
+    buys = {fill.order_id: fill for fill in fills if fill.side == "BUY"}
+    initial_stops: dict[str, float] = {}
+    for event in snapshot.event_evidence:
+        payload = event.payload
+        if (event.event_type == "PAPER_STOP" and payload.get("action") == "SET"
+            and payload.get("reason") == "HARD_STOP"):
+            initial_stops.setdefault(str(payload["source_id"]), float(payload["stop_price"]))
+        if event.event_type != "PAPER_POSITION":
+            continue
+        _require_evidence_keys(payload, {"version", "order_id", "fill_id", "previous_event_id",
+                                        "initial_stop", "high_water", "candle_highs"}, "position observation")
+        order_id = _payload_text(payload, "order_id")
+        fill = buys.get(order_id)
+        if (type(payload["version"]) is not int or payload["version"] != 1 or fill is None
+            or payload["fill_id"] != fill.fill_id
+            or _paper_source_at_sequence(event.sequence, snapshot.event_evidence, orders) != order_id
+            or event.event_id != _position_observation_id(order_id, event.occurred_at_utc)):
+            raise PaperReconciliationError("position observation ancestry is invalid")
+        prior = observations.get(order_id)
+        if payload["previous_event_id"] != (prior.event_id if prior else None):
+            raise PaperReconciliationError("position observation chain is invalid")
+        initial = _payload_number(payload, "initial_stop")
+        expected_initial = initial_stops.get(order_id)
+        context = orders[order_id].execution_context
+        if context is not None:
+            expected_initial = fill.fill_price - float(context["initial_atr_mult"]) * float(context["entry_atr"])
+        if (expected_initial is None or initial <= 0.0 or initial >= fill.fill_price
+            or initial != expected_initial or (prior and initial != prior.payload["initial_stop"])):
+            raise PaperReconciliationError("position observation changes immutable initial risk")
+        highs = payload["candle_highs"]
+        if not isinstance(highs, (list, tuple)) or not highs:
+            raise PaperReconciliationError("position observation has no candle evidence")
+        next_at = prior.occurred_at_utc + _FOUR_HOURS if prior else fill.fill_time
+        high_water = float(prior.payload["high_water"]) if prior else 0.0
+        for item in highs:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise PaperReconciliationError("position candle evidence schema is invalid")
+            at = _evidence_timestamp(item[0])[1]
+            high = _number(item[1], "position high")
+            if at != next_at or high <= 0.0:
+                raise PaperReconciliationError("position candle history is not contiguous")
+            high_water = max(high_water, high)
+            next_at += _FOUR_HOURS
+        if next_at - _FOUR_HOURS != event.occurred_at_utc or _payload_number(payload, "high_water") != high_water:
+            raise PaperReconciliationError("position high-water or boundary is inconsistent")
+        observations[order_id] = event
+    return observations
+
+
+def _entry_context(value: object) -> Mapping[str, object]:
+    keys = {"signal_price", "entry_atr", "initial_atr_mult", "baseline_atr_pct",
+            "risk_rate", "exposure_cap", "risk_event_id"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise PaperReconciliationError("entry context schema is invalid")
+    result = {key: _payload_number(value, key) for key in keys - {"risk_event_id"}}
+    if any(number <= 0.0 for number in result.values()):
+        raise PaperReconciliationError("entry context values must be positive")
+    if result["risk_rate"] > .02 or result["exposure_cap"] > .70:
+        raise PaperReconciliationError("entry context exceeds approved risk limits")
+    result["risk_event_id"] = _payload_text(value, "risk_event_id")
+    return MappingProxyType(result)
+
+
+def _validate_entry_context_binding(
+    event: StoredEvent, order: PaperOrder, snapshot: PaperSnapshot, metadata: StoredEvent,
+) -> None:
+    _require_evidence_keys(event.payload, {"order_id", "context", "version"}, "entry context")
+    if (type(event.payload["version"]) is not int or event.payload["version"] != 1
+        or event.event_id != _entry_context_id(order.order_id)
+        or not order.signal_at_utc <= event.occurred_at_utc <= order.eligible_open_utc or order.side != "BUY"
+        or metadata.sequence >= event.sequence):
+        raise PaperReconciliationError("entry context order ancestry is invalid")
+    previous = next(item for item in snapshot.event_evidence if item.sequence == event.sequence - 1)
+    if event.occurred_at_utc != max(order.signal_at_utc, previous.occurred_at_utc):
+        raise PaperReconciliationError("entry context timestamp is not causal")
+    context = order.execution_context
+    risk = next((item for item in snapshot.event_evidence
+                 if item.event_id == context["risk_event_id"]), None)
+    signal_text = _canonical_datetime(order.signal_at_utc)
+    if (risk is None or risk.event_type != "BREAKER_STATE" or risk.sequence >= metadata.sequence
+        or risk.payload.get("last_risk_at_utc") != signal_text
+        or risk.payload.get("decision_risk_rate") != context["risk_rate"]
+        or risk.payload.get("decision_exposure_cap") != context["exposure_cap"]):
+        raise PaperReconciliationError("entry context lacks same-signal risk ancestry")
+    cash = Decimal("100")
+    btc = Decimal("0")
+    for raw in snapshot.event_evidence:
+        if raw.sequence >= metadata.sequence:
+            break
+        if raw.event_type == "FILL":
+            q = _decimal(raw.payload["quantity"])
+            notional = q * _decimal(raw.payload["price"])
+            fee = _decimal(raw.payload["fee"])
+            if raw.payload["side"] == "BUY":
+                cash -= notional + fee
+                btc += q
+            else:
+                cash += notional - fee
+                btc -= q
+    close = float(context["signal_price"])
+    size = calculate_size(
+        equity=float(cash), cash=float(cash), entry=close,
+        stop=close - float(context["initial_atr_mult"]) * float(context["entry_atr"]),
+        current_atr_pct=float(context["entry_atr"]) / close,
+        baseline_atr_pct=float(context["baseline_atr_pct"]),
+        risk_rate=float(context["risk_rate"]), exposure_cap=float(context["exposure_cap"]),
+        costs=CostConfig(order.fee_rate, order.slippage_rate),
+    )
+    if btc != 0 or order.requested_quantity > size.quantity + 1e-12:
+        raise PaperReconciliationError("entry context contradicts signal sizing")
+
+
+def _execution_quantity(order: PaperOrder, fill_price: float, cash: float) -> float:
+    context = order.execution_context
+    atr = float(context["entry_atr"])
+    result = calculate_size(
+        equity=cash, cash=cash, entry=fill_price,
+        stop=fill_price - float(context["initial_atr_mult"]) * atr,
+        current_atr_pct=atr / fill_price, baseline_atr_pct=float(context["baseline_atr_pct"]),
+        risk_rate=float(context["risk_rate"]), exposure_cap=float(context["exposure_cap"]),
+        costs=CostConfig(order.fee_rate, 0.0),
+    ).quantity
+    while result > 0.0 and (_decimal(result) * _decimal(fill_price)
+                           + _decimal(_computed_fee(result, fill_price, order.fee_rate))) > _decimal(cash):
+        result = math.nextafter(result, 0.0)
+    return result
 
 
 def _paper_fill_from_evidence(

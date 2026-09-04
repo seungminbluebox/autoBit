@@ -416,7 +416,6 @@ class PaperService:
 
             created_ids: list[str] = []
             filled_ids: list[str] = []
-            initial_stop_created = False
             with self._store.transaction():
                 reconciliation = self._broker.reconcile()
                 filled_entry_this_bar = False
@@ -427,6 +426,10 @@ class PaperService:
                     if eligible < bar_at:
                         raise PaperServiceError("active market order missed its eligible open")
                     if eligible == bar_at:
+                        if order.side == "BUY" and order.execution_context is None:
+                            context = self._legacy_entry_context(order, enriched)
+                            if context is not None:
+                                self._broker.bind_entry_context(order.order_id, context)
                         fill = self._broker.process_open(
                             order.order_id,
                             bar_at,
@@ -451,7 +454,6 @@ class PaperService:
                         enriched,
                         active_after=(bar_at if filled_entry_this_bar else None),
                     )
-                    initial_stop_created = True
                     reconciliation = self._broker.reconcile()
                 if reconciliation.btc_quantity > 0.0 and not reconciliation.active_orders:
                     stop_fill = self._broker.process_intrabar_stop(
@@ -463,6 +465,8 @@ class PaperService:
                         filled_ids.append(stop_fill.order_id)
 
             reconciliation = self._broker.reconcile()
+            if reconciliation.btc_quantity > 0.0:
+                self._observe_position(bar_at, reconciliation, enriched)
             equity = _mark_to_market(reconciliation, float(row["close"]))
             risk_decision = self._risk_decision(
                 bar_at,
@@ -488,7 +492,7 @@ class PaperService:
                         reason=exit_reason,
                     )
                     created_ids.append(order.order_id)
-                elif not initial_stop_created:
+                else:
                     self._ensure_stop(bar_at, row, reconciliation, enriched)
             elif (
                 reconciliation.btc_quantity == 0.0
@@ -516,6 +520,7 @@ class PaperService:
                         bar_at,
                         quantity=size.quantity,
                         reason="ENTRY",
+                        execution_context=self._entry_context(bar_at, row, risk_decision),
                     )
                     created_ids.append(order.order_id)
                     self._fault("after_order_acceptance")
@@ -537,6 +542,79 @@ class PaperService:
         snapshot = self._store.replay_state()
         _validate_health_and_risk_chain(snapshot)
         return snapshot
+
+    def _entry_context(
+        self, bar_at: datetime, row: pd.Series, decision: RiskDecision,
+    ) -> dict[str, object]:
+        chain = _validate_health_and_risk_chain(self._store.replay_state())
+        event = chain.latest_risk_event
+        if event is None or chain.projection.last_risk_at != bar_at:
+            raise PaperServiceError("entry sizing lacks same-signal risk evidence")
+        return {
+            "signal_price": float(row["close"]),
+            "entry_atr": float(row[f"atr_{self._strategy.atr_period}"]),
+            "initial_atr_mult": self._strategy.initial_atr_mult,
+            "baseline_atr_pct": float(row["baseline_atr_pct"]),
+            "risk_rate": decision.risk_rate, "exposure_cap": decision.exposure_cap,
+            "risk_event_id": event.event_id,
+        }
+
+    def _observe_position(
+        self, bar_at: datetime, reconciliation: PaperReconciliation, enriched: pd.DataFrame,
+    ) -> None:
+        entry = _open_entry(reconciliation)
+        observation = self._broker.position_observation(entry.order_id)
+        if observation is not None and observation.occurred_at_utc >= bar_at:
+            if observation.occurred_at_utc > bar_at:
+                raise PaperServiceError("position observation is ahead of current candle")
+            return
+        start = observation.occurred_at_utc + _FOUR_HOURS if observation else entry.fill_time
+        end = bar_at + _FOUR_HOURS
+        held = enriched.loc[(enriched.index >= start) & (enriched.index < end)]
+        expected = pd.date_range(start, bar_at, freq="4h", tz="UTC")
+        if not held.index.equals(expected):
+            loader = getattr(self._source, "load_position_candles", None)
+            if loader is None:
+                raise PaperServiceError("public position-history backfill is unavailable")
+            held = loader(start, end)
+        held = _validated_position_frame(held, start, end)
+        initial = (float(observation.payload["initial_stop"]) if observation
+                   else self._broker.initial_stop(entry.order_id))
+        if initial is None:
+            raise PaperServiceError("position history lacks immutable initial protection")
+        self._broker.observe_position(
+            entry.order_id,
+            [[_canonical_datetime(at.to_pydatetime()), float(row["high"])] for at, row in held.iterrows()],
+            initial,
+        )
+        self._fault("after_position_observation")
+
+    def _legacy_entry_context(
+        self, order: PaperOrder, enriched: pd.DataFrame,
+    ) -> dict[str, object] | None:
+        snapshot = self._store.replay_state()
+        # Direct broker orders retain their historical generic contract. A service
+        # order is recognized by its canonical same-signal risk ancestry.
+        events = [event for event in snapshot.event_evidence
+                  if event.event_type == "BREAKER_STATE"
+                  and event.payload.get("last_risk_at_utc") == _canonical_datetime(order.signal_at_utc)]
+        if not events:
+            return None
+        risk = _risk_state_from_payload(events[-1].payload)
+        signal_end = order.signal_at_utc + _FOUR_HOURS
+        raw = self._source.load_completed_candles(signal_end)
+        original = compute_trend_indicators(canonicalize_ohlcv(raw, signal_end).frame, self._strategy)
+        if len(original) != self._strategy.warmup_bars + 1 or original.index[-1] != order.signal_at_utc:
+            raise PaperServiceError("legacy entry requires its original complete signal window")
+        signal = original.loc[pd.Timestamp(order.signal_at_utc)]
+        return {
+            "signal_price": float(signal["close"]),
+            "entry_atr": float(signal[f"atr_{self._strategy.atr_period}"]),
+            "initial_atr_mult": self._strategy.initial_atr_mult,
+            "baseline_atr_pct": float(signal["baseline_atr_pct"]),
+            "risk_rate": risk.decision.risk_rate, "exposure_cap": risk.decision.exposure_cap,
+            "risk_event_id": events[-1].event_id,
+        }
 
     def _risk_decision(
         self,
@@ -991,6 +1069,43 @@ def _open_position(
     bar_at: datetime,
     config: StrategyConfig,
 ) -> _OpenPosition:
+    open_entry = _open_entry(reconciliation)
+    order = broker.order(open_entry.order_id)
+    observation = broker.position_observation(order.order_id)
+    if observation is not None and observation.occurred_at_utc == bar_at:
+        initial = float(observation.payload["initial_stop"])
+        active = reconciliation.active_stop
+        return _OpenPosition(
+            order, open_entry, open_entry.fill_price, initial,
+            active.stop_price if active else initial, float(observation.payload["high_water"]),
+            int((bar_at - open_entry.fill_time) / _FOUR_HOURS),
+        )
+    initial_stop = broker.initial_stop(order.order_id)
+    if initial_stop is None and order.execution_context is not None:
+        atr = float(order.execution_context["entry_atr"])
+        initial_stop = open_entry.fill_price - config.initial_atr_mult * atr
+    elif initial_stop is None:
+        signal_at = pd.Timestamp(order.signal_at_utc)
+        if signal_at not in enriched.index:
+            raise PaperServiceError("entry signal candle is absent from public history")
+        signal_row = enriched.loc[signal_at]
+        atr = _positive_finite(signal_row.get(f"atr_{config.atr_period}"), "entry ATR")
+        initial_stop = open_entry.fill_price - config.initial_atr_mult * atr
+    if not math.isfinite(initial_stop) or initial_stop <= 0.0:
+        raise PaperServiceError("reconstructed initial stop is invalid")
+    held = enriched.loc[(enriched.index >= open_entry.fill_time) & (enriched.index <= bar_at)]
+    highs = pd.to_numeric(held["high"], errors="coerce")
+    if held.empty or not highs.notna().all():
+        raise PaperServiceError("held candle history is incomplete")
+    active = reconciliation.active_stop
+    return _OpenPosition(
+        order, open_entry, open_entry.fill_price, initial_stop,
+        active.stop_price if active else initial_stop, float(highs.max()),
+        int((bar_at - open_entry.fill_time) / _FOUR_HOURS),
+    )
+
+
+def _open_entry(reconciliation: PaperReconciliation) -> PaperFill:
     if reconciliation.btc_quantity <= 0.0:
         raise PaperServiceError("cannot reconstruct a flat position")
     inventory = Decimal("0")
@@ -1011,35 +1126,18 @@ def _open_position(
     if open_entry is None or inventory != Decimal(str(reconciliation.btc_quantity)):
         raise PaperServiceError("open position does not reconcile to paper fills")
 
-    order = broker.order(open_entry.order_id)
-    signal_at = pd.Timestamp(order.signal_at_utc)
-    if signal_at not in enriched.index:
-        raise PaperServiceError("entry signal candle is absent from public history")
-    signal_row = enriched.loc[signal_at]
-    atr = _positive_finite(signal_row.get(f"atr_{config.atr_period}"), "entry ATR")
-    initial_stop = open_entry.fill_price - config.initial_atr_mult * atr
-    if not math.isfinite(initial_stop) or initial_stop <= 0.0:
-        raise PaperServiceError("reconstructed initial stop is invalid")
+    return open_entry
 
-    held = enriched.loc[
-        (enriched.index >= pd.Timestamp(open_entry.fill_time))
-        & (enriched.index <= pd.Timestamp(bar_at))
-    ]
-    highs = pd.to_numeric(held["high"], errors="coerce")
-    if held.empty or not highs.notna().all():
-        raise PaperServiceError("held candle history is incomplete")
-    high_water = float(highs.max())
-    active = reconciliation.active_stop
-    current_stop = active.stop_price if active is not None else initial_stop
-    return _OpenPosition(
-        order=order,
-        entry_fill=open_entry,
-        entry_price=open_entry.fill_price,
-        initial_stop=initial_stop,
-        current_stop=current_stop,
-        high_water=high_water,
-        held_bars=len(held) - 1,
-    )
+
+def _validated_position_frame(frame: pd.DataFrame, start: datetime, end: datetime) -> pd.DataFrame:
+    expected = pd.date_range(start, end - _FOUR_HOURS, freq="4h", tz="UTC")
+    if (not isinstance(frame, pd.DataFrame) or not isinstance(frame.index, pd.DatetimeIndex)
+        or not frame.index.equals(expected)):
+        raise PaperServiceError("position history must cover its exact contiguous interval")
+    canonical = canonicalize_ohlcv(frame, end).frame
+    if not canonical.index.equals(expected) or not all(_safe_execution_row(row) for _, row in canonical.iterrows()):
+        raise PaperServiceError("position history contains unsafe candle evidence")
+    return canonical
 
 
 def _advance_risk_state(

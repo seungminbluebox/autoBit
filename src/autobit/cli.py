@@ -324,12 +324,23 @@ class _PublicPaperCandleSource:
 
     def load_completed_candles(self, end_utc: datetime) -> pd.DataFrame:
         end = _paper_end(end_utc)
+        start = end - timedelta(hours=4 * _PAPER_HISTORY_BARS)
+        identity = hashlib.sha256(_format_utc(end).encode("utf-8")).hexdigest()
+        return self._load_range(start, end, identity)
+
+    def load_position_candles(self, start_utc: datetime, end_utc: datetime) -> pd.DataFrame:
+        start, end = _paper_end(start_utc), _paper_end(end_utc)
+        bars = (end - start) / timedelta(hours=4)
+        if not 0 < bars <= StrategyConfig().max_holding_bars + 1:
+            raise ValueError("position backfill exceeds approved holding interval")
+        identity = hashlib.sha256(f"position:{_format_utc(start)}:{_format_utc(end)}".encode("utf-8")).hexdigest()
+        return self._load_range(start, end, identity)
+
+    def _load_range(self, start: datetime, end: datetime, identity: str) -> pd.DataFrame:
         if self._data_dir.exists() and (
             not self._data_dir.is_dir() or self._data_dir.is_symlink()
         ):
             raise ValueError("paper data directory must be a real directory")
-        start = end - timedelta(hours=4 * _PAPER_HISTORY_BARS)
-        identity = hashlib.sha256(_format_utc(end).encode("utf-8")).hexdigest()
         evidence_root = self._data_dir / "KRW-BTC-240" / identity
         if evidence_root.exists() and (
             not evidence_root.is_dir() or evidence_root.is_symlink()
@@ -388,7 +399,7 @@ class _PublicPaperCandleSource:
             frame.index = pd.to_datetime(frame.pop("timestamp"), utc=True, errors="raise")
         except (TypeError, ValueError) as error:
             raise _CandleTimestampError("public candle timestamps are invalid") from error
-        return _validated_paper_frame(frame, end)
+        return _validated_public_frame(frame, start, end)
 
 
 class _ObservedCandleSource:
@@ -461,6 +472,21 @@ class _ObservedCandleSource:
             frame = self.prepare(end)
             self._prepared.pop(end, None)
         return frame.copy(deep=True)
+
+    def load_position_candles(self, start_utc: datetime, end_utc: datetime) -> pd.DataFrame:
+        observed = _clock_now(self._clock)
+        monitor = HealthMonitor.from_store(self._store)
+        try:
+            loader = getattr(self._source, "load_position_candles")
+            return _validated_public_frame(loader(start_utc, end_utc), start_utc, end_utc)
+        except Exception as error:
+            if isinstance(error, (ValueError, TypeError)):
+                monitor.record_schema_check(False, observed)
+            else:
+                monitor.record_api_failure(observed)
+            event = self._persist(monitor, end_utc, observed, "position-history-failure")
+            self._notify(event)
+            raise
 
     def _persist(
         self,
@@ -981,6 +1007,10 @@ def _validate_checkpointless_paper_evidence(
 
 
 def _validated_paper_frame(frame: object, end: datetime) -> pd.DataFrame:
+    return _validated_public_frame(frame, end - timedelta(hours=4 * _PAPER_HISTORY_BARS), end)
+
+
+def _validated_public_frame(frame: object, start: datetime, end: datetime) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame):
         raise _CandleSchemaError("completed candle source must return a pandas DataFrame")
     required = {"open", "high", "low", "close", "volume"}
@@ -1000,14 +1030,14 @@ def _validated_paper_frame(frame: object, end: datetime) -> pd.DataFrame:
         raise _CandleLatestError("completed candle source crossed its exclusive end")
     expected_latest = end - timedelta(hours=4)
     expected_index = pd.date_range(
+        start=pd.Timestamp(start),
         end=pd.Timestamp(expected_latest),
-        periods=_PAPER_HISTORY_BARS,
         freq="4h",
         tz="UTC",
     )
-    if len(index) != _PAPER_HISTORY_BARS or not index.equals(expected_index):
+    if not index.equals(expected_index):
         raise _CandleLatestError(
-            "paper candle history must contain exactly 601 contiguous completed bars"
+            "paper candle history must contain the exact contiguous completed interval"
         )
     try:
         canonical = canonicalize_ohlcv(frame, end).frame
@@ -1015,7 +1045,7 @@ def _validated_paper_frame(frame: object, end: datetime) -> pd.DataFrame:
         raise _CandleSchemaError("completed candle values are invalid") from error
     if canonical.empty or canonical.index[-1].to_pydatetime() != expected_latest:
         raise _CandleLatestError("exact latest completed candle is missing")
-    if len(canonical) != _PAPER_HISTORY_BARS or not canonical.index.equals(expected_index):
+    if not canonical.index.equals(expected_index):
         raise _CandleLatestError("600-bar warmup plus execution candle is incomplete")
     if canonical.loc[:, ["open", "high", "low", "close", "volume"]].isna().any().any():
         raise _CandleSchemaError("paper candle history contains invalid values")

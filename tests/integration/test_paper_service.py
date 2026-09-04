@@ -50,6 +50,69 @@ class _Source:
         return self.frame.copy()
 
 
+@pytest.mark.parametrize("held_bars", [586, 588, 600, 601, 1094, 1095])
+def test_rolling_601_long_hold_bootstraps_once_and_exits_at_1095(
+    tmp_path: Path, held_bars: int,
+) -> None:
+    from autobit.cli import _validated_paper_frame
+
+    bar_at = END - timedelta(hours=4)
+    fill_at = bar_at - timedelta(hours=4 * held_bars)
+    full = _history(END + timedelta(hours=4), held_bars + 603)
+    full.loc[fill_at, "high"] = 106.0
+
+    class RollingSource:
+        backfills: list[tuple[datetime, datetime]] = []
+
+        def load_completed_candles(self, end_utc):
+            frame = full.loc[full.index < end_utc].tail(601)
+            return _validated_paper_frame(frame, end_utc)
+
+        def load_position_candles(self, start_utc, end_utc):
+            self.backfills.append((start_utc, end_utc))
+            return full.loc[(full.index >= start_utc) & (full.index < end_utc)].copy()
+
+    source = RollingSource()
+    path = tmp_path / "rolling-long.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    broker = PaperBroker(store, CostConfig(0, 0))
+    order = broker.submit_entry(fill_at - timedelta(hours=4), quantity=.2)
+    broker.process_open(order.order_id, fill_at, open_price=100)
+    broker.set_stop(fill_at, 95, active_after=fill_at, source_id=order.order_id)
+    store.close()
+    store = SQLiteStore(path)
+    store.initialize()
+    for end in (END, END + timedelta(hours=4)):
+        service = PaperService(
+            source=source, store=store, broker=PaperBroker(store, CostConfig(0, 0)),
+            clock=_FrozenClock(end + timedelta(minutes=10)), costs=CostConfig(0, 0),
+            lease_owner="long-hold", lease_token=f"long-hold-{end}",
+        )
+        result = service.process_completed_candle(end)
+        assert result.status is CycleStatus.PROCESSED
+        state = PaperBroker(store).reconcile()
+        if end == END:
+            assert state.btc_quantity == .2
+            assert tuple(order.reason for order in state.active_orders) == (
+                ("MAX_HOLD_EXIT",) if held_bars == 1095 else ()
+            )
+        if end > END and held_bars == 1095:
+            trade, = state.completed_trades
+            assert trade.exit_time == END
+            assert trade.exit_reason == "MAX_HOLD_EXIT"
+        assert service.process_completed_candle(end).status is CycleStatus.ALREADY_PROCESSED
+        store.close()
+        store = SQLiteStore(path)
+        store.initialize()
+        assert PaperBroker(store).reconcile() == state
+    # Age600 still includes every held candle; only the signal has aged out.
+    assert len(source.backfills) == (1 if held_bars > 600 else 0)
+    if source.backfills:
+        assert source.backfills == [(fill_at, END)]
+    store.close()
+
+
 class _HalfEntryBroker(PaperBroker):
     """Use the real broker lifecycle while injecting a half-sized BUY fill."""
 
@@ -965,9 +1028,13 @@ def test_gap_down_entry_persists_fill_price_based_stop_from_the_fill_boundary(
     assert reconciliation.position_state is PositionState.LONG
     assert reconciliation.fills[0].fill_price == 90.0
     assert reconciliation.active_stop is not None
-    assert reconciliation.active_stop.stop_price == pytest.approx(85.0)
-    assert reconciliation.active_stop.stop_price < reconciliation.fills[0].fill_price
-    assert reconciliation.active_stop.active_after_utc == bar_at
+    initial = next(event for event in store.replay_state().event_evidence
+                   if event.event_type == "PAPER_STOP" and event.payload.get("reason") == "HARD_STOP")
+    assert initial.payload["stop_price"] == pytest.approx(85.0)
+    assert initial.payload["active_after_utc"] == bar_at.isoformat().replace("+00:00", "Z")
+    # High101 reaches +2R after a90 fill; close-time ATR38/14 yields101 -3*(38/14).
+    assert reconciliation.active_stop.stop_price == pytest.approx(92.85714285714286)
+    assert reconciliation.active_stop.active_after_utc == END
 
 
 def test_prior_stop_uses_current_gap_or_low_before_close_decisions(tmp_path: Path) -> None:

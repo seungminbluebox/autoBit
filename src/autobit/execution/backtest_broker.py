@@ -83,6 +83,19 @@ class EventBacktestBroker(bt.brokers.BackBroker):
             self._pre_match_hook()
         super().next()
 
+    def cancel(self, order, bracket=False):
+        """Retire a submitted stop before its next-bar replacement is checked."""
+        try:
+            self.submitted.remove(order)
+        except ValueError:
+            return super().cancel(order, bracket=bracket)
+        order.cancel()
+        self.notify(order)
+        self._ococheck(order)
+        if not bracket:
+            self._bracketize(order, cancel=True)
+        return True
+
     def cancel_end_of_data(
         self,
         order: bt.Order,

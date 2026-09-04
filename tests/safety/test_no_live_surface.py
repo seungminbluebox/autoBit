@@ -1098,6 +1098,10 @@ def test_only_root_generated_pytest_basetemp_is_not_a_repository_source_surface(
     nested_probe = Path("src/autobit/.test-tmp/_safety_nested_fixture/probe.py")
     assert not root_probe.exists()
     assert not nested_probe.exists()
+    owned_parents = tuple(
+        parent for parent in (root_probe.parent.parent, nested_probe.parent.parent)
+        if not parent.exists()
+    )
     root_probe.parent.mkdir(parents=True)
     nested_probe.parent.mkdir(parents=True)
     root_probe.write_text("import pyupbit\n", encoding="utf-8")
@@ -1116,7 +1120,29 @@ def test_only_root_generated_pytest_basetemp_is_not_a_repository_source_surface(
         root_probe.parent.rmdir()
         nested_probe.unlink()
         nested_probe.parent.rmdir()
-        nested_probe.parent.parent.rmdir()
+        for parent in owned_parents:
+            parent.rmdir()
+
+
+@pytest.mark.parametrize("nonempty", [False, True], ids=["empty-parent", "nonempty-parent"])
+def test_generated_probe_cleanup_preserves_preexisting_parent(nonempty: bool) -> None:
+    parent = Path("src/autobit/.test-tmp")
+    owned_parent = not parent.exists()
+    parent.mkdir(exist_ok=True)
+    marker = parent / "_ownership_regression.txt"
+    assert not marker.exists()
+    if nonempty:
+        marker.write_text("unrelated retained content", encoding="utf-8")
+    try:
+        test_only_root_generated_pytest_basetemp_is_not_a_repository_source_surface()
+        assert parent.is_dir()
+        if nonempty:
+            assert marker.read_text(encoding="utf-8") == "unrelated retained content"
+    finally:
+        if marker.exists():
+            marker.unlink()
+        if owned_parent and parent.exists():
+            parent.rmdir()
 
 
 def test_worktree_surface_scan_still_includes_an_unignored_package_module() -> None:

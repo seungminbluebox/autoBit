@@ -101,6 +101,119 @@ def _raw_row(at: datetime) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("open_price", [110.0, 100.2, 99.0])
+@pytest.mark.parametrize("costs", [CostConfig(0.0, 0.0), CostConfig(0.0005, 0.0005)])
+def test_application_actual_open_caps_quantity_and_survives_reopen(
+    tmp_path: Path, open_price: float, costs: CostConfig,
+) -> None:
+    from autobit.backtest.engine import BacktestConfig, run_backtest
+    from autobit.config import StrategyConfig
+    from autobit.data.quality import canonicalize_ohlcv
+    from autobit.domain.models import OrderStatus
+    from autobit.indicators.trend import compute_trend_indicators
+
+    frame = _history(END + timedelta(hours=4), 602)
+    frame.loc[:, ["high", "low"]] = [100.1, 99.9]
+    frame.iloc[600] = [100, 100.3, 99.9, 100.2, 1]
+    frame.iloc[601] = [open_price, open_price + 1, open_price - .1, open_price, 1]
+    core = run_backtest(
+        compute_trend_indicators(canonicalize_ohlcv(frame, END + timedelta(hours=4)).frame, StrategyConfig()),
+        BacktestConfig(costs=costs),
+    )
+    core_buy = next(order for order in core.orders if order.side == "BUY" and order.filled_quantity > 0)
+    path = tmp_path / "actual-open.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    for index in (600, 601):
+        end = frame.index[index].to_pydatetime() + timedelta(hours=4)
+        clock = _Clock(end + timedelta(minutes=10))
+        app = _PaperApplication(
+            source=_FrameSource([frame.iloc[:index + 1].tail(601)]), store=store,
+            clock=clock, sleeper=_Sleeper(clock), notifier=None, costs=costs,
+            lease_owner="actual-open", lease_token=f"actual-open-{index}",
+        )
+        assert app.run_once().status is CycleStatus.PROCESSED
+        state = PaperBroker(store, costs).reconcile()
+        if index == 600:
+            requested = state.active_orders[0].requested_quantity
+        store.close()
+        store = SQLiteStore(path)
+        store.initialize()
+        assert PaperBroker(store, costs).reconcile() == state
+    fill, = state.fills
+    assert fill.quantity <= requested
+    assert fill.quantity * fill.fill_price <= 70.0 + 1e-10
+    assert fill.quantity == pytest.approx(core_buy.filled_quantity)
+    if open_price == 110.0:
+        assert fill.quantity == pytest.approx(70.0 / fill.fill_price)
+        assert PaperBroker(store).order(fill.order_id).status is OrderStatus.CANCELED
+        assert any(event.payload.get("reason") == "EXECUTION_CAP" for event in store.replay_state().event_evidence)
+    assert state.cash >= 0.0
+    assert PaperBroker(store).process_open(fill.order_id, frame.index[601].to_pydatetime(), open_price=open_price) is None
+    store.close()
+
+
+@pytest.mark.parametrize("adapter", ["paper", "core"])
+@pytest.mark.parametrize("next_open", [115.0, 105.0], ids=["touch", "gap"])
+def test_entry_close_trailing_protects_next_bar_without_retroactive_fill(
+    tmp_path: Path, adapter: str, next_open: float,
+) -> None:
+    from autobit.backtest.engine import BacktestConfig, run_backtest
+    from autobit.config import StrategyConfig
+    from autobit.data.quality import canonicalize_ohlcv
+    from autobit.indicators.trend import compute_trend_indicators
+
+    final_end = END + timedelta(hours=8)
+    frame = _history(final_end, 603)
+    frame.iloc[600] = [100, 103, 99, 102, 1]
+    frame.iloc[601] = [102, 120, 101, 115, 1]
+    frame.iloc[602] = [next_open, 116, min(104, next_open), 110, 1]
+    expected_stop = 109.95918367346938
+    expected_fill = min(next_open, expected_stop)
+    costs = CostConfig(0.0, 0.0)
+
+    if adapter == "core":
+        result = run_backtest(
+            compute_trend_indicators(canonicalize_ohlcv(frame, final_end).frame, StrategyConfig()),
+            BacktestConfig(costs=costs),
+        )
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert not any(order.reason == "DUPLICATE_EXIT" for order in result.orders)
+        assert any(order.stop_price == pytest.approx(expected_stop) for order in result.orders)
+    else:
+        path = tmp_path / "entry-close.sqlite3"
+        store = SQLiteStore(path)
+        store.initialize()
+        for index in (600, 601, 602):
+            end = frame.index[index].to_pydatetime() + timedelta(hours=4)
+            clock = _Clock(end + timedelta(minutes=10))
+            app = _PaperApplication(
+                source=_FrameSource([frame.iloc[:index + 1].tail(601)]),
+                store=store, clock=clock, sleeper=_Sleeper(clock), notifier=None,
+                costs=costs, lease_owner="entry-close", lease_token=f"entry-close-{index}",
+            )
+            assert app.run_once().status is CycleStatus.PROCESSED
+            state = PaperBroker(store, costs).reconcile()
+            if index == 601:
+                assert len(state.fills) == 1  # entry low is below the new stop, not initial
+                assert state.active_stop.stop_price == pytest.approx(expected_stop)
+                assert state.active_stop.active_after_utc == frame.index[602]
+            before = state
+            store.close()
+            store = SQLiteStore(path)
+            store.initialize()
+            assert PaperBroker(store, costs).reconcile() == before
+        trade, = state.completed_trades
+        assert len([fill for fill in state.fills if fill.side == "SELL"]) == 1
+        assert state.btc_quantity == 0.0
+        store.close()
+    assert trade.exit_reason == "TRAILING_STOP"
+    assert trade.entry_time == frame.index[601]
+    assert trade.exit_time == frame.index[602]
+    assert trade.exit_price == pytest.approx(expected_fill)
+
+
 def _append_cycle(
     store: SQLiteStore,
     end: datetime,
@@ -809,6 +922,23 @@ def _ledger_file_image(path: Path) -> tuple[tuple[str, bytes, int, int], ...]:
         )
         for item in sorted(path.parent.iterdir(), key=lambda candidate: candidate.name)
     )
+
+
+def test_public_position_backfill_has_range_bound_cache_and_preserves_normal_window(tmp_path: Path) -> None:
+    start = END - timedelta(hours=4 * 701)
+    rows = [_raw_row(start + timedelta(hours=4 * index)) for index in range(-1, 701)]
+    source = _PublicPaperCandleSource(tmp_path, client=_PublicClient(list(reversed(rows))))
+    normal = source.load_completed_candles(END)
+    historical = source.load_position_candles(start, END)
+    assert len(normal) == 601
+    assert len(historical) == 701
+    assert historical.index[0] == start
+    assert len(tuple(tmp_path.rglob("checkpoint.json"))) == 2
+    offline = _PublicClient([])
+    reopened = _PublicPaperCandleSource(tmp_path, client=offline)
+    pd.testing.assert_frame_equal(reopened.load_completed_candles(END), normal)
+    pd.testing.assert_frame_equal(reopened.load_position_candles(start, END), historical)
+    assert offline.calls == []
 
 
 def test_public_source_binds_cache_to_exclusive_end_and_requires_601_bars(

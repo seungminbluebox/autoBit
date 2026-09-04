@@ -267,7 +267,10 @@ def _assert_causal_entry_sizing(
         **{**actual, "current_atr_pct": actual["baseline_atr_pct"]}
     )
     assert result.entry_submitted_quantity == pytest.approx(expected.quantity)
-    assert result.entry_filled_quantity == pytest.approx(expected.quantity)
+    # Actual slipped open100.05, entry ATR5, risk budget0.5, baseline ATR%=.02.
+    # Loss/BTC=12.5 + .0005*(100.05+87.55)=12.5938; vol multiplier=.4002.
+    assert result.entry_filled_quantity == pytest.approx(.5 * .4002 / 12.5938)
+    assert result.entry_filled_quantity < result.entry_submitted_quantity
     assert expected.binding_constraint == "volatility"
     assert expected.quantity < normal_risk_high_volatility.quantity
     assert expected.quantity < reduced_risk_baseline_volatility.quantity
@@ -316,7 +319,7 @@ def test_paper_acceptance_rejects_risk_agnostic_service_sizing(
         return SizeDecision(quantity=0.5, binding_constraint="constant", estimated_loss=0.0)
 
     monkeypatch.setattr(paper_service, "calculate_size", constant_size)
-    result = app_harness.run("tests/fixtures/paper_acceptance.json")
+    from autobit.execution.paper_broker import PaperReconciliationError
 
-    with pytest.raises(AssertionError):
-        _assert_causal_entry_sizing(result, calls)
+    with pytest.raises(PaperReconciliationError, match="signal sizing"):
+        app_harness.run("tests/fixtures/paper_acceptance.json")
