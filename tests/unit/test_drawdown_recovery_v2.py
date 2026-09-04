@@ -73,3 +73,16 @@ def test_recovery_combines_simultaneous_halts():
     assert decision.reasons == (
         "recovery", "daily_loss_halt", "weekly_loss_halt", "volatility_halt",
     )
+
+
+@pytest.mark.parametrize("hours", [72, 240])
+@pytest.mark.parametrize("drawdown", [.15, .16])
+def test_unhealthy_system_dominates_all_simultaneous_halts_after_expiry(hours, drawdown):
+    decision = _recover(
+        now=START + timedelta(hours=hours), drawdown=drawdown,
+        daily_loss=.04, weekly_loss=.07, consecutive_losses=5,
+        volatility_ratio=3.1, system_healthy=False,
+    )
+    assert (decision.risk_rate, decision.exposure_cap) == (0.0, 0.0)
+    assert decision.halted_until is None
+    assert decision.reasons == ("system_unhealthy",)
