@@ -74,6 +74,7 @@ class VenueOrder:
     price: Decimal | None
     created_at: datetime
     last_fill_at: datetime | None
+    first_fill_at: datetime | None = None
 
     @property
     def terminal(self) -> bool:
@@ -130,7 +131,7 @@ def _order(data: object, identifier: str, side: str | None, *, detail: bool) -> 
     if volume is not None and (executed > volume or remaining is None or executed + remaining > volume):
         raise LiveResponseError('Contradictory order volumes')
     created = _time(data.get('created_at'))
-    funds, last_fill = None, None
+    funds, first_fill, last_fill = None, None, None
     trades = data.get('trades')
     if trades is not None:
         if not isinstance(trades, list) or type(data.get('trades_count')) is not int or len(trades) != data['trades_count']:
@@ -150,6 +151,7 @@ def _order(data: object, identifier: str, side: str | None, *, detail: bool) -> 
             at = _time(trade.get('created_at'))
             if at < created:
                 raise LiveResponseError('Trade precedes order')
+            first_fill = min(first_fill, at) if first_fill else at
             last_fill = max(last_fill, at) if last_fill else at
             total += quantity
             funds += trade_funds
@@ -160,7 +162,7 @@ def _order(data: object, identifier: str, side: str | None, *, detail: bool) -> 
     if executed == 0 and fee != 0:
         raise LiveResponseError('Fee without a fill')
     return VenueOrder(identifier, data['uuid'], 'KRW-BTC', data['side'], data['ord_type'], data['state'],
-                      executed, funds, fee, volume, remaining, price, created, last_fill)
+                      executed, funds, fee, volume, remaining, price, created, last_fill, first_fill)
 
 
 class LiveClient:

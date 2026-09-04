@@ -134,6 +134,10 @@ class LiveService:
             raise LiveResponseError('Contradictory incremental fills')
         if actual.last_fill_at and actual.last_fill_at > at:
             raise LiveResponseError('Future execution fact')
+        if actual.side == 'bid' and quantity > 0 and (
+                not _aware(actual.first_fill_at)
+                or not actual.created_at <= actual.first_fill_at <= actual.last_fill_at):
+            raise LiveResponseError('Missing or contradictory first buy execution time')
         position,cash,trades = state.position,state.cash,state.closed_trades
         health = self._health()
         if quantity > 0:
@@ -148,7 +152,7 @@ class LiveService:
                     stop = initial_stop_price(entry,intent.entry_atr,intent.initial_atr_mult)
                     if not _positive(stop):
                         raise LiveResponseError('Actual entry has invalid protection')
-                    position = LivePosition(quantity,entry,intent.entry_atr,intent.initial_atr_mult,actual.last_fill_at,
+                    position = LivePosition(quantity,entry,intent.entry_atr,intent.initial_atr_mult,actual.first_fill_at,
                                             stop,stop,entry,0,funds+fee)
                 else:
                     entry = float(actual.executed_funds/actual.executed_volume)
@@ -235,6 +239,9 @@ class LiveService:
             overlay = apply_health_recovery(state.risk.decision,
                 system_healthy=observation.system_healthy and not action.halt_entries,
                 resume_reduced=action.resume_reduced)
+            if (valid and fingerprint == state.candle_fingerprint
+                    and state.position and state.position.entry_at >= end):
+                return Decision('hold','DEFERRED_PRE_ENTRY_CANDLE',0.,None,overlay)
             # Replay reconciles and reports current health, but cannot reissue
             # the consumed candle's entry/discretionary order or advance risk.
             return self.engine.decide(DecisionInput(row,float(state.cash),state.risk.last_equity,
@@ -257,6 +264,17 @@ class LiveService:
                 overlay = apply_health_recovery(state.risk.decision,system_healthy=False,resume_reduced=False)
                 return self.engine.decide(DecisionInput(row,float(state.cash),state.risk.last_equity,
                                           _context(state.position),True,overlay))
+        if state.position and state.position.entry_at >= end:
+            # Reconciliation can discover an entry after this candle ended.
+            # [open,end) contains no owned-position price evidence, including
+            # equality at end. After integrity checks, defer without consuming
+            # OHLC, inventing pending orders, or latching a health failure.
+            # on_price independently handles actual observed-price protection.
+            action = health.current_action()
+            overlay = apply_health_recovery(state.risk.decision,
+                system_healthy=observation.system_healthy and not action.halt_entries,
+                resume_reduced=action.resume_reduced)
+            return Decision('hold','DEFERRED_PRE_ENTRY_CANDLE',0.,None,overlay)
         position = self._activate(state.position,end)
         if position:
             # Shared holding age labels the entry candle zero. Completion is

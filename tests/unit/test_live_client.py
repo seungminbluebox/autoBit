@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import httpx
@@ -175,3 +176,43 @@ def test_invalid_order_constraints_fail_closed(monkeypatch,field,value):
     data[field]=value
     live=unlocked(monkeypatch,lambda r:httpx.Response(200,json=data))
     with pytest.raises(c.LiveResponseError):live.order_chance('KRW-BTC')
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_cumulative_trades_preserve_first_and_latest_execution_independent_of_order(monkeypatch, reverse):
+    first = datetime(2026, 9, 5, 3, 59, 59, 900000, tzinfo=timezone.utc)
+    last = datetime(2026, 9, 5, 4, 0, 0, 100000, tzinfo=timezone.utc)
+    trades = [dict(uuid=str(n), market='KRW-BTC', side='bid', price='10000000',
+                   volume='.0005', funds='5000', created_at=at.isoformat())
+              for n, at in enumerate((first, last))]
+    if reverse:
+        trades.reverse()
+    payload = order(state='done', executed_volume='.001', paid_fee='5', trades_count=2, trades=trades)
+    live = unlocked(monkeypatch, lambda r: httpx.Response(200, json=payload))
+    actual = live.get_order('offline-1')
+    assert getattr(actual, 'first_fill_at', None) == first
+    assert actual.last_fill_at == last
+    assert actual.executed_funds == Decimal('10000')
+
+
+@pytest.mark.parametrize('timestamp', [None, '', 'invalid', '2026-09-05T03:59:59.9',
+                                      '2026-09-04T23:59:59Z'])
+def test_missing_or_invalid_actual_first_execution_time_is_not_order_time(monkeypatch, timestamp):
+    trades = [dict(uuid='first', market='KRW-BTC', side='bid', price='10000000',
+                   volume='.0005', funds='5000', created_at=timestamp),
+              dict(uuid='last', market='KRW-BTC', side='bid', price='10000000',
+                   volume='.0005', funds='5000', created_at='2026-09-05T04:00:00.1Z')]
+    if timestamp is None:
+        del trades[0]['created_at']
+    live = unlocked(monkeypatch, lambda r: httpx.Response(200, json=order(
+        state='done', executed_volume='.001', paid_fee='5', trades_count=2, trades=trades)))
+    c, _ = api()
+    with pytest.raises(c.LiveResponseError):
+        live.get_order('offline-1')
+
+
+def test_zero_fill_acknowledgement_has_no_invented_execution_times(monkeypatch):
+    live = unlocked(monkeypatch, lambda r: httpx.Response(200, json=order()))
+    actual = live.place_market_buy('offline-1', Decimal('10000'))
+    assert actual.last_fill_at is None
+    assert getattr(actual, 'first_fill_at', None) is None

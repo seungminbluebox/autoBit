@@ -564,3 +564,278 @@ def test_older_position_payload_defaults_missing_candle_provenance_without_reset
     assert service.journal.state().position.completed_bar_at is None
     assert service.journal.state().position.completed_bar_fingerprint is None
     service.close()
+
+
+class CumulativeVenue(Venue):
+    """Cancellation acknowledgement leaves cumulative details unresolved."""
+
+    def __call__(self, request):
+        if request.method == 'DELETE':
+            self.requests.append(request)
+            return httpx.Response(200, json=self.orders[request.url.params['identifier']])
+        return super().__call__(request)
+
+    def cumulative_buy(self, identifier, times, *, terminal, reverse=False):
+        trades = [dict(uuid=f'fill-{n}', market='KRW-BTC', side='bid', price='10000000',
+                       volume='.0005', funds='5000', created_at=at.isoformat())
+                  for n, at in enumerate(times)]
+        if reverse:
+            trades.reverse()
+        quantity = Decimal('.0005') * len(times)
+        fee = Decimal('2.5') * len(times)
+        self.orders[identifier].update(state='done' if terminal else 'wait',
+            executed_volume=str(quantity), paid_fee=str(fee), trades_count=len(trades), trades=trades)
+        self.cash = str(Decimal('100000') - quantity * Decimal('10000000') - fee)
+        self.btc = str(quantity)
+        self.now = max(times) + timedelta(microseconds=1)
+
+
+@pytest.mark.parametrize('staged', [False, True])
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('before,after,reason,high', [
+    (59, 60, 'STAGNANT_EXIT', 10_100_000),
+    (1094, 1095, 'MAX_HOLD_EXIT', 10_300_000),
+])
+def test_cumulative_first_entry_polling_order_restart_and_holding_boundaries(
+        monkeypatch, tmp_path, staged, reverse, before, after, reason, high):
+    venue = CumulativeVenue()
+    service = make(monkeypatch, tmp_path, venue)
+    first = NOW + timedelta(hours=3, minutes=59, seconds=59, microseconds=900000)
+    last = NOW + timedelta(hours=4, microseconds=100000)
+    try:
+        service.process_completed_candle(*facts())
+        identifier = service.journal.pending()[0].identifier
+        if staged:
+            venue.cumulative_buy(identifier, (first,), terminal=False)
+            service.reconcile()
+            partial = service.journal.state().position
+            assert partial.entry_at == first and partial.quantity == Decimal('.0005')
+            assert service.journal.pending()
+            service.close()
+            service = make(monkeypatch, tmp_path, venue)
+            assert service.journal.state().position == partial
+        venue.cumulative_buy(identifier, (first, last), terminal=True, reverse=reverse)
+        for _ in range(3):
+            venue.now += timedelta(seconds=1)
+            service.reconcile()
+        position = service.journal.state().position
+        assert position.entry_at == first
+        assert (position.entry_atr, position.initial_atr_mult) == (100000., 2.5)
+        assert (position.quantity, position.cost_basis) == (Decimal('.001'), Decimal('10005'))
+        assert service.journal.state().cash == Decimal('89995')
+        assert not service.journal.pending()
+        saved = service.journal.state()
+        service.close()
+        service = make(monkeypatch, tmp_path, venue)
+        assert service.journal.state() == saved
+        for age in (1, before, after):
+            venue.now = NOW + timedelta(hours=4 * (age + 1))
+            snapshot, observation = facts(venue.now)
+            snapshot = replace(snapshot, row={**snapshot.row, 'high': high})
+            decision = service.process_completed_candle(snapshot, observation)
+            assert service.journal.state().position.held_bars == age
+            assert service.journal.state().position.entry_at == first
+            expected = ('sell', reason) if age == after else ('hold', None)
+            assert (decision.action, decision.reason) == expected
+        assert len(venue.posts) == 2
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize('entry_offset', [timedelta(0), timedelta(minutes=1)])
+@pytest.mark.parametrize('close', [11_000_000, 5_000_000])
+@pytest.mark.parametrize('reconciled_first', [False, True])
+def test_pre_entry_candle_defers_without_owned_price_risk_or_cursor_progress_and_recovers(
+        monkeypatch, tmp_path, entry_offset, close, reconciled_first):
+    venue = Venue()
+    service = make(monkeypatch, tmp_path, venue)
+    end = NOW + timedelta(hours=4)
+    try:
+        service.process_completed_candle(*facts())
+        baseline = service.journal.state()
+        identifier = service.journal.pending()[0].identifier
+        venue.fill(identifier)
+        entry = end + entry_offset
+        venue.orders[identifier]['trades'][0]['created_at'] = entry.isoformat()
+        venue.now = end + timedelta(minutes=2)
+        if reconciled_first:
+            for _ in range(3):
+                service.reconcile()
+                venue.now += timedelta(seconds=1)
+        snapshot, observation = facts(end, close=close)
+        snapshot = replace(snapshot, row={**snapshot.row, 'high': 12_000_000,
+                                         'low': 4_000_000, 'exit_low': 6_000_000})
+        observation = replace(observation, now=venue.now)
+        # False discovers entry inside this call; True exercises healthy policy.
+        for attempt in range(3):
+            decision = service.process_completed_candle(snapshot, observation)
+            assert (decision.action, decision.reason, decision.next_stop) == (
+                'hold', 'DEFERRED_PRE_ENTRY_CANDLE', None)
+            state = service.journal.state()
+            assert state.position.entry_at == entry
+            assert state.position.high_water == 10_000_000
+            assert state.position.current_stop == 9_750_000
+            assert state.position.pending_stop is None and state.position.held_bars == 0
+            assert state.position.completed_bar_at is None
+            assert state.position.completed_bar_fingerprint is None
+            assert state.risk == baseline.risk
+            assert (state.completed_at, state.candle_fingerprint, state.decision) == (
+                baseline.completed_at, baseline.candle_fingerprint, baseline.decision)
+            assert state.cash == Decimal('89995') and state.closed_trades == ()
+            assert not service.journal.pending() and len(venue.posts) == 1
+            assert state.health['schema_valid'] and state.health['timestamps_monotonic']
+            if attempt == 0:
+                service.close()
+                service = make(monkeypatch, tmp_path, venue)
+                assert service.journal.state() == state
+            venue.now += timedelta(seconds=1)
+            observation = replace(observation, now=venue.now)
+        # A genuine observed high survives deferred retries; there is no candle
+        # provenance yet and no pending-stop promotion caused by pre-entry OHLC.
+        service.on_price(10_200_000)
+        observed = service.journal.state().position
+        service.process_completed_candle(snapshot, replace(observation, now=venue.now))
+        assert service.journal.state().position == observed
+        venue.now = end + timedelta(hours=4)
+        eligible, cutoff = facts(venue.now)
+        # For an interior entry, the high is unknown-before-entry; close is safe.
+        eligible = replace(eligible, row={**eligible.row, 'high': 11_000_000, 'close': 10_400_000})
+        result = service.process_completed_candle(eligible, cutoff)
+        assert result.action == 'hold' and result.reason is None
+        progressed = service.journal.state()
+        assert progressed.position.high_water == (11_000_000 if entry_offset == timedelta(0) else 10_400_000)
+        assert progressed.position.pending_stop == (10_700_000 if entry_offset == timedelta(0) else 9_750_000)
+        assert progressed.position.completed_bar_at == end
+        assert progressed.risk.last_risk_at == venue.now
+        assert progressed.completed_at == end
+        assert len(venue.posts) == 1
+        # Deferral does not disable independently observed-price protection.
+        service.on_price(9_750_000)
+        assert len(venue.posts) == 2
+        assert json.loads(venue.posts[-1].content)['side'] == 'ask'
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize('first', [None, NOW.replace(tzinfo=None),
+                                  NOW - timedelta(seconds=1), NOW + timedelta(hours=1)])
+def test_buy_consumer_rejects_missing_or_contradictory_first_fill_without_mutation(monkeypatch, tmp_path, first):
+    venue = Venue()
+    service = make(monkeypatch, tmp_path, venue)
+    try:
+        service.process_completed_candle(*facts())
+        intent = service.journal.pending()[0]
+        venue.fill(intent.identifier)
+        actual = service.client.get_order(intent.identifier)
+        before = service.journal.state()
+        c, *_ = modules()
+        with pytest.raises(c.LiveResponseError):
+            service._apply_order(intent, replace(actual, first_fill_at=first), venue.now)
+        assert service.journal.state() == before
+        assert service.journal.pending() == (intent,)
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_completed_cumulative_sell_uses_latest_execution_not_first_after_restart(monkeypatch, tmp_path, reverse):
+    venue = Venue()
+    service = make(monkeypatch, tmp_path, venue)
+    try:
+        service.process_completed_candle(*facts())
+        venue.fill(service.journal.pending()[0].identifier)
+        service.reconcile()
+        service.on_price(9_750_000)
+        intent = service.journal.pending()[0]
+        first = NOW + timedelta(hours=1, minutes=59, seconds=59, microseconds=900000)
+        last = NOW + timedelta(hours=2, microseconds=100000)
+        trades = [dict(uuid=f'sell-{n}', market='KRW-BTC', side='ask', price='9750000',
+                       volume='.0005', funds='4875', created_at=at.isoformat())
+                  for n, at in enumerate((first, last))]
+        if reverse:
+            trades.reverse()
+        venue.orders[intent.identifier].update(state='done', executed_volume='.001', remaining_volume='0',
+            paid_fee='4.875', trades_count=2, trades=trades)
+        venue.cash = '99740.125'
+        venue.btc = '0'
+        venue.now = last + timedelta(seconds=1)
+        service.close()
+        service = make(monkeypatch, tmp_path, venue)
+        service.reconcile()
+        state = service.journal.state()
+        assert state.position is None and not service.journal.pending()
+        assert state.closed_trades[0].exit_time == last
+        assert state.closed_trades[0].net_pnl == -259.875
+        assert state.cash == Decimal('99740.125')
+        service.close()
+        service = make(monkeypatch, tmp_path, venue)
+        assert service.journal.state() == state
+    finally:
+        service.close()
+
+
+def test_pre_entry_deferral_preserves_consumed_candle_fingerprint_rejection(monkeypatch, tmp_path):
+    venue = Venue()
+    service = make(monkeypatch, tmp_path, venue)
+    try:
+        snapshot, observation = facts()
+        service.process_completed_candle(snapshot, observation)
+        baseline = service.journal.state()
+        venue.fill(service.journal.pending()[0].identifier)
+        changed = replace(snapshot, row={**snapshot.row, 'high': 11_000_000})
+        service.process_completed_candle(changed, replace(observation, now=venue.now))
+        state = service.journal.state()
+        assert not state.health['schema_valid']
+        assert state.risk == baseline.risk and state.completed_at == baseline.completed_at
+        assert state.candle_fingerprint == baseline.candle_fingerprint
+        assert state.position.high_water == 10_000_000
+        assert state.position.completed_bar_at is None
+        assert len(venue.posts) == 1
+    finally:
+        service.close()
+
+
+def test_pre_entry_deferral_preserves_independent_position_provenance_rejection(monkeypatch, tmp_path):
+    venue = CumulativeVenue()
+    service = make(monkeypatch, tmp_path, venue)
+    try:
+        service.process_completed_candle(*facts())
+        identifier = service.journal.pending()[0].identifier
+        venue.cumulative_buy(identifier, (NOW + timedelta(hours=4, minutes=1),), terminal=False)
+        venue.now = NOW + timedelta(hours=8, minutes=2)
+        service.process_completed_candle(*facts(NOW + timedelta(hours=8)))
+        before = service.journal.state()
+        assert before.position.completed_bar_at == NOW + timedelta(hours=4)
+        assert before.completed_at == NOW - timedelta(hours=4)
+        assert service.journal.pending()
+        earlier, observation = facts(NOW + timedelta(hours=4))
+        service.process_completed_candle(earlier, replace(observation, now=venue.now))
+        state = service.journal.state()
+        assert not state.health['timestamps_monotonic']
+        assert state.position == before.position
+        assert state.risk == before.risk and state.completed_at == before.completed_at
+        assert len(service.journal.pending()) == 1 and len(venue.posts) == 1
+    finally:
+        service.close()
+
+
+def test_pre_entry_deferral_keeps_observed_stop_protection_before_next_eligible_candle(monkeypatch, tmp_path):
+    venue = Venue()
+    service = make(monkeypatch, tmp_path, venue)
+    try:
+        service.process_completed_candle(*facts())
+        venue.fill(service.journal.pending()[0].identifier)
+        snapshot, observation = facts()
+        decision = service.process_completed_candle(snapshot, replace(observation, now=venue.now))
+        assert decision.reason == 'DEFERRED_PRE_ENTRY_CANDLE'
+        before = service.journal.state()
+        service.on_price(9_750_000)
+        assert len(venue.posts) == 2
+        assert json.loads(venue.posts[-1].content)['side'] == 'ask'
+        assert service.journal.pending()[0].amount == before.position.quantity
+        assert service.journal.state().risk == before.risk
+        assert service.journal.state().completed_at == before.completed_at
+        service.on_price(9_750_000)
+        assert len(venue.posts) == 2
+    finally:
+        service.close()

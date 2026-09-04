@@ -181,9 +181,9 @@ _PROCESS_EXECUTION_REFERENCES = frozenset({"os.popen", "os.system"})
 _AUDITED_LIVE_AST = {
     'src/autobit/live/__init__.py': '5b059888223aaecda805e67e81a4cb26bd1c975b827d76624dbcf6f74a71c5e4',
     'src/autobit/live/guard.py': '5fc5efbe8896d18e2cbafee8f45cf517096591af38d708058806c18a6fbab238',
-    'src/autobit/live/client.py': '701ba171ea856be962e426b104a25ff247699e876bb9983817d8a2464931f98c',
+    'src/autobit/live/client.py': '4952a1046fa97a9366cb0aa610237ddf8f011e6361634d7c1e3e0537369c7122',
     'src/autobit/live/journal.py': '4528fb1d76b6c4e060306ac3c980e14f76ce10997a9823b086fd55a2c155e271',
-    'src/autobit/live/service.py': 'ff2009d853119dac5c9aa633de3691f433df41120abc34c90ad06b82d8190d32',
+    'src/autobit/live/service.py': 'f19753f176c4ec5dce056eac8e839b98b5b702b92233c07fec2d2b6be885c481',
 }
 _LIVE_API_URLS = tuple('https://api.upbit.com' + path for path in (
     '/v1/accounts', '/v1/order', '/v1/orders', '/v1/orders/chance',
