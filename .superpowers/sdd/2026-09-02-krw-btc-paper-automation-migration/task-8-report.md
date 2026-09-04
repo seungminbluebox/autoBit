@@ -27,7 +27,7 @@ snapshots.  Expected RED:
 
 ```
 .venv\\Scripts\\python.exe -m pytest tests/integration/test_paper_cli.py -k
-"later_fee_bearing or fill_precedes_terminal_cycle" --basetemp
+"later_fill_sequence or fill_precedes_terminal_cycle" --basetemp
 .test-tmp/task8-red -p no:cacheprovider
 
 1 passed, 4 failed in 8.92s
@@ -46,7 +46,7 @@ GREEN command:
 
 ```
 .venv\\Scripts\\python.exe -m pytest tests/integration/test_paper_cli.py -k
-"later_fee_bearing or fill_precedes_terminal_cycle" --basetemp
+"later_fill_sequence or fill_precedes_terminal_cycle" --basetemp
 .test-tmp/task8-green -p no:cacheprovider
 ```
 
@@ -131,3 +131,115 @@ private/live-network, or trading behavior changed.  Generated `.coverage` and
 
 No unresolved implementation concern remains.  This remains paper-only and
 does not enable live trading or recommend a buy.
+
+## Independent-review fix round 1 (2026-09-04)
+
+This round addresses I1, I2, and M1 from the independent scoped review of
+`b2770804ce324c164b745514320634bd0a71e617`.
+
+### I1: all validated raw fills bind status
+
+`PaperBroker.reconcile()` had already validated and replayed every raw `FILL`
+into its balances, but `_status_equity` only considered paper-metadata fills.
+It now derives fallback provenance/time from the newest immutable raw `FILL`
+by sequence and rejects completed-close `CURRENT` when any such raw fill is
+later than the selected terminal cycle. The raw fill's canonical
+`occurred_at_utc` is used for `LAST_FILL_BROKER_EQUITY`; sequence remains the
+only ordering authority. This preserves generic, replay-compatible ledger
+formats rather than rejecting them.
+
+New real SQLiteStore/PaperBroker/CLI regressions cover fee-bearing generic
+BUY and SELL post-cycle states in active-WAL and reopened modes, generic
+no-cycle fallback provenance, and mixed paper/generic evidence with each type
+as the latest fill. They assert broker equity, latest raw-fill sequence/time,
+stale provenance, and source read-only status. Existing pre-cycle-paper-fill
+and no-fill completed-current controls remain in the same file.
+
+RED before the production edit:
+
+```
+.venv\\Scripts\\python.exe -m pytest tests/integration/test_paper_cli.py -k
+'generic_fill_after_cycle or generic_fill_without_cycle or mixed_fill_evidence'
+--basetemp C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-generic-red2-a7f975f3abbd46ec81fcd576ec5ccd39\\basetemp
+-p no:cacheprovider
+```
+
+Result: `6 failed, 1 passed in 4.67s`. Generic BUY falsely returned current
+equity `100.0`, generic SELL returned `INVALID_OR_MISSING_LEDGER`, generic
+no-cycle omitted its as-of time, and the newest-generic mixed state falsely
+returned `100.0`.
+
+GREEN after the production edit:
+
+```
+.venv\\Scripts\\python.exe -m pytest tests/integration/test_paper_cli.py -k
+'generic_fill_after_cycle or generic_fill_without_cycle or mixed_fill_evidence'
+--basetemp C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-green-d2645e82e8364039b490e60f43b9b5f5\\cli-basetemp
+-p no:cacheprovider
+```
+
+Result: `7 passed in 3.67s`; durable output is
+`C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-green-d2645e82e8364039b490e60f43b9b5f5\\cli-green.log`.
+
+### I2: root-only generated basetemp
+
+The ignore pattern is now `/.test-tmp/`, so only the approved repository-root
+pytest basetemp is excluded. The safety fixture creates a root probe and a
+nested `src/autobit/.test-tmp/` probe, proves the root probe is absent from
+the worktree surface inventory, and proves the nested probe is inventoried and
+its forbidden import is detected. It removes exact probe files and their
+uniquely created leaf directories in `finally`.
+
+RED before anchoring:
+
+```
+.venv\\Scripts\\python.exe -m pytest tests/safety/test_no_live_surface.py -k
+'only_root_generated_pytest_basetemp' --basetemp
+C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-red-5687198fcf0f4556a825f5d646831354\\basetemp
+-p no:cacheprovider
+```
+
+Result: `1 failed in 5.69s`: the nested source fixture was hidden.
+
+GREEN after anchoring:
+
+```
+.venv\\Scripts\\python.exe -m pytest tests/safety/test_no_live_surface.py -k
+'only_root_generated_pytest_basetemp' --basetemp
+C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-green-d2645e82e8364039b490e60f43b9b5f5\\safety-basetemp
+-p no:cacheprovider
+```
+
+Result: `1 passed in 4.44s`; durable output is
+`C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-green-d2645e82e8364039b490e60f43b9b5f5\\safety-green.log`.
+`git check-ignore -v .test-tmp/_task8_probe.py` reports `/.test-tmp/`, while
+the nested `src/autobit/.test-tmp/_task8_probe.py` is not ignored.
+
+### M1 and focused verification
+
+The historical selector is corrected to
+`-k "later_fill_sequence or fill_precedes_terminal_cycle"`, matching the
+committed paper BUY/SELL crash tests and the completed-current positive
+control.
+
+Fresh amendment-covering suite:
+
+```
+.venv\\Scripts\\python.exe -m pytest tests/integration/test_paper_cli.py
+tests/unit/test_paper_broker.py tests/unit/test_sqlite_store.py
+tests/integration/test_paper_restart.py tests/integration/test_paper_service.py
+tests/safety/test_no_live_surface.py tests/integration/test_paper_auto_recovery.py
+tests/integration/test_paper_acceptance.py --basetemp
+C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-focused-3c2e979f23124599921b46a434959f96\\basetemp
+-p no:cacheprovider
+```
+
+Result: `398 passed in 90.20s`; durable output is
+`C:\\Users\\boxma\\AppData\\Local\\Temp\\autobit-task8-r1-focused-3c2e979f23124599921b46a434959f96\\focused.log`.
+`.venv\\Scripts\\python.exe -m compileall -q src tests` and `git diff --check`
+both exit 0. Historic whole-suite evidence remains the distinct retained
+`1077 passed` run above; it was not rerun because this focused amendment does
+not alter walk-forward coverage.
+
+Implementation/test/safety commit: `53eeccff50ec64e7e75ee87f7842314bc79195ab`.
+No schema, command, network, or live-trading surface changed.
