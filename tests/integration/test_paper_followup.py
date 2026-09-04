@@ -218,6 +218,310 @@ def test_legacy_pending_service_entry_is_bound_before_actual_open(tmp_path):
     store.close()
 
 
+def test_legacy_pending_history_api_failure_survives_return_and_reopen(tmp_path):
+    """A failed original-signal lookup must not roll back durable health evidence."""
+    from autobit.cli import _PaperApplication
+    from autobit.paper.health import HealthMonitor
+    from test_paper_cli import _Sleeper
+
+    class LegacyServiceBroker(PaperBroker):
+        def submit_entry(self, signal_at, *, quantity, reason="ENTRY", execution_context=None):
+            return super().submit_entry(signal_at, quantity=quantity, reason=reason)
+
+    path = tmp_path / "legacy-history-api.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    order, signal_frame = _signal(
+        store, broker=LegacyServiceBroker(store, CostConfig(0, 0)),
+    )
+    next_frame = _history(END + timedelta(hours=4), 602)
+    next_frame.iloc[:601] = signal_frame.to_numpy()
+    next_frame.iloc[601] = [110, 111, 109.9, 110, 1]
+    clock = _Clock(END + timedelta(hours=4, minutes=10))
+
+    class Source:
+        def load_completed_candles(self, end):
+            if end == END + timedelta(hours=4):
+                clock.value += timedelta(seconds=1)
+                return next_frame.tail(601).copy()
+            assert end == END
+            clock.value += timedelta(seconds=5)
+            raise RuntimeError("legacy signal public outage")
+
+    with pytest.raises(RuntimeError, match="legacy signal public outage"):
+        _PaperApplication(
+            source=Source(), store=store, clock=clock, sleeper=_Sleeper(clock),
+            notifier=None, costs=CostConfig(0, 0), lease_owner="legacy-history-api",
+            lease_token="legacy-history-api",
+        ).run_once()
+
+    health = HealthMonitor.from_store(store).snapshot()
+    assert health.api_failures == 1
+    assert health.api_successes == 0
+    assert health.last_failure_at_utc == END + timedelta(hours=4, minutes=10, seconds=1)
+    state = PaperBroker(store).reconcile()
+    assert state.active_orders == (order,)
+    assert state.fills == ()
+    assert PaperBroker(store).order(order.order_id).execution_context is None
+    store.close()
+
+    store = SQLiteStore(path)
+    store.initialize()
+    reopened = HealthMonitor.from_store(store).snapshot()
+    assert reopened.api_failures == 1
+    assert reopened.last_failure_at_utc == health.last_failure_at_utc
+    assert PaperBroker(store).reconcile().active_orders == (order,)
+    assert PaperBroker(store).reconcile().fills == ()
+    store.close()
+
+
+def test_legacy_pending_history_schema_failure_halts_durably(tmp_path):
+    """Malformed original-signal evidence must remain HALTED after the failed fill."""
+    from autobit.cli import _PaperApplication
+    from autobit.paper.health import HealthMonitor, HealthStage
+    from test_paper_cli import _Sleeper
+
+    class LegacyServiceBroker(PaperBroker):
+        def submit_entry(self, signal_at, *, quantity, reason="ENTRY", execution_context=None):
+            return super().submit_entry(signal_at, quantity=quantity, reason=reason)
+
+    path = tmp_path / "legacy-history-schema.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    order, signal_frame = _signal(
+        store, broker=LegacyServiceBroker(store, CostConfig(0, 0)),
+    )
+    next_frame = _history(END + timedelta(hours=4), 602)
+    next_frame.iloc[:601] = signal_frame.to_numpy()
+    next_frame.iloc[601] = [110, 111, 109.9, 110, 1]
+    clock = _Clock(END + timedelta(hours=4, minutes=10))
+
+    class Source:
+        def load_completed_candles(self, end):
+            if end == END + timedelta(hours=4):
+                clock.value += timedelta(seconds=1)
+                return next_frame.tail(601).copy()
+            assert end == END
+            return signal_frame.drop(columns=["high"])
+
+    with pytest.raises(ValueError, match="schema"):
+        _PaperApplication(
+            source=Source(), store=store, clock=clock, sleeper=_Sleeper(clock),
+            notifier=None, costs=CostConfig(0, 0), lease_owner="legacy-history-schema",
+            lease_token="legacy-history-schema",
+        ).run_once()
+
+    health = HealthMonitor.from_store(store).snapshot()
+    assert health.stage is HealthStage.HALTED
+    assert not health.schema_valid
+    assert health.api_successes == 0
+    assert PaperBroker(store).reconcile().active_orders == (order,)
+    assert PaperBroker(store).reconcile().fills == ()
+    store.close()
+
+    store = SQLiteStore(path)
+    store.initialize()
+    reopened = HealthMonitor.from_store(store).snapshot()
+    assert reopened.stage is HealthStage.HALTED
+    assert not reopened.schema_valid
+    assert PaperBroker(store).reconcile().active_orders == (order,)
+    assert PaperBroker(store).reconcile().fills == ()
+    store.close()
+
+
+def test_legacy_pending_history_retry_binds_one_capped_fill_after_reopen(tmp_path):
+    """A durable failed lookup recovers through the real application path once."""
+    from autobit.cli import _PaperApplication
+    from autobit.paper.service import CycleStatus
+    from test_paper_cli import _Sleeper
+
+    class LegacyServiceBroker(PaperBroker):
+        def submit_entry(self, signal_at, *, quantity, reason="ENTRY", execution_context=None):
+            return super().submit_entry(signal_at, quantity=quantity, reason=reason)
+
+    path = tmp_path / "legacy-history-retry.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    order, signal_frame = _signal(
+        store, broker=LegacyServiceBroker(store, CostConfig(0, 0)),
+    )
+    next_frame = _history(END + timedelta(hours=4), 602)
+    next_frame.iloc[:601] = signal_frame.to_numpy()
+    next_frame.iloc[601] = [110, 111, 109.9, 110, 1]
+    clock = _Clock(END + timedelta(hours=4, minutes=10))
+
+    class FailingSource:
+        def load_completed_candles(self, end):
+            if end == END + timedelta(hours=4):
+                clock.value += timedelta(seconds=1)
+                return next_frame.tail(601).copy()
+            assert end == END
+            clock.value += timedelta(seconds=5)
+            raise RuntimeError("legacy signal public outage")
+
+    with pytest.raises(RuntimeError, match="legacy signal public outage"):
+        _PaperApplication(
+            source=FailingSource(), store=store, clock=clock, sleeper=_Sleeper(clock),
+            notifier=None, costs=CostConfig(0, 0), lease_owner="legacy-history-retry",
+            lease_token="legacy-history-retry-failed",
+        ).run_once()
+    assert PaperBroker(store).reconcile().active_orders == (order,)
+    store.close()
+
+    store = SQLiteStore(path)
+    store.initialize()
+    clock.value = END + timedelta(hours=4, minutes=20)
+    recovered = _PaperApplication(
+        source=_FrameSource([next_frame.tail(601), signal_frame]), store=store,
+        clock=clock, sleeper=_Sleeper(clock), notifier=None, costs=CostConfig(0, 0),
+        lease_owner="legacy-history-retry", lease_token="legacy-history-retry-success",
+    )
+    assert recovered.run_once().status is CycleStatus.PROCESSED
+    reconciliation = PaperBroker(store).reconcile()
+    fill, = reconciliation.fills
+    assert fill.order_id == order.order_id
+    assert fill.quantity == pytest.approx(70 / 110)
+    assert fill.quantity * fill.fill_price <= 70
+    assert PaperBroker(store).order(order.order_id).execution_context is not None
+    assert len(reconciliation.fills) == 1
+    expected = store.replay_state()
+    store.close()
+
+    store = SQLiteStore(path)
+    store.initialize()
+    assert store.replay_state() == expected
+    assert PaperBroker(store).reconcile().fills == (fill,)
+    store.close()
+
+
+def test_legacy_history_failure_alert_has_durable_exactly_once_lineage(tmp_path):
+    """Delivered health alerts retain their source and one durable attempt."""
+    from autobit.cli import _PaperApplication
+    from test_paper_cli import _Sleeper
+
+    class LegacyServiceBroker(PaperBroker):
+        def submit_entry(self, signal_at, *, quantity, reason="ENTRY", execution_context=None):
+            return super().submit_entry(signal_at, quantity=quantity, reason=reason)
+
+    class CapturingNotifier:
+        def __init__(self):
+            self.delivered: list[dict[str, object]] = []
+
+        def send(self, event):
+            self.delivered.append(dict(event))
+            return True
+
+    path = tmp_path / "legacy-history-alert.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    _, signal_frame = _signal(
+        store, broker=LegacyServiceBroker(store, CostConfig(0, 0)),
+    )
+    next_frame = _history(END + timedelta(hours=4), 602)
+    next_frame.iloc[:601] = signal_frame.to_numpy()
+    next_frame.iloc[601] = [110, 111, 109.9, 110, 1]
+    clock = _Clock(END + timedelta(hours=4, minutes=10))
+
+    class Source:
+        def load_completed_candles(self, end):
+            if end == END + timedelta(hours=4):
+                clock.value += timedelta(seconds=1)
+                return next_frame.tail(601).copy()
+            assert end == END
+            clock.value += timedelta(seconds=5)
+            raise RuntimeError("legacy signal public outage")
+
+    notifier = CapturingNotifier()
+    app = _PaperApplication(
+        source=Source(), store=store, clock=clock, sleeper=_Sleeper(clock),
+        notifier=notifier, costs=CostConfig(0, 0), lease_owner="legacy-history-alert",
+        lease_token="legacy-history-alert",
+    )
+    with pytest.raises(RuntimeError, match="legacy signal public outage"):
+        app.run_once()
+
+    evidence = store.replay_state().event_evidence
+    failed_health, = [
+        event for event in evidence
+        if event.event_type == "HEALTH_STATE" and event.payload["api_failures"] == 1
+    ]
+    attempts = [event for event in evidence if event.event_type == "ALERT_ATTEMPT"]
+    assert any(event.payload["source_event_id"] == failed_health.event_id for event in attempts)
+    assert {event["event_id"] for event in notifier.delivered} == {
+        event.payload["source_event_id"] for event in attempts
+    }
+    delivered_before_retry = tuple(notifier.delivered)
+    app._source._notify(failed_health)
+    assert tuple(notifier.delivered) == delivered_before_retry
+    assert len([event for event in store.replay_state().event_evidence
+                if event.event_type == "ALERT_ATTEMPT"
+                and event.payload["source_event_id"] == failed_health.event_id]) == 1
+    expected = store.replay_state()
+    store.close()
+
+    store = SQLiteStore(path)
+    store.initialize()
+    assert store.replay_state() == expected
+    assert any(
+        event.event_type == "ALERT_ATTEMPT"
+        and event.payload["source_event_id"] == failed_health.event_id
+        for event in store.replay_state().event_evidence
+    )
+    store.close()
+
+
+def test_slow_legacy_context_lookup_revalidates_lost_cycle_lease(tmp_path):
+    """A lease takeover during historical preparation blocks the trading mutation."""
+    from autobit.cli import _PaperApplication
+    from autobit.paper.service import CycleStatus
+    from test_paper_cli import _Sleeper
+
+    class LegacyServiceBroker(PaperBroker):
+        def submit_entry(self, signal_at, *, quantity, reason="ENTRY", execution_context=None):
+            return super().submit_entry(signal_at, quantity=quantity, reason=reason)
+
+    path = tmp_path / "legacy-history-lease.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    order, signal_frame = _signal(
+        store, broker=LegacyServiceBroker(store, CostConfig(0, 0)),
+    )
+    next_frame = _history(END + timedelta(hours=4), 602)
+    next_frame.iloc[:601] = signal_frame.to_numpy()
+    next_frame.iloc[601] = [110, 111, 109.9, 110, 1]
+    clock = _Clock(END + timedelta(hours=4, minutes=10))
+    competitor: SQLiteStore | None = None
+
+    class Source:
+        def load_completed_candles(self, end):
+            nonlocal competitor
+            if end == END + timedelta(hours=4):
+                return next_frame.tail(601).copy()
+            assert end == END
+            clock.value += timedelta(minutes=6)
+            competitor = SQLiteStore(path)
+            competitor.initialize()
+            assert competitor.acquire_cycle_lease(
+                "competing-worker", "competing-token", clock.value,
+                clock.value + timedelta(minutes=5),
+            )
+            return signal_frame.copy()
+
+    result = _PaperApplication(
+        source=Source(), store=store, clock=clock, sleeper=_Sleeper(clock),
+        notifier=None, costs=CostConfig(0, 0), lease_owner="legacy-history-lease",
+        lease_token="legacy-history-lease",
+    ).run_once()
+    assert result.status is CycleStatus.LEASE_HELD
+    reconciliation = PaperBroker(store).reconcile()
+    assert reconciliation.active_orders == (order,)
+    assert reconciliation.fills == ()
+    assert PaperBroker(store).order(order.order_id).execution_context is None
+    assert competitor is not None
+    competitor.close()
+    store.close()
+
+
 def test_old_high_water_survives_observation_crash_and_rolling_window(tmp_path):
     fill_at = END - timedelta(hours=4 * 701)
     full = _history(END + timedelta(hours=4), 1303)

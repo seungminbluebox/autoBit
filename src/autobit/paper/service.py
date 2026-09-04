@@ -414,9 +414,44 @@ class PaperService:
                 self._record_completion(event_id, result)
                 return result
 
+            # Legacy service orders predate immutable entry contexts.  Resolve
+            # their public signal window before the fill mutation so observed
+            # health/alert evidence cannot be rolled back with a failed fill.
+            prepared_contexts = self._prepare_legacy_entry_contexts(bar_at, enriched)
+
+            renewed_at = _clock_utc(self._clock)
+            renewed_expiry = _safe_add(
+                renewed_at,
+                self._lease_ttl,
+                "lease expiry is outside datetime range",
+            )
+            if not self._store.acquire_cycle_lease(
+                self._lease_owner,
+                self._lease_token,
+                renewed_at,
+                renewed_expiry,
+            ):
+                return CycleResult(CycleStatus.LEASE_HELD, end)
+            if _has_completed_cycle(
+                self._validated_snapshot(),
+                event_id,
+                end,
+                self._broker,
+            ):
+                return CycleResult(CycleStatus.ALREADY_PROCESSED, end)
+
             created_ids: list[str] = []
             filled_ids: list[str] = []
             with self._store.transaction():
+                atomic_snapshot = self._validated_snapshot()
+                _validate_operational_alert_chain(atomic_snapshot.event_evidence)
+                if _has_completed_cycle(
+                    atomic_snapshot,
+                    event_id,
+                    end,
+                    self._broker,
+                ):
+                    return CycleResult(CycleStatus.ALREADY_PROCESSED, end)
                 reconciliation = self._broker.reconcile()
                 filled_entry_this_bar = False
                 for order in reconciliation.active_orders:
@@ -427,7 +462,11 @@ class PaperService:
                         raise PaperServiceError("active market order missed its eligible open")
                     if eligible == bar_at:
                         if order.side == "BUY" and order.execution_context is None:
-                            context = self._legacy_entry_context(order, enriched)
+                            if order.order_id not in prepared_contexts:
+                                raise PaperServiceError(
+                                    "pending BUY changed during legacy context preparation"
+                                )
+                            context = prepared_contexts[order.order_id]
                             if context is not None:
                                 self._broker.bind_entry_context(order.order_id, context)
                         fill = self._broker.process_open(
@@ -615,6 +654,25 @@ class PaperService:
             "risk_rate": risk.decision.risk_rate, "exposure_cap": risk.decision.exposure_cap,
             "risk_event_id": events[-1].event_id,
         }
+
+    def _prepare_legacy_entry_contexts(
+        self, bar_at: datetime, enriched: pd.DataFrame,
+    ) -> dict[str, dict[str, object] | None]:
+        """Resolve eligible legacy BUY contexts outside a trading mutation."""
+        prepared: dict[str, dict[str, object] | None] = {}
+        for order in self._broker.reconcile().active_orders:
+            eligible = order.eligible_open_utc
+            if eligible is None:
+                raise PaperServiceError("active market order has no eligible open")
+            if eligible < bar_at:
+                raise PaperServiceError("active market order missed its eligible open")
+            if (
+                eligible == bar_at
+                and order.side == "BUY"
+                and order.execution_context is None
+            ):
+                prepared[order.order_id] = self._legacy_entry_context(order, enriched)
+        return prepared
 
     def _risk_decision(
         self,
