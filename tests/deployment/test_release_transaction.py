@@ -106,16 +106,45 @@ def test_backup_copies_db_and_wal_but_never_shm():
 with tempfile.TemporaryDirectory(prefix="autobit-transaction-") as fixture:
     base = Path(fixture)
     candidate(base)
-    ledger(base / "state/paper.sqlite3")
-    (base / "state/paper.sqlite3-wal").write_bytes(b"")
-    (base / "state/paper.sqlite3-shm").write_bytes(b"transient")
+    seed = base / "seed/paper.sqlite3"
+    seed.parent.mkdir(parents=True)
+    connection = sqlite3.connect(seed)
+    try:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        connection.executescript("""
+        CREATE TABLE schema_version(version INTEGER);
+        INSERT INTO schema_version VALUES (1);
+        CREATE TABLE events(sequence INTEGER);
+        INSERT INTO events VALUES (1);
+        CREATE TABLE orders(id INTEGER);
+        CREATE TABLE snapshots(id INTEGER);
+        """)
+        connection.commit()
+        assert Path(str(seed) + "-wal").stat().st_size > 32, "fixture must contain real WAL frames"
+        state = base / "state"
+        state.mkdir()
+        shutil.copy2(seed, state / "paper.sqlite3")
+        shutil.copy2(Path(str(seed) + "-wal"), state / "paper.sqlite3-wal")
+    finally:
+        connection.close()
     operation = run('backup_closed_ledger\n', base)
     assert operation.returncode == 0, operation.stderr
     backup = Path(operation.stdout.strip())
-    assert (backup / "bundle/paper.sqlite3").is_file()
-    assert (backup / "bundle/paper.sqlite3-wal").is_file()
-    assert not (backup / "bundle/paper.sqlite3-shm").exists()
-    assert (backup / "SHA256SUMS").is_file()
+    bundle = backup / "bundle"
+    checksums = (backup / "SHA256SUMS").read_text().splitlines()
+    assert {line.split("  ", 1)[1] for line in checksums} == {
+        "paper.sqlite3", "paper.sqlite3-wal"
+    }
+    assert {item.name for item in bundle.iterdir()} == {
+        "paper.sqlite3", "paper.sqlite3-wal"
+    }
+    before = {item.name: item.read_bytes() for item in bundle.iterdir()}
+    subprocess.run(
+        ["sha256sum", "-c", str(backup / "SHA256SUMS")], cwd=bundle,
+        check=True, capture_output=True,
+    )
+    assert {item.name: item.read_bytes() for item in bundle.iterdir()} == before
     assert (backup / "verification/paper-status.json").is_file()
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
@@ -132,6 +161,24 @@ with tempfile.TemporaryDirectory(prefix="autobit-first-install-") as fixture:
     backup = Path(operation.stdout.strip())
     assert (backup / "ledger-state.txt").read_bytes() == b"NO_EXISTING_LEDGER\n"
     assert not (backup / "bundle").exists()
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_dangling_ledger_symlink_is_not_classified_as_first_install():
+    result = _run_linux_python(HARNESS + r'''
+with tempfile.TemporaryDirectory(prefix="autobit-dangling-ledger-") as fixture:
+    base = Path(fixture)
+    candidate(base)
+    (base / "state").mkdir()
+    outside = base / "outside"
+    outside.mkdir()
+    (base / "state/paper.sqlite3").symlink_to(outside / "missing.sqlite3")
+    operation = run('backup_closed_ledger\n', base)
+    assert operation.returncode != 0
+    assert "ledger" in operation.stderr.lower()
+    assert not (base / "backups" / f"{TIMESTAMP}-{COMMIT}").exists()
+    assert list(outside.iterdir()) == []
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -214,6 +261,11 @@ with tempfile.TemporaryDirectory(prefix="autobit-writer-check-") as fixture:
     )
     operation = run('AUTOBIT_PROC_ROOT="$fixture/proc"\nassert_no_paper_writer\n', base)
     assert operation.returncode != 0
+    (proc / "cmdline").write_bytes(
+        b"python\0-m\0autobit.cli\0paper-run\0--db\0/var/lib/autobit/paper/paper.sqlite3.old\0"
+    )
+    operation = run('AUTOBIT_PROC_ROOT="$fixture/proc"\nassert_no_paper_writer\n', base)
+    assert operation.returncode == 0, operation.stderr
     (proc / "cmdline").write_bytes(b"python\0-m\0autobit.cli\0paper-status\0")
     operation = run('AUTOBIT_PROC_ROOT="$fixture/proc"\nassert_no_paper_writer\n', base)
     assert operation.returncode == 0, operation.stderr
@@ -250,6 +302,8 @@ previous_release="$fixture/releases/0000000000000000000000000000000000000000"
 previous_enabled=enabled
 switch_current_atomically "$candidate_release"
 service_stop() { :; }
+wait_for_paper_service_stop() { :; }
+assert_no_paper_writer() { :; }
 service_daemon_reload() { :; }
 service_enable() { :; }
 service_start() { :; }
@@ -277,12 +331,58 @@ previous_release=
 switch_current_atomically "$candidate_release"
 service_stop() { printf 'stop\n' >> "$fixture/actions"; }
 service_disable() { printf 'disable\n' >> "$fixture/actions"; }
+wait_for_paper_service_stop() { printf 'inactive\n' >> "$fixture/actions"; }
+assert_no_paper_writer() { printf 'no-writer\n' >> "$fixture/actions"; }
 rollback_code_only
 """, base)
     assert operation.returncode == 0, operation.stderr
-    assert (base / "actions").read_text().splitlines() == ["stop", "disable"]
+    assert (base / "actions").read_text().splitlines() == [
+        "stop", "disable", "inactive", "no-writer"
+    ]
     assert state.read_bytes() == b"new-ledger"
     assert (base / "current").resolve() == base / "releases" / COMMIT
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_first_install_stop_failure_is_a_distinct_rollback_failure():
+    result = _run_linux_python(HARNESS + r'''
+with tempfile.TemporaryDirectory(prefix="autobit-stop-failure-") as fixture:
+    base = Path(fixture)
+    candidate(base)
+    evidence = base / "backups/evidence"
+    operation = run(r"""
+previous_release=
+ledger_backup="$fixture/backups/evidence"
+activation_in_progress=1
+service_stop() { return 1; }
+service_disable() { printf 'disable\n' >> "$fixture/actions"; }
+activation_exit_trap 9
+""", base)
+    assert operation.returncode == 70
+    assert (base / "actions").read_text().splitlines() == ["disable"]
+    assert "previous=NO_PREVIOUS_RELEASE" in operation.stderr
+    assert str(base / "releases" / COMMIT) in operation.stderr
+    assert str(evidence) in operation.stderr
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failed_check", ("active", "writer"))
+def test_first_install_rollback_requires_inactive_writer_free_service(failed_check):
+    result = _run_linux_python(HARNESS + f'''
+with tempfile.TemporaryDirectory(prefix="autobit-stop-verification-") as fixture:
+    base = Path(fixture)
+    candidate(base)
+    operation = run(r"""
+previous_release=
+service_stop() {{ :; }}
+service_disable() {{ :; }}
+wait_for_paper_service_stop() {{ {'return 1' if failed_check == 'active' else ':'}; }}
+assert_no_paper_writer() {{ {'return 1' if failed_check == 'writer' else ':'}; }}
+rollback_code_only
+""", base)
+    assert operation.returncode != 0
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -318,6 +418,8 @@ install() {
     command chmod 0644 -- "$2"
 }
 service_stop() { printf 'stop\n' >> "$fixture/actions"; }
+wait_for_paper_service_stop() { printf 'inactive\n' >> "$fixture/actions"; }
+assert_no_paper_writer() { printf 'no-writer\n' >> "$fixture/actions"; }
 restart_journald() { printf 'journald\n' >> "$fixture/actions"; }
 service_daemon_reload() { printf 'daemon-reload\n' >> "$fixture/actions"; }
 service_disable() { printf 'disable\n' >> "$fixture/actions"; }
@@ -329,7 +431,7 @@ rollback_code_only
     assert (config / "unit").read_text() == "previous unit\n"
     assert (config / "journal").read_text() == "previous journal\n"
     assert (base / "actions").read_text().splitlines() == [
-        "stop", "journald", "daemon-reload", "disable", "start"
+        "stop", "inactive", "no-writer", "journald", "daemon-reload", "disable", "start"
     ]
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
@@ -345,6 +447,8 @@ previous_release="$fixture/releases/0000000000000000000000000000000000000000"
 previous_enabled=enabled
 activation_in_progress=1
 service_stop() { :; }
+wait_for_paper_service_stop() { :; }
+assert_no_paper_writer() { :; }
 restore_config_backups() { :; }
 restart_journald() { :; }
 service_daemon_reload() { :; }
@@ -355,5 +459,38 @@ activation_exit_trap 9
     assert operation.returncode == 70
     assert str(base / "releases" / ("0" * 40)) in operation.stderr
     assert str(base / "releases" / COMMIT) in operation.stderr
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_started_service_command_requires_exact_argv_and_paths():
+    result = _run_linux_python(HARNESS + r'''
+with tempfile.TemporaryDirectory(prefix="autobit-service-command-") as fixture:
+    base = Path(fixture)
+    proc = base / "proc/321"
+    proc.mkdir(parents=True)
+    expected = [
+        "/opt/autobit/current/.venv/bin/python", "-m", "autobit.cli", "paper-run",
+        "--db", "/var/lib/autobit/paper/paper.sqlite3",
+        "--data-dir", "/var/lib/autobit/raw/paper",
+    ]
+    def check(arguments):
+        (proc / "cmdline").write_bytes(b"\0".join(value.encode() for value in arguments) + b"\0")
+        return run(
+            'AUTOBIT_PROC_ROOT="$fixture/proc"\n'
+            'production_ledger=/var/lib/autobit/paper/paper.sqlite3\n'
+            'production_data=/var/lib/autobit/raw/paper\n'
+            'service_command_is_expected 321\n',
+            base,
+        )
+    assert check(expected).returncode == 0
+    near_matches = (
+        [*expected[:5], expected[5] + ".old", *expected[6:]],
+        [*expected[:7], expected[7] + "-alt"],
+        [expected[0] + ".old", *expected[1:]],
+        [*expected, "--db", expected[5]],
+    )
+    for arguments in near_matches:
+        assert check(arguments).returncode != 0, arguments
 ''')
     assert result.returncode == 0, result.stdout + result.stderr

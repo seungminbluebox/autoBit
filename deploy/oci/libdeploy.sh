@@ -339,16 +339,28 @@ for cmdline_path in proc_root.glob("[0-9]*/cmdline"):
         command = cmdline_path.read_bytes()
     except (FileNotFoundError, PermissionError, ProcessLookupError):
         continue
-    if b"autobit.cli" in command and b"paper-run" in command and ledger in command:
+    if not command.endswith(b"\0"):
+        continue
+    arguments = command[:-1].split(b"\0")
+    is_paper_run = any(
+        arguments[index:index + 3] == [b"-m", b"autobit.cli", b"paper-run"]
+        for index in range(len(arguments) - 2)
+    )
+    uses_ledger = any(
+        arguments[index:index + 2] == [b"--db", ledger]
+        for index in range(len(arguments) - 1)
+    )
+    if is_paper_run and uses_ledger:
         raise SystemExit("paper ledger writer remains active")
 PY
 }
 
 backup_closed_ledger() {
     require_commit "$commit"
-    local backup bundle verification owner group
+    local backup bundle verification verification_source owner group
     backup="${backup_root}/${activation_timestamp}-${commit}"
     [ ! -e "$backup" ] && [ ! -L "$backup" ] || die "backup directory already exists: $backup"
+    [ ! -L "$ledger" ] || die "paper ledger must not be a symbolic link"
     if [ ! -e "$ledger" ]; then
         [ ! -e "${ledger}-wal" ] && [ ! -L "${ledger}-wal" ] \
             && [ ! -e "${ledger}-shm" ] && [ ! -L "${ledger}-shm" ] \
@@ -382,8 +394,10 @@ backup_closed_ledger() {
 
     bundle="$backup/bundle"
     verification="$backup/verification"
+    verification_source="$verification/source"
     make_directory_nofollow "$bundle" "$owner" "$group" 0700
     make_directory_nofollow "$verification" "$owner" "$group" 0700
+    make_directory_nofollow "$verification_source" "$owner" "$group" 0700
     cp --preserve=mode,timestamps -- "$ledger" "$bundle/paper.sqlite3"
     if [ -e "${ledger}-wal" ]; then
         cp --preserve=mode,timestamps -- "${ledger}-wal" "$bundle/paper.sqlite3-wal"
@@ -397,8 +411,12 @@ backup_closed_ledger() {
         fi
     ) > "$backup/SHA256SUMS"
     (cd -- "$bundle" && sha256sum -c -- "$backup/SHA256SUMS" >/dev/null)
+    cp --preserve=mode,timestamps -- "$bundle/paper.sqlite3" "$verification_source/paper.sqlite3"
+    if [ -e "$bundle/paper.sqlite3-wal" ]; then
+        cp --preserve=mode,timestamps -- "$bundle/paper.sqlite3-wal" "$verification_source/paper.sqlite3-wal"
+    fi
     /usr/bin/python3 "$candidate_release/deploy/oci/sqlite_tools.py" snapshot \
-        --source "$bundle/paper.sqlite3" --destination "$verification/paper.sqlite3"
+        --source "$verification_source/paper.sqlite3" --destination "$verification/paper.sqlite3"
     "$candidate_release/.venv/bin/python" -m autobit.cli paper-status \
         --db "$verification/paper.sqlite3" > "$verification/paper-status.json"
     /usr/bin/python3 - "$verification/paper-status.json" <<'PY'
@@ -446,7 +464,8 @@ wait_for_paper_service_stop() {
         attempts=$((attempts + 1))
         sleep 1
     done
-    die "paper service did not stop within 120 seconds"
+    printf 'paper service did not stop within 120 seconds\n' >&2
+    return 1
 }
 
 ensure_config_backup() {
@@ -564,16 +583,23 @@ candidate_paper_status() {
 service_command_is_expected() {
     /usr/bin/python3 - "$1" "${AUTOBIT_PROC_ROOT:-/proc}" \
         "${production_ledger:-/var/lib/autobit/paper/paper.sqlite3}" \
-        "${production_data:-/var/lib/autobit/raw/paper}" <<'PY'
+        "${production_data:-/var/lib/autobit/raw/paper}" \
+        "${paper_python:-/opt/autobit/current/.venv/bin/python}" <<'PY'
 from pathlib import Path
 import sys
-pid, proc_root, ledger, data = sys.argv[1:]
+pid, proc_root, ledger, data, python = sys.argv[1:]
 try:
     command = (Path(proc_root) / pid / "cmdline").read_bytes()
 except (FileNotFoundError, PermissionError, ProcessLookupError):
     raise SystemExit(1)
-if (b"autobit.cli" not in command or b"paper-run" not in command
-        or ledger.encode() not in command or data.encode() not in command):
+if not command.endswith(b"\0"):
+    raise SystemExit(1)
+arguments = command[:-1].split(b"\0")
+expected = [
+    python.encode(), b"-m", b"autobit.cli", b"paper-run",
+    b"--db", ledger.encode(), b"--data-dir", data.encode(),
+]
+if arguments != expected:
     raise SystemExit(1)
 PY
 }
@@ -604,9 +630,15 @@ wait_for_started_service() {
 }
 
 rollback_code_only() {
-    service_stop || [ -z "${previous_release:-}" ] || return 1
+    local stop_failed=0 disable_failed=0
+    service_stop || stop_failed=1
     if [ -z "${previous_release:-}" ]; then
-        service_disable || return 1
+        service_disable || disable_failed=1
+    fi
+    [ "$stop_failed" -eq 0 ] && [ "$disable_failed" -eq 0 ] || return 1
+    wait_for_paper_service_stop || return 1
+    assert_no_paper_writer || return 1
+    if [ -z "${previous_release:-}" ]; then
         return 0
     fi
     restore_config_backups || return 1
