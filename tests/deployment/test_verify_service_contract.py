@@ -1,6 +1,9 @@
 import json
+from functools import lru_cache
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -10,6 +13,78 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "deploy/oci/verify-service.sh"
 OCI_RUNBOOK = ROOT / "docs/runbooks/oci-paper.md"
+
+
+@lru_cache
+def _shell_prefix():
+    if os.name != "nt":
+        return []
+    if not shutil.which("wsl.exe"):
+        pytest.skip("No WSL distribution is available")
+    result = subprocess.run(["wsl.exe", "bash", "-c", "true"], capture_output=True)
+    if result.returncode:
+        pytest.skip("No runnable WSL distribution is available")
+    return ["wsl.exe", "--exec"]
+
+
+def _linux_path(path: Path) -> str:
+    if os.name != "nt":
+        return str(path)
+    _shell_prefix()
+    windows_path = str(path).replace("\\", "/")
+    return subprocess.run(
+        ["wsl.exe", "wslpath", "-a", windows_path],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout.strip()
+
+
+def _run_dispatch_harness(mode: str, failure: str = "") -> subprocess.CompletedProcess[str]:
+    harness = r'''
+set -eu
+source "$1"
+events="$2"
+failure=$3
+initialize_evidence() { evidence=/tmp/mock-verification-evidence; printf 'initialize\n' >> "$events"; }
+collect_evidence() {
+    printf 'collect:%s\n' "$1" >> "$events"
+    [ "$failure" != "collect-$1" ]
+}
+systemctl() {
+    [ "$1" = restart ] && [ "$2" = autobit-paper.service ]
+    printf 'restart\n' >> "$events"
+    [ "$failure" != restart ]
+}
+wait_for_started_service() { printf 'readiness\n' >> "$events"; [ "$failure" != readiness ]; }
+compare_restart_evidence() { printf 'compare\n' >> "$events"; [ "$failure" != compare ]; }
+verify_journal_preservation() { printf 'journal\n' >> "$events"; [ "$failure" != journal ]; }
+dispatch_verification "$4"
+'''
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="autobit-verify-dispatch-") as directory:
+        events = Path(directory) / "events.txt"
+        events.touch()
+        result = subprocess.run(
+            [
+                *_shell_prefix(),
+                "bash",
+                "-s",
+                "--",
+                _linux_path(SCRIPT),
+                _linux_path(events),
+                failure,
+                mode,
+            ],
+            input=harness.encode("utf-8"),
+            capture_output=True,
+        )
+        result.stdout = result.stdout.decode("utf-8")
+        result.stderr = result.stderr.decode("utf-8")
+        result.events = events.read_text(encoding="utf-8").splitlines() if events.exists() else []  # type: ignore[attr-defined]
+        return result
 
 
 def _script_text() -> str:
@@ -117,6 +192,87 @@ def test_inspect_is_read_only_and_restart_is_one_explicit_mutation():
     assert restart.count(restart_call) == 1
     assert "wait_for_started_service" in restart
     assert "180" in text
+
+
+def test_executable_dispatcher_orders_inspect_and_exactly_one_restart():
+    inspect = _run_dispatch_harness("inspect")
+    restart = _run_dispatch_harness("restart")
+
+    assert inspect.returncode == 0, inspect.stderr
+    assert inspect.events == ["initialize", "collect:before"]  # type: ignore[attr-defined]
+    assert restart.returncode == 0, restart.stderr
+    assert restart.events == [  # type: ignore[attr-defined]
+        "initialize",
+        "collect:before",
+        "restart",
+        "readiness",
+        "collect:after",
+        "compare",
+        "journal",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("collect-before", "restart", "readiness", "collect-after", "compare", "journal"),
+)
+def test_executable_dispatcher_propagates_command_and_validator_failures(failure: str):
+    result = _run_dispatch_harness("restart", failure)
+
+    assert result.returncode != 0, failure
+    assert result.events.count("restart") == (0 if failure == "collect-before" else 1)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("is_active", "active_state", "sub_state", "accepted"),
+    (
+        (True, "active", "running", True),
+        (False, "active", "running", False),
+        (True, "activating", "start", False),
+        (True, "deactivating", "stop-sigterm", False),
+        (True, "active", "exited", False),
+    ),
+)
+def test_runtime_state_validator_rejects_transitional_or_nonrunning_service(
+    is_active: bool,
+    active_state: str,
+    sub_state: str,
+    accepted: bool,
+):
+    harness = r'''
+set -eu
+source "$1"
+service=autobit-paper.service
+is_active=$2
+configured_active_state=$3
+configured_sub_state=$4
+systemctl() {
+    if [ "$1" = is-active ]; then [ "$is_active" = true ]; return; fi
+    [ "$1" = show ] || return 2
+    case "$3" in
+        --property=ActiveState) printf '%s\n' "$configured_active_state" ;;
+        --property=SubState) printf '%s\n' "$configured_sub_state" ;;
+        *) return 2 ;;
+    esac
+}
+validate_service_runtime_state
+'''
+    result = subprocess.run(
+        [
+            *_shell_prefix(),
+            "bash",
+            "-s",
+            "--",
+            _linux_path(SCRIPT),
+            str(is_active).lower(),
+            active_state,
+            sub_state,
+        ],
+        input=harness.encode("utf-8"),
+        capture_output=True,
+    )
+
+    assert (result.returncode == 0) is accepted
 
 
 def test_evidence_uses_probes_without_copying_or_hashing_the_active_ledger():

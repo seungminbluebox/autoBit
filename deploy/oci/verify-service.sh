@@ -94,8 +94,21 @@ with cursor_path.open("x", encoding="utf-8") as stream:
 PY
 }
 
+validate_service_runtime_state() {
+    local active_state sub_state
+    systemctl is-active --quiet "$service" \
+        || die "service is not active"
+    active_state=$(systemctl show "$service" --property=ActiveState --value)
+    sub_state=$(systemctl show "$service" --property=SubState --value)
+    [ "$active_state" = active ] \
+        || die "service ActiveState is not active: $active_state"
+    [ "$sub_state" = running ] \
+        || die "service SubState is not running: $sub_state"
+}
+
 collect_evidence() {
     local phase="$1" pid
+    validate_service_runtime_state
     date -u +%Y-%m-%dT%H:%M:%SZ > "$evidence/time-${phase}-utc.txt"
     printf '%s\n' "$release_target" > "$evidence/release-${phase}.txt"
     /usr/bin/python3 - "$evidence/boot-id-${phase}.txt" <<'PY'
@@ -315,16 +328,23 @@ run_restart() {
     verify_journal_preservation
 }
 
-[ "$#" -eq 1 ] || die "expected inspect or restart"
-mode=$1
-case "$mode" in
-    inspect|restart) ;;
-    *) die "expected inspect or restart" ;;
-esac
+dispatch_verification() {
+    local mode
+    [ "$#" -eq 1 ] || die "expected inspect or restart"
+    mode=$1
+    case "$mode" in
+        inspect|restart) ;;
+        *) die "expected inspect or restart" ;;
+    esac
 
-initialize_evidence
-case "$mode" in
-    inspect) run_inspect ;;
-    restart) run_restart ;;
-esac
-printf 'Verification evidence: %s\n' "$evidence"
+    initialize_evidence
+    case "$mode" in
+        inspect) run_inspect ;;
+        restart) run_restart ;;
+    esac
+    printf 'Verification evidence: %s\n' "$evidence"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    dispatch_verification "$@"
+fi

@@ -455,6 +455,7 @@ service_enable() { systemctl enable autobit-paper.service; }
 service_start() { systemctl start autobit-paper.service; }
 service_daemon_reload() { systemctl daemon-reload; }
 service_is_enabled() { systemctl is-enabled --quiet autobit-paper.service; }
+service_is_active() { systemctl is-active --quiet autobit-paper.service; }
 
 wait_for_paper_service_stop() {
     local state attempts=0
@@ -552,7 +553,7 @@ restore_config_backups() {
     restore_one_config "${journal_config_state:-}" "$journal_destination" 99-autobit-persistence.conf || return 1
 }
 
-prepare_persistent_journal() {
+prepare_persistent_journal_storage() {
     local journal_group
     if [ -d /run/log/journal ] && [ ! -L /run/log/journal ]; then
         journal_group=$(stat -c %G -- /run/log/journal)
@@ -565,12 +566,16 @@ prepare_persistent_journal() {
         install -d --owner=root --group="$journal_group" --mode=2755 -- /var/log/journal
     fi
     systemd-tmpfiles --create --prefix /var/log/journal
-    restart_journald
 }
 
-restart_journald() {
-    systemctl restart systemd-journald
-    journalctl --disk-usage >/dev/null
+journald_reload() { systemctl restart systemd-journald; }
+journald_probe() { journalctl --disk-usage >/dev/null; }
+
+restart_journald() { journald_reload && journald_probe; }
+
+prepare_persistent_journal() {
+    prepare_persistent_journal_storage
+    restart_journald
 }
 
 candidate_paper_status() {
@@ -629,30 +634,69 @@ wait_for_started_service() {
     return 1
 }
 
+remove_candidate_current() {
+    local target
+    if [ ! -e "$current_link" ] && [ ! -L "$current_link" ]; then
+        return 0
+    fi
+    [ -L "$current_link" ] || return 1
+    target=$(readlink -- "$current_link") || return 1
+    [ "$target" = "$candidate_release" ] || return 1
+    unlink -- "$current_link"
+}
+
 rollback_code_only() {
     local stop_failed=0 disable_failed=0
-    service_stop || stop_failed=1
-    if [ -z "${previous_release:-}" ]; then
+    if [ -n "${previous_release:-}" ] \
+        || [ "${candidate_start_attempted:-1}" = 1 ]; then
+        service_stop || stop_failed=1
+    fi
+    if [ -z "${previous_release:-}" ] \
+        && [ "${candidate_enable_attempted:-1}" = 1 ]; then
         service_disable || disable_failed=1
     fi
     [ "$stop_failed" -eq 0 ] && [ "$disable_failed" -eq 0 ] || return 1
     wait_for_paper_service_stop || return 1
     assert_no_paper_writer || return 1
-    if [ -z "${previous_release:-}" ]; then
-        return 0
+    if [ -n "${unit_config_state:-}" ] || [ -n "${journal_config_state:-}" ]; then
+        restore_config_backups || return 1
     fi
-    restore_config_backups || return 1
     case "${journal_config_state:-}" in
         EXISTING|ABSENT) restart_journald || return 1 ;;
     esac
-    switch_current_atomically "$previous_release" || return 1
-    service_daemon_reload || return 1
-    if [ "${previous_enabled:-enabled}" = enabled ]; then
-        service_enable || return 1
+    if [ -n "${previous_release:-}" ]; then
+        switch_current_atomically "$previous_release" || return 1
     else
-        service_disable || return 1
+        remove_candidate_current || return 1
     fi
-    service_start || return 1
+    if [ -n "${unit_config_state:-}" ] || [ -n "${journal_config_state:-}" ]; then
+        service_daemon_reload || return 1
+    fi
+    if [ -n "${previous_release:-}" ]; then
+        if [ "${previous_enabled:-enabled}" = enabled ]; then
+            service_enable || return 1
+        else
+            service_disable || return 1
+        fi
+        if [ "${previous_active:-active}" = active ]; then
+            service_start || return 1
+        fi
+    fi
+}
+
+run_post_backup_activation() {
+    install_release_config
+    prepare_persistent_journal_storage
+    journald_reload
+    journald_probe
+    switch_current_atomically "$candidate_release"
+    service_daemon_reload
+    candidate_enable_attempted=1
+    service_enable
+    candidate_start_attempted=1
+    service_start
+    wait_for_started_service \
+        || die "candidate service did not become ready within 180 seconds"
 }
 
 activation_exit_trap() {
@@ -688,6 +732,9 @@ activate_transaction() {
     config_backup=
     previous_release=
     previous_enabled=disabled
+    previous_active=inactive
+    candidate_enable_attempted=0
+    candidate_start_attempted=0
 
     validate_release_candidate
     if [ -L "$current_link" ]; then
@@ -703,22 +750,19 @@ activate_transaction() {
     if service_is_enabled; then
         previous_enabled=enabled
     fi
+    if service_is_active; then
+        previous_active=active
+    fi
 
     activation_in_progress=1
     trap 'activation_exit_trap $?' EXIT
     if service_unit_exists; then
-        systemctl stop autobit-paper.service
+        service_stop
     fi
     wait_for_paper_service_stop
     assert_no_paper_writer
     backup_closed_ledger >/dev/null
-    install_release_config
-    prepare_persistent_journal
-    switch_current_atomically "$candidate_release"
-    systemctl daemon-reload
-    systemctl enable autobit-paper.service
-    systemctl start autobit-paper.service
-    wait_for_started_service || die "candidate service did not become ready within 180 seconds"
+    run_post_backup_activation
     activation_in_progress=0
     trap - EXIT
     printf 'Activated release: %s\n' "$candidate_release"

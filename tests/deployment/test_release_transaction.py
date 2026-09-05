@@ -340,7 +340,164 @@ rollback_code_only
         "stop", "disable", "inactive", "no-writer"
     ]
     assert state.read_bytes() == b"new-ledger"
-    assert (base / "current").resolve() == base / "releases" / COMMIT
+    assert not (base / "current").exists() and not (base / "current").is_symlink()
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_post_backup_failure_matrix_restores_code_config_and_service_without_db_restore():
+    result = _run_linux_python(HARNESS + r'''
+stages = ("config", "journal-storage", "journald-reload", "journald-probe", "link",
+          "daemon-reload", "enable", "start", "readiness")
+cases = (
+    (True, "disabled", "inactive"),
+    (False, "enabled", "active"),
+    (False, "enabled", "inactive"),
+    (False, "disabled", "active"),
+    (False, "disabled", "inactive"),
+)
+for first_install, expected_enabled, expected_active in cases:
+    for stage in stages:
+        with tempfile.TemporaryDirectory(prefix="autobit-activation-matrix-") as fixture:
+            base = Path(fixture)
+            wanted = candidate(base)
+            previous = base / "releases" / ("0" * 40)
+            previous.mkdir(parents=True)
+            state = base / "state"
+            state.mkdir()
+            database = state / "paper.sqlite3"
+            database.write_bytes(b"never-restore-this-ledger")
+            evidence = base / "evidence"
+            evidence.mkdir()
+            (evidence / "retained.txt").write_text("retained\n")
+            config = base / "config"
+            config.mkdir()
+            backup = base / "config-backup"
+            backup.mkdir()
+            if not first_install:
+                (base / "current").symlink_to(previous)
+                (config / "unit").write_text("previous unit\n")
+                (config / "journal").write_text("previous journal\n")
+                (backup / "autobit-paper.service").write_text("previous unit\n")
+                (backup / "99-autobit-persistence.conf").write_text("previous journal\n")
+            script = r"""
+set -eu
+source "$1"
+fixture=$2
+commit=$7
+candidate_release="$fixture/releases/$commit"
+previous_release=$3
+current_link="$fixture/current"
+ledger="$fixture/state/paper.sqlite3"
+ledger_backup="$fixture/evidence"
+unit_destination="$fixture/config/unit"
+journal_destination="$fixture/config/journal"
+config_backup="$fixture/config-backup"
+previous_enabled=$4
+previous_active=$5
+unit_config_state=
+journal_config_state=
+activation_in_progress=1
+candidate_enable_attempted=0
+candidate_start_attempted=0
+fail_stage=$6
+active=inactive
+enabled=disabled
+[ "$previous_active" = active ] && active=inactive
+printf '%s\n' "$active" > "$fixture/service-active"
+printf '%s\n' "$enabled" > "$fixture/service-enabled"
+maybe_fail() {
+    [ "$1" != "$fail_stage" ] && return 0
+    [ -e "$fixture/failed-once" ] && return 0
+    : > "$fixture/failed-once"
+    return 1
+}
+install_release_config() {
+    maybe_fail config
+    if [ -e "$unit_destination" ]; then
+        unit_config_state=EXISTING
+        journal_config_state=EXISTING
+    else
+        unit_config_state=ABSENT
+        journal_config_state=ABSENT
+    fi
+    printf 'candidate unit\n' > "$unit_destination"
+    printf 'candidate journal\n' > "$journal_destination"
+    printf 'config\n' >> "$fixture/actions"
+}
+prepare_persistent_journal_storage() {
+    printf 'journal-storage\n' >> "$fixture/actions"
+    maybe_fail journal-storage
+}
+journald_reload() { printf 'journald-reload\n' >> "$fixture/actions"; maybe_fail journald-reload; }
+journald_probe() { printf 'journald-probe\n' >> "$fixture/actions"; maybe_fail journald-probe; }
+restart_journald() { printf 'rollback-journald\n' >> "$fixture/actions"; }
+switch_current_atomically() {
+    [ ! -e "$current_link" ] || unlink -- "$current_link"
+    ln -s -- "$1" "$current_link"
+    printf 'link:%s\n' "$1" >> "$fixture/actions"
+    maybe_fail link
+}
+require_protected_directory() { :; }
+validate_installed_config() { [ -f "$1" ] && [ ! -L "$1" ]; }
+install() {
+    while [ "$1" != -- ]; do shift; done
+    shift
+    command cp -- "$1" "$2"
+    command chmod 0644 -- "$2"
+}
+service_stop() {
+    if [ -z "$previous_release" ] && [ ! -e "$unit_destination" ]; then
+        printf 'stop-missing-unit\n' >> "$fixture/actions"
+        return 1
+    fi
+    printf 'inactive\n' > "$fixture/service-active"
+    printf 'stop\n' >> "$fixture/actions"
+}
+service_disable() {
+    if [ -z "$previous_release" ] && [ ! -e "$unit_destination" ]; then
+        printf 'disable-missing-unit\n' >> "$fixture/actions"
+        return 1
+    fi
+    printf 'disabled\n' > "$fixture/service-enabled"
+    printf 'disable\n' >> "$fixture/actions"
+}
+service_enable() { printf 'enabled\n' > "$fixture/service-enabled"; printf 'enable\n' >> "$fixture/actions"; maybe_fail enable; }
+service_start() { printf 'active\n' > "$fixture/service-active"; printf 'start\n' >> "$fixture/actions"; maybe_fail start; }
+service_daemon_reload() { printf 'daemon-reload\n' >> "$fixture/actions"; maybe_fail daemon-reload; }
+wait_for_started_service() { printf 'readiness\n' >> "$fixture/actions"; maybe_fail readiness; }
+wait_for_paper_service_stop() { [ "$(<"$fixture/service-active")" = inactive ]; }
+assert_no_paper_writer() { :; }
+trap 'activation_exit_trap $?' EXIT
+run_post_backup_activation
+activation_in_progress=0
+trap - EXIT
+"""
+            operation = subprocess.run(
+                ["bash", "-s", "--", LIBRARY, str(base),
+                 "" if first_install else str(previous),
+                 expected_enabled, expected_active, stage, COMMIT],
+                input=script, text=True, capture_output=True,
+            )
+            assert operation.returncode != 0 and operation.returncode != 70, (
+                first_install, stage, operation.stdout, operation.stderr)
+            assert database.read_bytes() == b"never-restore-this-ledger"
+            assert (evidence / "retained.txt").read_text() == "retained\n"
+            assert wanted.is_dir()
+            if first_install:
+                assert not (base / "current").exists() and not (base / "current").is_symlink()
+                assert not (config / "unit").exists()
+                assert not (config / "journal").exists()
+                assert (base / "service-active").read_text().strip() == "inactive"
+                assert (base / "service-enabled").read_text().strip() == "disabled"
+            else:
+                assert (base / "current").resolve() == previous
+                assert (config / "unit").read_text() == "previous unit\n"
+                assert (config / "journal").read_text() == "previous journal\n"
+                assert (base / "service-active").read_text().strip() == expected_active
+                assert (base / "service-enabled").read_text().strip() == expected_enabled
+            assert str(wanted) in operation.stderr
+            assert str(evidence) in operation.stderr
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
 

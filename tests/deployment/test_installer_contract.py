@@ -303,6 +303,97 @@ systemd-analyze() { [ "$1" = verify ] && [ -f "$2" ]; }
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_prepare_success_cleans_only_validated_private_scratch_files():
+    installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
+    match = re.search(r"^cleanup_prepare_scratch\(\) \{\n.*?^\}", installer, re.M | re.S)
+    assert match is not None, "missing bounded prepare scratch cleanup"
+    prepare = re.search(r"^prepare_release\(\) \{\n.*?^\}", installer, re.M | re.S)
+    assert prepare is not None
+    assert prepare.group(0).index("cleanup_prepare_scratch") < prepare.group(0).index(
+        "Prepared immutable release"
+    )
+    assert "trap - EXIT" in prepare.group(0)
+    assert "rm -rf" not in installer
+
+    result = _run_linux_python(r'''
+from pathlib import Path
+import subprocess
+import sys
+
+helper = sys.argv[1]
+script = r"""
+set -eu
+die() { printf '%s\n' "$*" >&2; return 1; }
+""" + helper + r"""
+download_dir=$(mktemp -d /tmp/autobit-prepare.XXXXXXXX)
+uv_archive_name=uv.tar.gz
+python_archive_name=python.tar.gz
+printf '%s\n' "$download_dir"
+for name in source.tar.gz bundle.manifest autobit-paper.service "$uv_archive_name" "$python_archive_name"; do
+    : > "$download_dir/$name"
+done
+cleanup_prepare_scratch
+"""
+operation = subprocess.run(["bash", "-s"], input=script, text=True, capture_output=True)
+assert operation.returncode == 0, operation.stderr
+scratch = Path(operation.stdout.strip())
+assert not scratch.exists(), "successful prepare retained private scratch"
+''', match.group(0))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("case", ("unexpected", "known-symlink", "unsafe-name"))
+def test_prepare_scratch_cleanup_fails_closed_and_retains_evidence(case):
+    installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
+    match = re.search(r"^cleanup_prepare_scratch\(\) \{\n.*?^\}", installer, re.M | re.S)
+    assert match is not None, "missing bounded prepare scratch cleanup"
+    result = _run_linux_python(r'''
+from pathlib import Path
+import subprocess
+import sys
+
+helper, case = sys.argv[1:]
+script = r"""
+set -eu
+die() { printf '%s\n' "$*" >&2; return 1; }
+""" + helper + r"""
+download_dir=$(mktemp -d /tmp/autobit-prepare.XXXXXXXX)
+uv_archive_name=uv.tar.gz
+python_archive_name=python.tar.gz
+printf '%s\n' "$download_dir"
+for name in source.tar.gz bundle.manifest autobit-paper.service "$uv_archive_name" "$python_archive_name"; do
+    : > "$download_dir/$name"
+done
+case "$1" in
+    unexpected) : > "$download_dir/operator-note" ;;
+    known-symlink)
+        : > "$download_dir/outside-marker"
+        unlink -- "$download_dir/uv.tar.gz"
+        ln -s -- "$download_dir/outside-marker" "$download_dir/uv.tar.gz"
+        ;;
+    unsafe-name) uv_archive_name=../outside-marker ;;
+esac
+cleanup_prepare_scratch
+"""
+operation = subprocess.run(["bash", "-s", "--", case], input=script, text=True, capture_output=True)
+scratch = Path(operation.stdout.splitlines()[0])
+try:
+    assert operation.returncode != 0, "unsafe scratch shape was accepted"
+    assert scratch.is_dir(), "failure did not retain scratch evidence"
+    if case == "known-symlink":
+        assert (scratch / "uv.tar.gz").is_symlink()
+        assert (scratch / "outside-marker").read_bytes() == b""
+    if case == "unexpected":
+        assert (scratch / "operator-note").is_file()
+        assert (scratch / "source.tar.gz").is_file(), "known evidence was deleted before the unknown entry was rejected"
+finally:
+    for child in scratch.iterdir():
+        child.unlink()
+    scratch.rmdir()
+''', match.group(0), case)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("swap_at", ["none", "cache", "smoke"])
 @pytest.mark.parametrize("mode", ["0700", "0755"])
 def test_directory_descriptors_pin_ancestors_and_leaf_during_mutation(swap_at, mode):

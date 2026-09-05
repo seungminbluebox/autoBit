@@ -27,7 +27,7 @@ PY
         command -v "$command" >/dev/null || die "required command unavailable: $command"
     done
     if [ "$operation" = prepare ]; then
-        for command in curl tar useradd systemd-analyze; do
+        for command in curl rmdir stat tar unlink useradd systemd-analyze; do
             command -v "$command" >/dev/null || die "required command unavailable: $command"
         done
     else
@@ -139,6 +139,54 @@ candidate_python() {
         "$staging/.venv/bin/python" "$@"
 }
 
+cleanup_prepare_scratch() {
+    local name owner mode scratch_file
+    case "$download_dir" in
+        /tmp/autobit-prepare.????????) ;;
+        *) die "prepare scratch path is invalid: $download_dir" ;;
+    esac
+    [ -d "$download_dir" ] && [ ! -L "$download_dir" ] \
+        || die "prepare scratch directory is invalid: $download_dir"
+    owner=$(stat -c %u -- "$download_dir")
+    mode=$(stat -c %a -- "$download_dir")
+    [ "$owner" = "$(id -u)" ] && [ "$mode" = 700 ] \
+        || die "prepare scratch directory is not private to its owner"
+
+    # Validate the complete allowlist before removing any evidence. Archive
+    # names have already passed the pinned runtime manifest validator, but are
+    # checked again here because they form cleanup paths.
+    for name in source.tar.gz bundle.manifest autobit-paper.service \
+        "$uv_archive_name" "$python_archive_name"; do
+        case "$name" in ''|.|..|*/*) die "prepare scratch file name is invalid" ;; esac
+        scratch_file="$download_dir/$name"
+        case "$scratch_file" in "$download_dir"/*) ;; *) die "prepare scratch file path escaped" ;; esac
+        if [ -e "$scratch_file" ] || [ -L "$scratch_file" ]; then
+            [ -f "$scratch_file" ] && [ ! -L "$scratch_file" ] \
+                || die "prepare scratch artifact is not a regular file: $scratch_file"
+        fi
+    done
+    for scratch_file in "$download_dir"/* "$download_dir"/.[!.]* "$download_dir"/..?*; do
+        if [ ! -e "$scratch_file" ] && [ ! -L "$scratch_file" ]; then
+            continue
+        fi
+        case "$scratch_file" in
+            "$download_dir/source.tar.gz"|"$download_dir/bundle.manifest"|\
+            "$download_dir/autobit-paper.service"|\
+            "$download_dir/$uv_archive_name"|"$download_dir/$python_archive_name") ;;
+            *) die "prepare scratch contains an unexpected artifact: $scratch_file" ;;
+        esac
+    done
+    for name in source.tar.gz bundle.manifest autobit-paper.service \
+        "$uv_archive_name" "$python_archive_name"; do
+        scratch_file="$download_dir/$name"
+        if [ -e "$scratch_file" ]; then
+            unlink -- "$scratch_file"
+        fi
+    done
+    # The directory is known-empty here; no recursive deletion is used.
+    rmdir -- "$download_dir"
+}
+
 prepare_release() {
     check_host prepare
     acquire_deploy_lock
@@ -150,7 +198,7 @@ prepare_release() {
     [ ! -e "$release" ] || die "immutable release already exists: $release"
     [ ! -e "$staging" ] || die "staging directory already exists: $staging"
     download_dir=$(mktemp -d /tmp/autobit-prepare.XXXXXXXX)
-    trap 'result=$?; if [ "$result" -ne 0 ]; then printf "Prepare failed; staging retained for review: %s\n" "$staging" >&2; fi; printf "Prepare scratch retained for review: %s\n" "$download_dir" >&2' EXIT
+    trap 'result=$?; if [ "$result" -ne 0 ]; then printf "Prepare failed; staging retained for review: %s\n" "$staging" >&2; printf "Prepare scratch retained for review: %s\n" "$download_dir" >&2; fi' EXIT
     # Freeze uploads in a root-private directory, then recheck the copied bytes.
     cp -- "$archive" "$download_dir/source.tar.gz"
     cp -- "$manifest" "$download_dir/bundle.manifest"
@@ -225,6 +273,8 @@ PY
     mv -T --no-clobber -- "$staging" "$release"
     [ ! -e "$staging" ] || die "release publication was refused"
     chmod -R go-w -- "$release"
+    cleanup_prepare_scratch
+    trap - EXIT
     printf 'Prepared immutable release: %s\n' "$release"
 }
 
