@@ -128,6 +128,7 @@ compare_restart_evidence() {
     /usr/bin/python3 - "$evidence" <<'PY'
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -147,47 +148,91 @@ after_status = load("paper-status-after.json")
 before_probe = load("ledger-probe-before.json")
 after_probe = load("ledger-probe-after.json")
 
+
+def require_type(record, name, types):
+    if name not in record:
+        raise SystemExit("required evidence field is missing: " + name)
+    value = record[name]
+    if type(value) not in types:
+        raise SystemExit(name + " has an invalid type")
+    return value
+
+
+def require_number(record, name):
+    value = require_type(record, name, (int, float))
+    if not math.isfinite(value):
+        raise SystemExit(name + " must be finite")
+    return value
+
+
+def parse_utc(name, value):
+    if type(value) is not str or not value.endswith("Z"):
+        raise SystemExit(name + " is invalid")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise SystemExit(name + " is invalid") from error
+    if parsed.tzinfo != timezone.utc:
+        raise SystemExit(name + " must be UTC")
+    return parsed
+
+
 for status in (before_status, after_status):
-    if status.get("market") != "KRW-BTC":
+    if require_type(status, "market", (str,)) != "KRW-BTC":
         raise SystemExit("market must remain KRW-BTC")
-    if status.get("mode") != "normalized-paper":
+    if require_type(status, "mode", (str,)) != "normalized-paper":
         raise SystemExit("mode must remain normalized-paper")
+    candle = require_type(status, "last_completed_candle_utc", (str, type(None)))
+    if candle is not None:
+        parse_utc("last_completed_candle_utc", candle)
+    require_number(status, "normalized_cash")
+    require_number(status, "btc_quantity")
+    require_type(status, "position_state", (str,))
+    active_stop = require_type(status, "active_stop", (dict, type(None)))
+    if active_stop is not None:
+        parse_utc(
+            "active_stop.active_after_utc",
+            require_type(active_stop, "active_after_utc", (str,)),
+        )
+        require_type(active_stop, "reason", (str,))
+        require_number(active_stop, "stop_price")
+    pending_orders = require_type(status, "pending_orders", (list,))
+    if any(type(order_id) is not str for order_id in pending_orders):
+        raise SystemExit("pending_orders contains an invalid order ID")
+    require_type(status, "health_stage", (str,))
+
+for probe in (before_probe, after_probe):
+    event_count = require_type(probe, "event_count", (int,))
+    max_sequence = require_type(probe, "max_event_sequence", (int, type(None)))
+    if event_count < 0 or (max_sequence is not None and max_sequence < 1):
+        raise SystemExit("probe counts must be non-negative")
+    if (event_count == 0) != (max_sequence is None):
+        raise SystemExit("probe count and sequence are inconsistent")
 
 
 def require_not_decreased(name, before, after):
-    if before is None:
-        if after is not None and (not isinstance(after, int) or isinstance(after, bool)):
-            raise SystemExit(name + " has an invalid type")
-        return
-    if not isinstance(before, int) or isinstance(before, bool):
-        raise SystemExit(name + " has an invalid before type")
-    if not isinstance(after, int) or isinstance(after, bool) or after < before:
+    if before is not None and (after is None or after < before):
         raise SystemExit(name + " must not decrease")
 
 
 require_not_decreased(
-    "event_count", before_probe.get("event_count"), after_probe.get("event_count")
+    "event_count", before_probe["event_count"], after_probe["event_count"]
 )
 require_not_decreased(
     "max_event_sequence",
-    before_probe.get("max_event_sequence"),
-    after_probe.get("max_event_sequence"),
+    before_probe["max_event_sequence"],
+    after_probe["max_event_sequence"],
 )
 
 
 def parse_candle(value):
     if value is None:
         return None
-    if not isinstance(value, str) or not value.endswith("Z"):
-        raise SystemExit("last_completed_candle_utc is invalid")
-    parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-    if parsed.tzinfo != timezone.utc:
-        raise SystemExit("last_completed_candle_utc must be UTC")
-    return parsed
+    return parse_utc("last_completed_candle_utc", value)
 
 
-before_candle = parse_candle(before_status.get("last_completed_candle_utc"))
-after_candle = parse_candle(after_status.get("last_completed_candle_utc"))
+before_candle = parse_candle(before_status["last_completed_candle_utc"])
+after_candle = parse_candle(after_status["last_completed_candle_utc"])
 if before_candle is not None and (after_candle is None or after_candle < before_candle):
     raise SystemExit("last_completed_candle_utc must not decrease")
 if before_candle == after_candle:
@@ -200,7 +245,7 @@ if before_candle == after_candle:
         "health_stage",
     )
     for field in stable_fields:
-        if before_status.get(field) != after_status.get(field):
+        if before_status[field] != after_status[field]:
             raise SystemExit(field + " changed without a completed candle")
 PY
     cmp --silent "$evidence/release-before.txt" "$evidence/release-after.txt" \
@@ -220,15 +265,39 @@ verify_journal_preservation() {
         "$evidence/journal-before-readable-after-restart.export" \
         "$evidence/journal-after-saved-cursor.export" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 cursor, before_path, after_path = sys.argv[1:]
-before = Path(before_path).read_text(encoding="utf-8", errors="strict")
-after = Path(after_path).read_text(encoding="utf-8", errors="strict")
+before_path = Path(before_path)
+after_path = Path(after_path)
+before = before_path.read_text(encoding="utf-8", errors="strict")
+after = after_path.read_text(encoding="utf-8", errors="strict")
 if ("__CURSOR=" + cursor) not in before:
     raise SystemExit("pre-restart journal entry is no longer readable")
 if "__CURSOR=" not in after:
     raise SystemExit("no journal entry exists after the saved cursor")
+
+
+def invocation_id(phase):
+    service_path = after_path.parent / ("service-" + phase + ".txt")
+    values = []
+    for line in service_path.read_text(encoding="utf-8", errors="strict").splitlines():
+        if line.startswith("InvocationID="):
+            values.append(line.partition("=")[2])
+    if len(values) != 1 or re.fullmatch(r"[0-9A-Fa-f]{32}", values[0]) is None:
+        raise SystemExit(phase + " InvocationID is missing or invalid")
+    return values[0].lower()
+
+
+before_invocation = invocation_id("before")
+after_invocation = invocation_id("after")
+if before_invocation == after_invocation:
+    raise SystemExit("service restart did not create a new InvocationID")
+if re.search(
+    r"(?m)^_SYSTEMD_INVOCATION_ID=" + re.escape(after_invocation) + r"$", after
+) is None:
+    raise SystemExit("post-restart journal has no entry from the new invocation")
 PY
 }
 

@@ -1,5 +1,10 @@
+import json
 from pathlib import Path
 import re
+import subprocess
+import sys
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +21,78 @@ def _function(text: str, name: str) -> str:
     match = re.search(rf"^{re.escape(name)}\(\) \{{\n.*?^\}}", text, re.M | re.S)
     assert match is not None, f"missing shell function: {name}"
     return match.group(0)
+
+
+def _python_heredoc(function_name: str) -> str:
+    function = _function(_script_text(), function_name)
+    match = re.search(r"<<'PY'\n(.*?)\nPY", function, re.S)
+    assert match is not None, f"missing Python validator in {function_name}"
+    return match.group(1)
+
+
+def _valid_restart_evidence(root: Path) -> None:
+    status = {
+        "market": "KRW-BTC",
+        "mode": "normalized-paper",
+        "last_completed_candle_utc": None,
+        "normalized_cash": 100.0,
+        "btc_quantity": 0.0,
+        "position_state": "FLAT",
+        "active_stop": None,
+        "pending_orders": [],
+        "health_stage": "NORMAL",
+    }
+    probe = {"event_count": 0, "max_event_sequence": None}
+    for phase in ("before", "after"):
+        (root / f"paper-status-{phase}.json").write_text(
+            json.dumps(status), encoding="utf-8"
+        )
+        (root / f"ledger-probe-{phase}.json").write_text(
+            json.dumps(probe), encoding="utf-8"
+        )
+
+
+def _run_restart_comparison(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", _python_heredoc("compare_restart_evidence"), str(root)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _write_service_evidence(root: Path, before: str, after: str) -> None:
+    for phase, invocation_id in (("before", before), ("after", after)):
+        (root / f"service-{phase}.txt").write_text(
+            "ActiveState=active\n"
+            "SubState=running\n"
+            "MainPID=123\n"
+            f"InvocationID={invocation_id}\n"
+            "ExecMainStartTimestampMonotonic=123456\n",
+            encoding="utf-8",
+        )
+
+
+def _run_journal_validation(root: Path) -> subprocess.CompletedProcess[str]:
+    cursor = "s=before;i=1"
+    before = root / "journal-before-readable-after-restart.export"
+    after = root / "journal-after-saved-cursor.export"
+    before.write_text(f"__CURSOR={cursor}\nMESSAGE=before\n", encoding="utf-8")
+    if not after.exists():
+        after.write_text("__CURSOR=s=after;i=2\nMESSAGE=after\n", encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _python_heredoc("verify_journal_preservation"),
+            cursor,
+            str(before),
+            str(after),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_inspect_is_read_only_and_restart_is_one_explicit_mutation():
@@ -111,6 +188,136 @@ def test_before_and_after_evidence_and_preservation_checks_are_explicit():
     assert "--after-cursor" in text
     assert "pre-restart journal entry is no longer readable" in text
     assert "no journal entry exists after the saved cursor" in text
+
+
+@pytest.mark.parametrize(
+    ("document", "field"),
+    (
+        ("paper-status", "market"),
+        ("paper-status", "mode"),
+        ("paper-status", "last_completed_candle_utc"),
+        ("paper-status", "normalized_cash"),
+        ("paper-status", "btc_quantity"),
+        ("paper-status", "position_state"),
+        ("paper-status", "active_stop"),
+        ("paper-status", "pending_orders"),
+        ("paper-status", "health_stage"),
+        ("ledger-probe", "event_count"),
+        ("ledger-probe", "max_event_sequence"),
+    ),
+)
+@pytest.mark.parametrize("phase", ("before", "after"))
+def test_restart_comparison_rejects_each_missing_required_field(
+    tmp_path: Path, document: str, field: str, phase: str
+) -> None:
+    _valid_restart_evidence(tmp_path)
+    path = tmp_path / f"{document}-{phase}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload[field]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _run_restart_comparison(tmp_path)
+
+    assert result.returncode != 0, f"accepted missing {document}.{field}"
+
+
+@pytest.mark.parametrize(
+    ("document", "field", "invalid"),
+    (
+        ("paper-status", "market", ["KRW-BTC"]),
+        ("paper-status", "mode", {"value": "normalized-paper"}),
+        ("paper-status", "last_completed_candle_utc", 123),
+        ("paper-status", "normalized_cash", True),
+        ("paper-status", "btc_quantity", False),
+        ("paper-status", "position_state", ["FLAT"]),
+        ("paper-status", "active_stop", []),
+        ("paper-status", "pending_orders", {}),
+        ("paper-status", "health_stage", 0),
+        ("ledger-probe", "event_count", True),
+        ("ledger-probe", "max_event_sequence", False),
+    ),
+)
+@pytest.mark.parametrize("phase", ("before", "after"))
+def test_restart_comparison_rejects_each_wrong_typed_required_field(
+    tmp_path: Path, document: str, field: str, invalid: object, phase: str
+) -> None:
+    _valid_restart_evidence(tmp_path)
+    path = tmp_path / f"{document}-{phase}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload[field] = invalid
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _run_restart_comparison(tmp_path)
+
+    assert result.returncode != 0, f"accepted wrong type for {document}.{field}"
+
+
+def test_restart_comparison_rejects_malformed_json(tmp_path: Path) -> None:
+    _valid_restart_evidence(tmp_path)
+    (tmp_path / "paper-status-after.json").write_text("{", encoding="utf-8")
+
+    result = _run_restart_comparison(tmp_path)
+
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("before_invocation", "after_invocation"),
+    (
+        ("1" * 32, "1" * 32),
+        ("", "2" * 32),
+        ("not-an-invocation-id", "2" * 32),
+        ("1" * 32, ""),
+    ),
+)
+def test_restart_requires_a_new_valid_systemd_invocation(
+    tmp_path: Path, before_invocation: str, after_invocation: str
+) -> None:
+    _write_service_evidence(tmp_path, before_invocation, after_invocation)
+    (tmp_path / "journal-after-saved-cursor.export").write_text(
+        "__CURSOR=s=after;i=2\n"
+        f"_SYSTEMD_INVOCATION_ID={after_invocation}\n"
+        "MESSAGE=after\n",
+        encoding="utf-8",
+    )
+
+    result = _run_journal_validation(tmp_path)
+
+    assert result.returncode != 0, "accepted an unchanged InvocationID"
+
+
+def test_post_cursor_journal_must_belong_to_after_invocation(tmp_path: Path) -> None:
+    before_invocation = "1" * 32
+    after_invocation = "2" * 32
+    _write_service_evidence(tmp_path, before_invocation, after_invocation)
+    (tmp_path / "journal-after-saved-cursor.export").write_text(
+        "__CURSOR=s=after;i=2\n"
+        f"_SYSTEMD_INVOCATION_ID={before_invocation}\n"
+        "MESSAGE=unrelated-old-invocation-entry\n",
+        encoding="utf-8",
+    )
+
+    result = _run_journal_validation(tmp_path)
+
+    assert result.returncode != 0, "accepted journal evidence from the old invocation"
+
+
+def test_new_invocation_with_matching_post_cursor_journal_is_accepted(
+    tmp_path: Path,
+) -> None:
+    before_invocation = "1" * 32
+    after_invocation = "2" * 32
+    _write_service_evidence(tmp_path, before_invocation, after_invocation)
+    (tmp_path / "journal-after-saved-cursor.export").write_text(
+        "__CURSOR=s=after;i=2\n"
+        f"_SYSTEMD_INVOCATION_ID={after_invocation}\n"
+        "MESSAGE=started\n",
+        encoding="utf-8",
+    )
+
+    result = _run_journal_validation(tmp_path)
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_runbook_covers_manual_and_oci_workflows_and_approval_boundaries():
