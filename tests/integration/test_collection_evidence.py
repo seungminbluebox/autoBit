@@ -1,5 +1,6 @@
 import json
 import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 
@@ -9,6 +10,7 @@ import pytest
 from autobit.config import DataConfig
 from autobit.data.collector import collect_evidence_range
 from autobit.data import storage
+from autobit.data.quality import canonicalize_ohlcv
 from autobit.data.upbit_public import PUBLIC_CANDLE_URL, PublicDataUnavailable
 from autobit.cli import main
 
@@ -140,6 +142,70 @@ def test_interrupted_collection_resumes_from_saved_page_without_refetching_it(
     ]
     assert result.evidence.complete
     assert len(result.evidence.pages) == 2
+
+
+def test_identical_cross_page_overlap_is_counted_and_uses_later_collected_provenance(
+    tmp_path: Path,
+) -> None:
+    overlap = _candle("2026-01-01T04:00:00Z", 104)
+    result = _collect(
+        tmp_path,
+        _ScriptedPublicClient(
+            [
+                [_candle("2026-01-01T08:00:00Z", 108), overlap],
+                [dict(overlap), _candle("2026-01-01T00:00:00Z", 100), _candle("2025-12-31T20:00:00Z", 96)],
+            ]
+        ),
+    )
+
+    assert result.frame["candle_date_time_utc"].is_unique
+    assert result.frame.attrs["duplicates"] == 1
+    assert result.frame.attrs["duplicate_policy"] == "latest_collected"
+    assert result.frame.attrs["duplicate_provenance"] == (
+        ("2026-01-01T04:00:00Z", "page:0:row:1", "page:1:row:0"),
+    )
+    assert len(result.evidence.pages) == 2
+
+    raw = result.frame.rename(
+        columns={
+            "opening_price": "open",
+            "high_price": "high",
+            "low_price": "low",
+            "trade_price": "close",
+            "candle_acc_trade_volume": "volume",
+        }
+    ).set_index("candle_date_time_utc")
+    quality = canonicalize_ohlcv(
+        raw,
+        datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    assert quality.report.duplicates == 1
+    assert quality.frame.attrs["duplicate_provenance"] == (
+        ("2026-01-01T04:00:00Z", "page:0:row:1", "page:1:row:0"),
+    )
+
+
+def test_conflicting_cross_page_overlap_is_rejected_after_both_pages_are_durable(
+    tmp_path: Path,
+) -> None:
+    first = _candle("2026-01-01T04:00:00Z", 104)
+    conflicting = _candle("2026-01-01T04:00:00Z", 105)
+
+    with pytest.raises(
+        ValueError,
+        match=r"conflicting duplicate OHLCV timestamp.*page:0:row:1.*page:1:row:0",
+    ):
+        _collect(
+            tmp_path,
+            _ScriptedPublicClient(
+                [
+                    [_candle("2026-01-01T08:00:00Z", 108), first],
+                    [conflicting, _candle("2026-01-01T00:00:00Z", 100), _candle("2025-12-31T20:00:00Z", 96)],
+                ]
+            ),
+        )
+
+    assert len(tuple(tmp_path.glob("page-*.json"))) == 2
 
 
 def test_completed_evidence_rerun_loads_pages_without_network_calls(tmp_path: Path) -> None:

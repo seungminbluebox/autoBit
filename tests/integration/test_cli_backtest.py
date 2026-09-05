@@ -35,13 +35,18 @@ EXPECTED_FILES = {
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 
 
-def _quality(*, total_bars: int = 2, impossible_candles: int = 0) -> QualityReport:
+def _quality(
+    *,
+    total_bars: int = 2,
+    impossible_candles: int = 0,
+    long_gap_regions: int = 0,
+) -> QualityReport:
     return QualityReport(
         total_bars=total_bars,
         duplicates=0,
         conflicting_duplicates=0,
         short_gap_bars=0,
-        long_gap_regions=0,
+        long_gap_regions=long_gap_regions,
         impossible_candles=impossible_candles,
         nonpositive_prices=0,
         negative_volume=0,
@@ -415,6 +420,87 @@ def test_backtest_command_runs_one_enriched_scenario_and_writes_bundle(tmp_path:
     assert summary["metrics"]["trade_count"] == 1
     assert summary["final_equity"] > 0.0
     assert len((output / "trades.csv").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_backtest_command_forces_open_position_flat_at_next_open_after_long_gap(
+    tmp_path: Path,
+) -> None:
+    """The standalone command derives the execution boundary from canonical rows."""
+    frame = pd.read_csv(FIXTURES / "entry_next_open.csv")
+    for column in ("is_filled", "is_quarantined", "anomaly_spike", "anomaly_flat"):
+        frame[column] = False
+    frame["segment_id"] = 0
+    gap_rows = frame["timestamp"].eq("2025-01-05T12:00:00Z")
+    frame.loc[gap_rows, ["open", "high", "low", "close", "volume"]] = float("nan")
+    frame.loc[gap_rows, "entry_data_valid"] = False
+
+    missing = frame.iloc[-1].copy()
+    missing.loc["timestamp"] = "2025-01-05T16:00:00Z"
+    successor = missing.copy()
+    successor.loc[["timestamp", "open", "high", "low", "close", "volume"]] = [
+        "2025-01-05T20:00:00Z", 77.0, 80.0, 75.0, 78.0, 1.0
+    ]
+    successor.loc["segment_id"] = 1
+    successor.loc["entry_data_valid"] = True
+    future = successor.copy()
+    future.loc[["timestamp", "open", "high", "low", "close"]] = [
+        "2025-01-06T00:00:00Z", 79.0, 82.0, 76.0, 80.0
+    ]
+    frame = pd.concat(
+        [frame, missing.to_frame().T, successor.to_frame().T, future.to_frame().T],
+        ignore_index=True,
+    )
+
+    completed_forced_orders = []
+    scenarios = (
+        ("first", (79.0, 82.0, 76.0, 80.0)),
+        ("future-changed", (790.0, 820.0, 760.0, 800.0)),
+    )
+    for name, future_prices in scenarios:
+        canonical = tmp_path / name / "canonical"
+        canonical.mkdir(parents=True)
+        processed = canonical / "processed.csv"
+        candidate = frame.copy()
+        candidate.loc[
+            candidate["timestamp"] == "2025-01-06T00:00:00Z",
+            ["open", "high", "low", "close"],
+        ] = future_prices
+        candidate.to_csv(processed, index=False)
+        _write_quality_sidecar(
+            canonical / "quality.json",
+            _quality(total_bars=len(candidate), long_gap_regions=1),
+            processed,
+        )
+        report = tmp_path / name / "report"
+
+        assert main(
+            [
+                "backtest",
+                "--input",
+                str(processed),
+                "--output",
+                str(report),
+                "--slippage",
+                "0",
+            ]
+        ) == 0
+
+        orders = pd.read_csv(report / "orders.csv")
+        completed_forced_orders.append(
+            orders.loc[
+                (orders["reason"] == "FORCED_GAP")
+                & (orders["status"] == "COMPLETED"),
+                ["fill_time", "fill_price"],
+            ].to_dict("records")
+        )
+        trades = pd.read_csv(report / "trades.csv")
+        assert trades.loc[0, "exit_reason"] == "FORCED_GAP"
+        assert trades.loc[0, "exit_time"] == "2025-01-05T20:00:00Z"
+
+    assert completed_forced_orders == [
+        [{"fill_time": "2025-01-05T20:00:00Z", "fill_price": 77.0}],
+        [{"fill_time": "2025-01-05T20:00:00Z", "fill_price": 77.0}],
+    ]
 
 
 def test_repeated_backtest_reports_are_byte_identical(tmp_path: Path) -> None:

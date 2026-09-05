@@ -125,7 +125,7 @@ def _collect_legacy_range(
 ) -> pd.DataFrame:
     """Keep the original in-memory behavior for explicitly legacy callers."""
     start, end = _validated_range(start_utc, end_utc)
-    records: dict[str, dict[str, object]] = {}
+    pages: list[list[dict[str, object]]] = []
     to_utc = _format_utc(end)
     previous_oldest: pd.Timestamp | None = None
 
@@ -136,9 +136,7 @@ def _collect_legacy_range(
 
         timestamps = [_parse_utc(_timestamp_from(row)) for row in page]
         oldest = min(timestamps)
-        for row, timestamp in zip(page, timestamps, strict=True):
-            if start <= timestamp <= end:
-                records.setdefault(_timestamp_from(row), row)
+        pages.append(page)
 
         if oldest < start:
             break
@@ -148,23 +146,47 @@ def _collect_legacy_range(
         previous_oldest = oldest
         to_utc = _format_utc(oldest)
 
-    rows = [records[key] for key in sorted(records, key=_parse_utc)]
-    return pd.DataFrame(rows)
+    return _frame_from_pages(tuple(pages), start, end)
 
 
 def _frame_from_pages(
     pages: tuple[list[dict[str, object]], ...], start: pd.Timestamp, end: pd.Timestamp
 ) -> pd.DataFrame:
     """Derive the normalized view separately from exact ordered page evidence."""
-    records: dict[str, dict[str, object]] = {}
-    for page in pages:
-        for row in page:
+    records: dict[pd.Timestamp, tuple[dict[str, object], str]] = {}
+    duplicate_provenance: list[tuple[str, str, str]] = []
+    for page_index, page in enumerate(pages):
+        for row_index, row in enumerate(page):
             timestamp_text = _timestamp_from(row)
             timestamp = _parse_utc(timestamp_text)
             if start <= timestamp <= end:
-                records.setdefault(timestamp_text, row)
-    rows = [records[key] for key in sorted(records, key=_parse_utc)]
-    return pd.DataFrame(rows)
+                provenance = f"page:{page_index}:row:{row_index}"
+                existing = records.get(timestamp)
+                if existing is not None:
+                    existing_row, existing_provenance = existing
+                    if existing_row != row:
+                        raise ValueError(
+                            "conflicting duplicate OHLCV timestamp "
+                            f"{_format_utc(timestamp)} between "
+                            f"{existing_provenance} and {provenance}"
+                        )
+                    duplicate_provenance.append(
+                        (
+                            _format_utc(timestamp),
+                            existing_provenance,
+                            provenance,
+                        )
+                    )
+                # The later collected identical observation is the deterministic
+                # normalized representative; exact ordered pages remain evidence.
+                records[timestamp] = (row, provenance)
+    rows = [records[timestamp][0] for timestamp in sorted(records)]
+    frame = pd.DataFrame(rows)
+    frame.attrs["duplicates"] = len(duplicate_provenance)
+    frame.attrs["conflicting_duplicates"] = 0
+    frame.attrs["duplicate_policy"] = "latest_collected"
+    frame.attrs["duplicate_provenance"] = tuple(duplicate_provenance)
+    return frame
 
 
 def _validated_range(start_utc: str, end_utc: str) -> tuple[pd.Timestamp, pd.Timestamp]:

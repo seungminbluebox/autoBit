@@ -721,14 +721,36 @@ def run_backtest(frame: pd.DataFrame, config: BacktestConfig = BacktestConfig())
 
 def _prepare_frame(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     prepared = frame.copy()
+    executable = prepared.loc[:, ["open", "high", "low", "close", "volume"]].notna().all(axis=1)
+    explicit_gap = (
+        prepared["_gap_before_current_bar"].fillna(False).astype(bool)
+        if "_gap_before_current_bar" in prepared
+        else pd.Series(False, index=prepared.index, dtype=bool)
+    )
+    segment_column = next(
+        (
+            candidate
+            for candidate in ("_execution_segment_id", "segment_id")
+            if candidate in prepared
+        ),
+        None,
+    )
+    prepared = prepared.loc[executable].copy()
+    if prepared.empty:
+        raise ValueError("backtest frame has no executable OHLCV rows")
+    timestamp_gap = prepared.index.to_series().diff().gt(pd.Timedelta(hours=4))
+    derived_gap = timestamp_gap
+    if segment_column is not None:
+        prior_segment = prepared[segment_column].shift(1)
+        derived_gap = derived_gap | (
+            prior_segment.notna() & prepared[segment_column].ne(prior_segment)
+        )
     prepared["_warmup_complete"] = prepared["warmup_complete"]
     prepared["_entry_data_valid"] = prepared["entry_data_valid"]
     prepared["_ema_value"] = prepared[f"ema_{config.ema_period}"]
     prepared["_atr_value"] = prepared[f"atr_{config.atr_period}"]
     prepared["_gap_before_current_bar"] = (
-        prepared["_gap_before_current_bar"]
-        if "_gap_before_current_bar" in prepared
-        else False
+        explicit_gap.reindex(prepared.index, fill_value=False) | derived_gap.fillna(False)
     )
     return prepared
 

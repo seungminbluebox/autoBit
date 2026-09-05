@@ -94,10 +94,12 @@ def _require_ohlcv_schema(frame: pd.DataFrame) -> None:
 
 
 def _deduplicate_or_raise(frame: pd.DataFrame) -> pd.DataFrame:
+    upstream_duplicates = int(frame.attrs.get("duplicates", 0))
+    upstream_conflicts = int(frame.attrs.get("conflicting_duplicates", 0))
     duplicate_rows = int(frame.index.duplicated(keep=False).sum())
     if not duplicate_rows:
-        frame.attrs["duplicates"] = 0
-        frame.attrs["conflicting_duplicates"] = 0
+        frame.attrs["duplicates"] = upstream_duplicates
+        frame.attrs["conflicting_duplicates"] = upstream_conflicts
         return frame
 
     for _, rows in frame.groupby(level=0, sort=False):
@@ -105,8 +107,8 @@ def _deduplicate_or_raise(frame: pd.DataFrame) -> pd.DataFrame:
             raise ValueError("conflicting duplicate OHLCV timestamps")
 
     result = frame.loc[~frame.index.duplicated(keep="first")].copy()
-    result.attrs["duplicates"] = len(frame) - len(result)
-    result.attrs["conflicting_duplicates"] = 0
+    result.attrs["duplicates"] = upstream_duplicates + len(frame) - len(result)
+    result.attrs["conflicting_duplicates"] = upstream_conflicts
     return result
 
 

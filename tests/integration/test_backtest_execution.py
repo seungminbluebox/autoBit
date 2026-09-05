@@ -84,6 +84,46 @@ def test_gap_below_stop_fills_at_worse_open() -> None:
     assert stop.fill_price == pytest.approx(90.0)
 
 
+def test_standalone_engine_forces_position_flat_at_next_observed_open_after_canonical_gap() -> None:
+    """Canonical unavailable rows become a no-lookahead execution boundary in run_backtest."""
+    frame = _fixture("entry_next_open.csv")
+    unavailable = pd.Timestamp("2025-01-05T08:00:00Z")
+    next_observed = pd.Timestamp("2025-01-05T12:00:00Z")
+    frame.loc[unavailable, ["open", "high", "low", "close", "volume"]] = float("nan")
+    frame.loc[next_observed, ["open", "high", "low", "close"]] = [77.0, 80.0, 75.0, 78.0]
+
+    result = run_backtest(
+        frame,
+        BacktestConfig(costs=CostConfig(fee_rate=0.0, slippage_rate=0.0)),
+    )
+
+    trade, = result.trades
+    forced = next(
+        order
+        for order in result.orders
+        if order.reason == "FORCED_GAP" and order.status == "COMPLETED"
+    )
+    assert forced.fill_time == next_observed
+    assert forced.fill_price == 77.0
+    assert trade.exit_time == next_observed
+    assert trade.exit_reason == "FORCED_GAP"
+    assert all(point.timestamp != unavailable for point in result.equity_curve)
+
+    future_changed = frame.copy()
+    future_changed.loc[next_observed + pd.Timedelta(hours=4):, "close"] *= 9.0
+    rerun = run_backtest(
+        future_changed,
+        BacktestConfig(costs=CostConfig(fee_rate=0.0, slippage_rate=0.0)),
+    )
+    rerun_forced = next(
+        order
+        for order in rerun.orders
+        if order.reason == "FORCED_GAP" and order.status == "COMPLETED"
+    )
+    assert rerun_forced.fill_time == forced.fill_time
+    assert rerun_forced.fill_price == forced.fill_price
+
+
 def test_close_exit_signal_fills_at_following_open() -> None:
     result = run_backtest(
         _fixture("entry_next_open.csv"),

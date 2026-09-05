@@ -144,26 +144,7 @@ BacktestFn = Callable[[BacktestRequest], BacktestResult]
 
 def core_backtest(request: BacktestRequest) -> BacktestResult:
     """Run one phase with flat execution boundaries and continuous account risk."""
-    segment_column = (
-        "_execution_segment_id"
-        if "_execution_segment_id" in request.frame
-        else "segment_id"
-    )
-    execution = request.frame.copy(deep=True)
-    execution["_gap_before_current_bar"] = False
-    timestamp_gap = execution.index.to_series().diff().gt(_CANDLE_FREQUENCY)
-    if segment_column in execution:
-        preceding_segment = execution[segment_column].shift(1)
-        execution["_gap_before_current_bar"] = (
-            timestamp_gap
-            | (
-                preceding_segment.notna()
-                & execution[segment_column].ne(preceding_segment)
-            )
-        )
-    else:
-        execution["_gap_before_current_bar"] = timestamp_gap
-    return run_backtest(execution, request.config)
+    return run_backtest(request.frame, request.config)
 
 
 def run_walk_forward(
