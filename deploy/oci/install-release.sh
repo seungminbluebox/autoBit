@@ -7,23 +7,34 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 source "$script_dir/libdeploy.sh"
 
 check_host() {
-    [ "$(id -u)" -eq 0 ] || die "prepare requires root"
-    [ "$(uname -m)" = aarch64 ] || die "prepare requires aarch64"
+    local operation="${1:-prepare}"
+    [ "$(id -u)" -eq 0 ] || die "$operation requires root"
+    [ "$(uname -m)" = aarch64 ] || die "$operation requires aarch64"
     [ -x /usr/bin/python3 ] || die "bootstrap python3 is unavailable"
-    /usr/bin/python3 - <<'PY'
+    /usr/bin/python3 - "$operation" <<'PY'
 from pathlib import Path
 import shutil
+import sys
 entries = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines()
                if "=" in line and not line.startswith("#"))
 if entries.get("ID", "").strip('"') != "ubuntu" or entries.get("VERSION_ID", "").strip('"') != "22.04":
-    raise SystemExit("prepare requires Ubuntu 22.04")
-if shutil.disk_usage("/").free < 5 * 1024 ** 3:
+    raise SystemExit("{} requires Ubuntu 22.04".format(sys.argv[1]))
+if sys.argv[1] == "prepare" and shutil.disk_usage("/").free < 5 * 1024 ** 3:
     raise SystemExit("prepare requires at least 5 GiB free on root filesystem")
 PY
     local command
-    for command in flock readlink awk sha256sum curl tar runuser useradd getent systemd-analyze; do
+    for command in flock readlink awk sha256sum runuser getent; do
         command -v "$command" >/dev/null || die "required command unavailable: $command"
     done
+    if [ "$operation" = prepare ]; then
+        for command in curl tar useradd systemd-analyze; do
+            command -v "$command" >/dev/null || die "required command unavailable: $command"
+        done
+    else
+        for command in cmp cp date install journalctl ln mv stat systemctl systemd-tmpfiles; do
+            command -v "$command" >/dev/null || die "required command unavailable: $command"
+        done
+    fi
 }
 
 managed_directory() {
@@ -129,7 +140,7 @@ candidate_python() {
 }
 
 prepare_release() {
-    check_host
+    check_host prepare
     acquire_deploy_lock
     validate_bundle "$archive" "$manifest" "$commit"
     release="/opt/autobit/releases/$commit"
@@ -217,21 +228,36 @@ PY
     printf 'Prepared immutable release: %s\n' "$release"
 }
 
-[ "${1-}" = prepare ] || die "expected prepare (activation is a separate operation)"
+command_name=${1-}
+[ -n "$command_name" ] || die "expected prepare or activate --commit"
 shift
-archive= manifest= commit=
-while [ "$#" -gt 0 ]; do
-    [ "$#" -ge 2 ] || die "option requires a value"
-    case "$1" in
-        --archive) [ -z "$archive" ] || die "duplicate archive option"; archive=$2 ;;
-        --manifest) [ -z "$manifest" ] || die "duplicate manifest option"; manifest=$2 ;;
-        --commit) [ -z "$commit" ] || die "duplicate commit option"; commit=$2 ;;
-        *) die "unknown prepare option" ;;
-    esac
-    shift 2
-done
-[ -n "$archive" ] && [ -n "$manifest" ] && [ -n "$commit" ] || die "archive, manifest, and commit are required"
-require_commit "$commit"
-require_input_file "$archive"
-require_input_file "$manifest"
-prepare_release
+case "$command_name" in
+    prepare)
+        archive= manifest= commit=
+        while [ "$#" -gt 0 ]; do
+            [ "$#" -ge 2 ] || die "option requires a value"
+            case "$1" in
+                --archive) [ -z "$archive" ] || die "duplicate archive option"; archive=$2 ;;
+                --manifest) [ -z "$manifest" ] || die "duplicate manifest option"; manifest=$2 ;;
+                --commit) [ -z "$commit" ] || die "duplicate commit option"; commit=$2 ;;
+                *) die "unknown prepare option" ;;
+            esac
+            shift 2
+        done
+        [ -n "$archive" ] && [ -n "$manifest" ] && [ -n "$commit" ] \
+            || die "archive, manifest, and commit are required"
+        require_commit "$commit"
+        require_input_file "$archive"
+        require_input_file "$manifest"
+        prepare_release
+        ;;
+    activate)
+        [ "$#" -eq 2 ] && [ "$1" = --commit ] || die "activate --commit requires one value"
+        commit=$2
+        require_commit "$commit"
+        check_host activate
+        acquire_deploy_lock
+        activate_transaction
+        ;;
+    *) die "expected prepare or activate --commit" ;;
+esac

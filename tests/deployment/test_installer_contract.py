@@ -68,12 +68,34 @@ def test_installer_scripts_have_strict_non_destructive_contract(name):
 
 
 def test_prepare_does_not_change_services_or_current():
-    text = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
+    installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
+    match = re.search(r"^prepare_release\(\) \{\n.*?^\}", installer, re.M | re.S)
+    assert match is not None
+    text = match.group(0)
     assert "systemctl" not in text
     assert "daemon-reload" not in text
     assert "ln -s" not in text
     assert "--frozen --no-dev" in text
     assert "systemd-analyze verify" in text
+
+
+def test_activate_dispatch_and_transaction_contract():
+    installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
+    library = (ROOT / "deploy/oci/libdeploy.sh").read_text(encoding="utf-8")
+    combined = installer + library
+    assert "activate --commit" in installer
+    assert "activate_transaction" in installer
+    assert "NO_EXISTING_LEDGER" in combined
+    assert '"${ledger}-shm"' in combined
+    assert "systemctl stop autobit-paper.service" in combined
+    assert "systemctl enable autobit-paper.service" in combined
+    assert "systemctl start autobit-paper.service" in combined
+    assert "ln -s --" in combined
+    assert "mv -Tf --" in combined
+    assert "InvocationID" in combined
+    assert "paper-status" in combined
+    assert "180" in combined
+    assert "vacuum" not in combined.lower()
 
 
 def test_shared_lock_rejects_symlink_and_nonroot_precreation():
