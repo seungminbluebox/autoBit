@@ -215,6 +215,46 @@ def _git_paths(*arguments: str) -> tuple[Path, ...]:
     )
 
 
+def _assert_oci_deployment_surface_is_safe(
+    files: tuple[Path, ...],
+    service_text: str,
+) -> None:
+    combined = "\n".join(
+        path.read_text(encoding="utf-8", errors="strict") for path in files
+    )
+    forbidden = (
+        "EnvironmentFile",
+        "UPBIT_ACCESS_KEY",
+        "UPBIT_SECRET_KEY",
+        "--telegram-token-env",
+        "--telegram-chat-env",
+        "autobit.cli live",
+        "/v1/orders",
+        "/v1/accounts",
+        "source /home/ubuntu/autoBit/.env",
+    )
+    assert all(token not in combined for token in forbidden)
+    assert not re.search(
+        r"(?<![0-9.])(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\.){3}"
+        r"(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(?![0-9.])",
+        combined,
+    )
+    assert not re.search(r"\bocid1\.", combined, flags=re.IGNORECASE)
+    assert not re.search(r"\b[A-Za-z]:\\[^\r\n]*?\.key\b", combined, flags=re.IGNORECASE)
+    assert not re.search(r"\bSHA256:[A-Za-z0-9+/=]+", combined)
+    assert "paper-run" in service_text
+    assert "ProtectHome=true" in service_text
+
+
+def test_oci_deployment_surface_cannot_activate_live_or_load_secrets() -> None:
+    files = _git_paths("deploy/oci")
+    assert files
+    service = Path("deploy/oci/systemd/autobit-paper.service").read_text(
+        encoding="utf-8", errors="strict"
+    )
+    _assert_oci_deployment_surface_is_safe(files, service)
+
+
 def _is_repository_source(path: Path) -> bool:
     return (
         path.suffix.lower() in _SCANNED_SUFFIXES
