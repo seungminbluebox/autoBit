@@ -47,6 +47,19 @@ def test_service_has_exact_restart_shutdown_and_resource_controls():
     )
 
 
+def test_service_has_exact_unit_lifecycle_and_hardening_controls():
+    unit = _read_unit("deploy/oci/systemd/autobit-paper.service")
+    service = unit["Service"]
+    assert unit["Unit"]["Wants"] == "network-online.target"
+    assert unit["Unit"]["After"] == "network-online.target"
+    assert service["Type"] == "simple"
+    assert service["WorkingDirectory"] == "/opt/autobit/current"
+    assert service["NoNewPrivileges"] == "true"
+    assert service["PrivateTmp"] == "true"
+    assert service["RestrictAddressFamilies"] == "AF_UNIX AF_INET AF_INET6"
+    assert unit["Install"]["WantedBy"] == "multi-user.target"
+
+
 def test_journal_is_persistent_and_exactly_bounded():
     journal = _read_unit("deploy/oci/journald/99-autobit-persistence.conf")["Journal"]
     assert dict(journal) == {
