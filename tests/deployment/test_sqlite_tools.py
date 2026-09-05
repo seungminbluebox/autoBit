@@ -95,6 +95,23 @@ def test_snapshot_rejects_existing_or_identical_destination(
         module.snapshot(source, destination)
 
 
+def test_snapshot_rejects_dangling_destination_symlink_without_creating_target(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paper.sqlite3"
+    destination = tmp_path / "snapshot.sqlite3"
+    external_target = tmp_path.parent / "outside.sqlite3"
+    connection = _ledger_fixture(source)
+    connection.close()
+    destination.symlink_to(external_target)
+
+    with pytest.raises(ValueError, match="snapshot destination must be new and distinct"):
+        module.snapshot(source, destination)
+
+    assert destination.is_symlink()
+    assert not external_target.exists()
+
+
 def test_snapshot_removes_its_new_destination_when_quick_check_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

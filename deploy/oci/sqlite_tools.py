@@ -40,7 +40,11 @@ def snapshot(source: Path, destination: Path) -> None:
     source_path = Path(source).resolve(strict=True)
     destination_path = Path(destination)
     resolved_destination = destination_path.resolve(strict=False)
-    if destination_path.exists() or source_path == resolved_destination:
+    if (
+        destination_path.exists()
+        or destination_path.is_symlink()
+        or source_path == resolved_destination
+    ):
         raise ValueError("snapshot destination must be new and distinct")
 
     destination_path.parent.mkdir(parents=True, exist_ok=True)
