@@ -9,7 +9,6 @@ from pathlib import Path
 import sqlite3
 import sys
 from typing import Sequence
-from urllib.parse import quote
 
 
 _REQUIRED_TABLES = frozenset(("schema_version", "events", "orders", "snapshots"))
@@ -17,7 +16,7 @@ _SUPPORTED_SCHEMA_VERSION = 1
 
 
 def _read_only_uri(path: Path) -> str:
-    return "file:{}?mode=ro".format(quote(path.as_posix(), safe="/"))
+    return "{}?mode=ro".format(path.resolve(strict=True).as_uri())
 
 
 def _quick_check(connection: sqlite3.Connection) -> str | None:

@@ -75,6 +75,17 @@ def test_online_snapshot_is_consistent_and_does_not_copy_companions(tmp_path: Pa
     connection.close()
 
 
+def test_snapshot_reads_source_paths_with_uri_reserved_characters(tmp_path: Path) -> None:
+    source = tmp_path / "paper #%.sqlite3"
+    destination = tmp_path / "snapshot.sqlite3"
+    connection = _ledger_fixture(source)
+    connection.close()
+
+    module.snapshot(source, destination)
+
+    assert module.probe(destination)["event_count"] == 0
+
+
 def test_snapshot_rejects_missing_source(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         module.snapshot(tmp_path / "missing.sqlite3", tmp_path / "snapshot.sqlite3")
