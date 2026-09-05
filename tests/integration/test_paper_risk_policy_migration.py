@@ -16,7 +16,11 @@ from autobit.paper.service import (
     PaperService, _forced_exit_reason,
     _validate_health_and_risk_chain,
 )
-from autobit.persistence.sqlite_store import SQLiteStore, StoreCorruptionError
+from autobit.persistence.sqlite_store import (
+    CycleLeaseLostError,
+    SQLiteStore,
+    StoreCorruptionError,
+)
 
 
 START = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -66,7 +70,33 @@ def _old_store(path, *, mutate=None):
 
 
 def _decide(store, at, equity=84.0):
-    return _service(store)._risk_decision(at, ROW, equity, PaperBroker(store).reconcile())
+    service = _service(store)
+    assert service.acquire_cycle_lease()
+    try:
+        return service._risk_decision(
+            at,
+            ROW,
+            equity,
+            PaperBroker(store).reconcile(),
+        )
+    finally:
+        assert service.release_cycle_lease()
+
+
+def test_direct_risk_migration_mutation_requires_an_acquired_lease(tmp_path):
+    store = _old_store(tmp_path / "unleased-migration.sqlite3")
+    before = store.replay_state()
+
+    with pytest.raises(CycleLeaseLostError, match="no acquired lease epoch"):
+        _service(store)._risk_decision(
+            START + timedelta(hours=244),
+            ROW,
+            84.0,
+            PaperBroker(store).reconcile(),
+        )
+
+    assert store.replay_state() == before
+    store.close()
 
 
 def test_real_v1_sqlite_history_migrates_without_rewriting_and_replays_idempotently(tmp_path):
