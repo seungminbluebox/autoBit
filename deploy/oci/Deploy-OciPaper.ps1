@@ -97,7 +97,12 @@ function Require-RemoteArguments {
     if ([string]::IsNullOrWhiteSpace($IdentityFile)) {
         Fail "IdentityFile is required for remote deployment."
     }
-    $key = Get-Item -LiteralPath $IdentityFile -Force -ErrorAction Stop
+    try {
+        $key = Get-Item -LiteralPath $IdentityFile -Force -ErrorAction Stop
+    }
+    catch {
+        Fail "IdentityFile must be an existing regular file."
+    }
     if ($key.PSIsContainer) {
         Fail "IdentityFile must be an existing regular file."
     }

@@ -112,6 +112,21 @@ def test_package_only_rejects_an_unpushed_or_mismatched_commit(tmp_path: Path):
     assert not (tmp_path / "package").exists()
 
 
+def test_remote_identity_lookup_does_not_disclose_a_missing_key_path(tmp_path: Path):
+    repository, commit = _git_fixture_with_bare_origin(tmp_path)
+    secret_key = tmp_path / "OCI_PRIVATE_KEY_do_not_leak_9d4f3a.pem"
+
+    result = _pwsh(repository, "-Mode", "Activate", "-Commit", commit,
+                   "-HostName", "paper-host", "-User", "ubuntu",
+                   "-IdentityFile", secret_key)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "IdentityFile must be an existing regular file." in combined
+    assert str(secret_key) not in combined
+    assert "OCI_PRIVATE_KEY_do_not_leak_9d4f3a" not in combined
+
+
 def test_wrapper_declares_strict_operator_and_ssh_contracts():
     text = WRAPPER.read_text(encoding="utf-8")
     for parameter in ("Mode", "Commit", "HostName", "User", "IdentityFile", "PackageOnly",
