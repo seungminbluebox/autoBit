@@ -808,6 +808,52 @@ def test_service_rechecks_completion_after_an_expired_lease_was_taken_over(
     assert len([event for event in events if event.event_type == "BREAKER_STATE"]) == 1
 
 
+def test_released_successor_epoch_still_fences_stale_risk_order_and_completion(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    first_store = SQLiteStore(path)
+    first_store.initialize()
+    successor = SQLiteStore(path)
+    successor.initialize()
+    clock = _MutableClock(END + timedelta(minutes=10))
+
+    class SlowSource:
+        def load_completed_candles(self, end_utc: datetime) -> pd.DataFrame:
+            clock.value += timedelta(seconds=2)
+            successor_epoch = successor.acquire_cycle_lease_epoch(
+                "successor",
+                "successor-token",
+                clock.value,
+                clock.value + timedelta(seconds=1),
+            )
+            assert successor_epoch == 2
+            assert successor.release_cycle_lease(
+                "successor", "successor-token", successor_epoch
+            )
+            return _breakout_history(end_utc)
+
+    service = PaperService(
+        source=SlowSource(),
+        store=first_store,
+        broker=PaperBroker(first_store, CostConfig(0.0, 0.0)),
+        clock=clock,
+        lease_owner="stale",
+        lease_token="stale-token",
+        costs=CostConfig(0.0, 0.0),
+        lease_ttl=timedelta(seconds=1),
+    )
+
+    result = service.process_completed_candle(END)
+
+    events = first_store.replay_state().event_evidence
+    assert result.status is CycleStatus.LEASE_HELD
+    assert [event.event_type for event in events] == ["PAPER_CYCLE_ATTEMPT"]
+    assert not [event for event in events if event.event_type == "BREAKER_STATE"]
+    assert PaperBroker(first_store, CostConfig(0.0, 0.0)).reconcile().active_orders == ()
+    assert not [event for event in events if event.event_type == "PAPER_CYCLE"]
+
+
 def test_pending_entry_fills_only_at_current_open_and_gets_fill_boundary_protection(
     tmp_path: Path,
 ) -> None:

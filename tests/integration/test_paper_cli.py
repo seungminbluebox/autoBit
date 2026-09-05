@@ -1169,6 +1169,193 @@ def test_application_persists_three_failures_three_successes_and_auto_promotes(
     assert PaperBroker(store, CostConfig(0.0, 0.0)).reconcile().active_orders == ()
 
 
+def test_flat_completed_account_automatically_resolves_fill_anomaly_after_three_clean_checks(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    clock = _Clock(END + timedelta(minutes=10))
+    source = _FrameSource([_history(END)] * 4)
+    app = _PaperApplication(
+        source=source,
+        store=store,
+        clock=clock,
+        sleeper=_Sleeper(clock),
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="fill-recovery-worker",
+        lease_token="fill-recovery-token",
+    )
+    assert app.run_once().status is CycleStatus.PROCESSED
+    monitor = HealthMonitor.from_store(store)
+    detected = clock.value + timedelta(seconds=1)
+    monitor.record_fill_check(expected_price=100.0, actual_price=106.0, at=detected)
+    monitor.persist(store, event_id="health:fill-anomaly", logical_at=detected)
+    clock.value = detected
+
+    first = app.run_once()
+    store.close()
+    store = SQLiteStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    app = _PaperApplication(
+        source=source,
+        store=store,
+        clock=clock,
+        sleeper=_Sleeper(clock),
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="fill-recovery-worker-restarted",
+        lease_token="fill-recovery-token-restarted",
+    )
+    second = app.run_once()
+    third = app.run_once()
+
+    recovered = HealthMonitor.from_store(store)
+    reconciliation = PaperBroker(store, CostConfig(0.0, 0.0)).reconcile()
+    health_events = [
+        event
+        for event in store.replay_state().event_evidence
+        if event.event_type == "HEALTH_STATE"
+    ]
+    extension_keys = {
+        "fill_anomaly_episode",
+        "fill_recovery_checks",
+        "fill_anomaly_deviation",
+        "fill_anomaly_detected_at_utc",
+        "fill_anomaly_resolved_at_utc",
+        "last_fill_recovery_at_utc",
+    }
+    assert first.status is second.status is third.status is CycleStatus.ALREADY_PROCESSED
+    assert first.reasons == second.reasons == ("FILL_DEVIATION",)
+    assert third.reasons == ()
+    assert recovered.current_action().stage is HealthStage.REDUCED
+    assert recovered.snapshot().fill_anomaly_deviation == pytest.approx(0.06)
+    assert recovered.snapshot().fill_anomaly_resolved_at_utc is not None
+    assert reconciliation.btc_quantity == 0.0
+    assert reconciliation.active_orders == ()
+    assert reconciliation.fills == ()
+    assert all(event.payload["version"] == 2 for event in health_events)
+    assert all(not extension_keys.intersection(event.payload) for event in health_events)
+    assert sum(":fill-recovery-v1:eligible" in event.event_id for event in health_events) == 3
+
+
+def test_health_only_stale_epoch_cannot_persist_evidence_or_advance_recovery(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    successor = SQLiteStore(path)
+    successor.initialize()
+    clock = _Clock(END + timedelta(minutes=10))
+
+    class SlowHealthSource:
+        calls = 0
+
+        def load_completed_candles(self, end_utc: datetime) -> pd.DataFrame:
+            self.calls += 1
+            if self.calls == 2:
+                clock.value += timedelta(seconds=2)
+                epoch = successor.acquire_cycle_lease_epoch(
+                    "successor",
+                    "successor-token",
+                    clock.value,
+                    clock.value + timedelta(seconds=1),
+                )
+                assert epoch == 4
+                assert successor.release_cycle_lease(
+                    "successor", "successor-token", epoch
+                )
+            return _history(end_utc)
+
+    source = SlowHealthSource()
+    app = _PaperApplication(
+        source=source,
+        store=store,
+        clock=clock,
+        sleeper=_Sleeper(clock),
+        notifier=None,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="stale-health",
+        lease_token="stale-health-token",
+        lease_ttl=timedelta(seconds=1),
+    )
+    assert app.run_once().status is CycleStatus.PROCESSED
+    monitor = HealthMonitor.from_store(store)
+    detected = clock.value + timedelta(milliseconds=100)
+    monitor.record_fill_check(expected_price=100.0, actual_price=106.0, at=detected)
+    monitor.persist(store, event_id="health:stale-fill", logical_at=detected)
+    clock.value = detected
+    before = store.replay_state()
+
+    result = app.run_once()
+
+    after = store.replay_state()
+    restored = HealthMonitor.from_store(store).snapshot()
+    assert result.status is CycleStatus.LEASE_HELD
+    assert after == before
+    assert restored.api_successes == 0
+    assert restored.fill_recovery_checks == 0
+    assert restored.fill_anomaly_resolved_at_utc is None
+
+
+def test_slow_cycle_notifier_cannot_append_failure_evidence_after_lease_takeover(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = SQLiteStore(path)
+    store.initialize()
+    successor = SQLiteStore(path)
+    successor.initialize()
+    clock = _Clock(END + timedelta(minutes=10))
+
+    class TakingOverNotifier:
+        calls = 0
+        takeover_epoch: int | None = None
+
+        def send(self, event: dict[str, object]) -> bool:
+            del event
+            self.calls += 1
+            if self.calls == 1:
+                return True
+            clock.value += timedelta(seconds=2)
+            self.takeover_epoch = successor.acquire_cycle_lease_epoch(
+                "successor-notifier",
+                "successor-notifier-token",
+                clock.value,
+                clock.value + timedelta(seconds=1),
+            )
+            assert self.takeover_epoch is not None
+            successor.release_cycle_lease(
+                "successor-notifier",
+                "successor-notifier-token",
+                self.takeover_epoch,
+            )
+            return False
+
+    notifier = TakingOverNotifier()
+    app = _PaperApplication(
+        source=_FrameSource([_history(END)]),
+        store=store,
+        clock=clock,
+        sleeper=_Sleeper(clock),
+        notifier=notifier,
+        costs=CostConfig(0.0, 0.0),
+        lease_owner="stale-notifier",
+        lease_token="stale-notifier-token",
+        lease_ttl=timedelta(seconds=1),
+    )
+
+    result = app.run_once()
+
+    events = store.replay_state().event_evidence
+    assert result.status is CycleStatus.PROCESSED
+    assert notifier.calls == 2
+    assert notifier.takeover_epoch == 3
+    assert len([event for event in events if event.event_type == "ALERT_ATTEMPT"]) == 2
+    assert not [event for event in events if event.event_type == "ALERT_FAILURE"]
+
+
 def test_first_api_failure_survives_rollover_and_restart_before_newer_cycle(
     tmp_path: Path,
 ) -> None:

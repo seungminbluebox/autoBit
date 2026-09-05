@@ -14,6 +14,7 @@ import pytest
 from autobit.domain.models import OrderStatus, PositionState
 from autobit.persistence import sqlite_store as sqlite_store_module
 from autobit.persistence.sqlite_store import (
+    CycleLeaseLostError,
     IdempotencyConflictError,
     SQLiteStore,
     StoreError,
@@ -616,6 +617,99 @@ def test_expired_cycle_lease_is_recoverable_after_reopen(tmp_path: Path) -> None
         now + timedelta(minutes=5),
         now + timedelta(minutes=10),
     )
+
+
+def test_monotonic_lease_epoch_fences_stale_owner_even_after_successor_releases(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    first = _open_store(path)
+    second = _open_store(path)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first_epoch = first.acquire_cycle_lease_epoch(
+        "worker-a", "token-a", now, now + timedelta(seconds=1)
+    )
+    assert first_epoch == 1
+    second_epoch = second.acquire_cycle_lease_epoch(
+        "worker-b",
+        "token-b",
+        now + timedelta(seconds=2),
+        now + timedelta(seconds=3),
+    )
+    assert second_epoch == 2
+    assert second.release_cycle_lease("worker-b", "token-b", second_epoch)
+
+    with pytest.raises(CycleLeaseLostError, match="lease"):
+        with first.cycle_lease_transaction(
+            "worker-a",
+            "token-a",
+            first_epoch,
+            now + timedelta(seconds=2),
+        ):
+            first.append_event("stale", "CYCLE_EVIDENCE", UTC_0, {"value": 1})
+
+    third_epoch = first.acquire_cycle_lease_epoch(
+        "worker-c",
+        "token-c",
+        now + timedelta(seconds=2),
+        now + timedelta(seconds=4),
+    )
+    assert third_epoch == 3
+    assert first.replay_state().last_sequence == 0
+
+
+def test_legacy_three_field_lease_is_migrated_without_unlocking_its_holder(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    store.close()
+    legacy = (
+        '{"expires_at_utc":"2026-01-01T00:05:00Z",'
+        '"owner":"worker-a","token":"token-a"}'
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO metadata (key, value) VALUES ('paper_cycle_lease', ?)",
+            (legacy,),
+        )
+    reopened = _open_store(path)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    epoch = reopened.acquire_cycle_lease_epoch(
+        "worker-a", "token-a", now, now + timedelta(minutes=6)
+    )
+
+    assert epoch == 1
+    with reopened.cycle_lease_transaction("worker-a", "token-a", epoch, now):
+        reopened.append_event("migrated", "CYCLE_EVIDENCE", UTC_0, {"value": 1})
+    assert reopened.replay_state().last_sequence == 1
+
+
+def test_fenced_lease_keeps_the_frozen_three_field_metadata_shape(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _open_store(path)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    epoch = store.acquire_cycle_lease_epoch(
+        "worker-a", "token-a", now, now + timedelta(minutes=5)
+    )
+
+    assert epoch == 1
+    with sqlite3.connect(path) as connection:
+        metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+        lease = json.loads(metadata["paper_cycle_lease"])
+        assert set(metadata) == {"initial_equity", "market", "paper_cycle_lease"}
+        assert set(lease) == {"expires_at_utc", "owner", "token"}
+        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+    assert store.release_cycle_lease("worker-a", "token-a", epoch)
+    with sqlite3.connect(path) as connection:
+        assert {
+            key for key, in connection.execute("SELECT key FROM metadata")
+        } == {"initial_equity", "market"}
+        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
 
 
 @pytest.mark.parametrize(

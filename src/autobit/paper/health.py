@@ -37,14 +37,16 @@ HEALTH_REASON_ORDER = (
     "FILL_DEVIATION",
 )
 
-_VERSION = 2
+_VERSION = 3
+_LEGACY_VERSION = 2
 _API_SUCCESSES_REQUIRED = 3
 _LEDGER_TOLERANCE = 1e-10
 _FILL_DEVIATION_LIMIT = 0.05
 _FILL_DEVIATION_LIMIT_DECIMAL = Decimal("0.05")
 _STALE_AFTER = timedelta(minutes=10)
 _UTC = timezone.utc
-_SNAPSHOT_KEYS = frozenset(
+_FILL_RECOVERY_EVENT_SUFFIX = ":fill-recovery-v1:"
+_SNAPSHOT_V2_KEYS = frozenset(
     {
         "version",
         "stage",
@@ -68,6 +70,16 @@ _SNAPSHOT_KEYS = frozenset(
         "last_success_at_utc",
         "last_failure_at_utc",
         "last_observation_at_utc",
+    },
+)
+_SNAPSHOT_KEYS = _SNAPSHOT_V2_KEYS | frozenset(
+    {
+        "fill_anomaly_episode",
+        "fill_recovery_checks",
+        "fill_anomaly_deviation",
+        "fill_anomaly_detected_at_utc",
+        "fill_anomaly_resolved_at_utc",
+        "last_fill_recovery_at_utc",
     },
 )
 
@@ -128,6 +140,12 @@ class HealthSnapshot:
     latest_candle_valid: bool = True
     fill_within_limit: bool = True
     fill_deviation: float = 0.0
+    fill_anomaly_episode: int = 0
+    fill_recovery_checks: int = 0
+    fill_anomaly_deviation: float = 0.0
+    fill_anomaly_detected_at_utc: datetime | None = None
+    fill_anomaly_resolved_at_utc: datetime | None = None
+    last_fill_recovery_at_utc: datetime | None = None
     retry_attempts: int = 0
     last_success_at_utc: datetime | None = None
     last_failure_at_utc: datetime | None = None
@@ -138,7 +156,7 @@ class HealthSnapshot:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> HealthSnapshot:
-        """Parse only the canonical version-two snapshot shape.
+        """Parse the canonical snapshot or strictly migrate version two.
 
         An empty mapping is the one compatibility exception: Task 3 databases
         predate health events and therefore begin healthy.
@@ -147,10 +165,13 @@ class HealthSnapshot:
             raise HealthStateError("health snapshot must be a mapping")
         if not payload:
             return cls()
-        if set(payload) != _SNAPSHOT_KEYS:
+        payload_keys = set(payload)
+        if payload_keys not in {_SNAPSHOT_KEYS, _SNAPSHOT_V2_KEYS}:
             raise HealthStateError("health snapshot keys are invalid")
         version = _strict_int(payload["version"], "version")
-        if version != _VERSION:
+        legacy = payload_keys == _SNAPSHOT_V2_KEYS
+        expected_version = _LEGACY_VERSION if legacy else _VERSION
+        if version != expected_version:
             raise HealthStateError("health snapshot version is unsupported")
         stage = _strict_stage(payload["stage"])
         reasons = _strict_reasons(payload["reasons"])
@@ -196,6 +217,38 @@ class HealthSnapshot:
             payload["fill_deviation"],
             "fill_deviation",
         )
+        if legacy:
+            fill_anomaly_episode = 0 if fill_within_limit else 1
+            fill_recovery_checks = 0
+            fill_anomaly_deviation = 0.0 if fill_within_limit else fill_deviation
+            fill_anomaly_detected_at = None
+            fill_anomaly_resolved_at = None
+            last_fill_recovery_at = None
+        else:
+            fill_anomaly_episode = _strict_int(
+                payload["fill_anomaly_episode"],
+                "fill_anomaly_episode",
+            )
+            fill_recovery_checks = _strict_int(
+                payload["fill_recovery_checks"],
+                "fill_recovery_checks",
+            )
+            fill_anomaly_deviation = _nonnegative_finite(
+                payload["fill_anomaly_deviation"],
+                "fill_anomaly_deviation",
+            )
+            fill_anomaly_detected_at = _optional_canonical_datetime(
+                payload["fill_anomaly_detected_at_utc"],
+                "fill_anomaly_detected_at_utc",
+            )
+            fill_anomaly_resolved_at = _optional_canonical_datetime(
+                payload["fill_anomaly_resolved_at_utc"],
+                "fill_anomaly_resolved_at_utc",
+            )
+            last_fill_recovery_at = _optional_canonical_datetime(
+                payload["last_fill_recovery_at_utc"],
+                "last_fill_recovery_at_utc",
+            )
         retry_attempts = _strict_int(payload["retry_attempts"], "retry_attempts")
         last_success_at = _optional_canonical_datetime(
             payload["last_success_at_utc"],
@@ -213,7 +266,7 @@ class HealthSnapshot:
         resume_reduced = _strict_bool(payload["resume_reduced"], "resume_reduced")
 
         snapshot = cls(
-            version=version,
+            version=_VERSION,
             stage=stage,
             reasons=reasons,
             api_failures=api_failures,
@@ -229,6 +282,12 @@ class HealthSnapshot:
             latest_candle_valid=latest_candle_valid,
             fill_within_limit=fill_within_limit,
             fill_deviation=fill_deviation,
+            fill_anomaly_episode=fill_anomaly_episode,
+            fill_recovery_checks=fill_recovery_checks,
+            fill_anomaly_deviation=fill_anomaly_deviation,
+            fill_anomaly_detected_at_utc=fill_anomaly_detected_at,
+            fill_anomaly_resolved_at_utc=fill_anomaly_resolved_at,
+            last_fill_recovery_at_utc=last_fill_recovery_at,
             retry_attempts=retry_attempts,
             last_success_at_utc=last_success_at,
             last_failure_at_utc=last_failure_at,
@@ -271,6 +330,18 @@ class HealthSnapshot:
                 "latest_candle_valid": self.latest_candle_valid,
                 "fill_within_limit": self.fill_within_limit,
                 "fill_deviation": self.fill_deviation,
+                "fill_anomaly_episode": self.fill_anomaly_episode,
+                "fill_recovery_checks": self.fill_recovery_checks,
+                "fill_anomaly_deviation": self.fill_anomaly_deviation,
+                "fill_anomaly_detected_at_utc": _optional_datetime(
+                    self.fill_anomaly_detected_at_utc,
+                ),
+                "fill_anomaly_resolved_at_utc": _optional_datetime(
+                    self.fill_anomaly_resolved_at_utc,
+                ),
+                "last_fill_recovery_at_utc": _optional_datetime(
+                    self.last_fill_recovery_at_utc,
+                ),
                 "retry_attempts": self.retry_attempts,
                 "last_success_at_utc": _optional_datetime(self.last_success_at_utc),
                 "last_failure_at_utc": _optional_datetime(self.last_failure_at_utc),
@@ -279,6 +350,14 @@ class HealthSnapshot:
                 ),
             },
         )
+
+    def _to_storage_mapping(self) -> Mapping[str, object]:
+        """Keep durable HEALTH_STATE payloads readable by the frozen v2 release."""
+        payload = dict(self.to_mapping())
+        for key in _SNAPSHOT_KEYS - _SNAPSHOT_V2_KEYS:
+            payload.pop(key)
+        payload["version"] = _LEGACY_VERSION
+        return MappingProxyType(payload)
 
 
 class HealthMonitor:
@@ -290,6 +369,7 @@ class HealthMonitor:
         self._snapshot = snapshot or HealthSnapshot()
         # Validate manually constructed snapshots as strictly as persisted ones.
         self._snapshot = HealthSnapshot.from_mapping(self._snapshot.to_mapping())
+        self._pending_fill_recovery: bool | None = None
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> HealthMonitor:
@@ -301,24 +381,33 @@ class HealthMonitor:
         if not isinstance(store, SQLiteStore):
             raise TypeError("store must be a SQLiteStore")
         state = store.replay_state()
-        latest: HealthSnapshot | None = None
+        latest_event: StoredEvent | None = None
         for event in state.event_evidence:
             if event.event_type == "HEALTH_STATE":
-                latest = _snapshot_from_health_event(event)
-        if latest is None:
+                _snapshot_from_health_event(event)
+                latest_event = event
+        if latest_event is None:
             if state.health_state:
                 raise StoreCorruptionError("health projection has no event evidence")
             return cls()
-        projected = HealthSnapshot.from_mapping(state.health_state)
-        if projected != latest:
+        if dict(state.health_state) != dict(latest_event.payload):
             raise StoreCorruptionError("health projection contradicts event evidence")
-        return cls(latest)
+        return cls(_project_fill_recovery_evidence(state.event_evidence))
 
     def snapshot(self) -> HealthSnapshot:
         return self._snapshot
 
     def current_action(self) -> HealthAction:
         return _action(self._snapshot)
+
+    def persistence_event_id(self, event_id: str) -> str:
+        """Bind a pending flat-account recovery observation to its health event."""
+        if not isinstance(event_id, str) or not event_id:
+            raise ValueError("event_id must be non-empty")
+        if self._pending_fill_recovery is None:
+            return event_id
+        outcome = "eligible" if self._pending_fill_recovery else "ineligible"
+        return f"{event_id}{_FILL_RECOVERY_EVENT_SUFFIX}{outcome}"
 
     def record_api_failure(self, at: datetime) -> HealthAction:
         observed = _utc_datetime(at, "API observation time")
@@ -513,11 +602,73 @@ class HealthMonitor:
         if not within_limit and deviation <= _FILL_DEVIATION_LIMIT:
             deviation = math.nextafter(_FILL_DEVIATION_LIMIT, math.inf)
         newly_faulted = self._snapshot.fill_within_limit and not within_limit
+        episode = self._snapshot.fill_anomaly_episode
+        anomaly_deviation = self._snapshot.fill_anomaly_deviation
+        detected_at = self._snapshot.fill_anomaly_detected_at_utc
+        resolved_at = self._snapshot.fill_anomaly_resolved_at_utc
+        recovery_checks = self._snapshot.fill_recovery_checks
+        last_recovery_at = self._snapshot.last_fill_recovery_at_utc
+        if not within_limit:
+            if newly_faulted:
+                episode += 1
+                detected_at = observed
+            anomaly_deviation = max(anomaly_deviation, deviation)
+            resolved_at = None
+            recovery_checks = 0
+            last_recovery_at = None
+        elif not self._snapshot.fill_within_limit:
+            # A subsequent real fill is direct resolution evidence for the
+            # active episode. Historical trigger evidence remains immutable.
+            recovery_checks = _API_SUCCESSES_REQUIRED
+            resolved_at = observed
         self._snapshot = replace(
             self._snapshot,
             fill_within_limit=within_limit,
             fill_deviation=deviation,
+            fill_anomaly_episode=episode,
+            fill_recovery_checks=recovery_checks,
+            fill_anomaly_deviation=anomaly_deviation,
+            fill_anomaly_detected_at_utc=detected_at,
+            fill_anomaly_resolved_at_utc=resolved_at,
+            last_fill_recovery_at_utc=last_recovery_at,
             api_successes=0 if newly_faulted else self._snapshot.api_successes,
+            last_observation_at_utc=_latest_observation(
+                self._snapshot.last_observation_at_utc,
+                observed,
+            ),
+        )
+        return self._finish_observation()
+
+    def record_flat_fill_recovery_check(
+        self,
+        *,
+        eligible: bool,
+        at: datetime,
+    ) -> HealthAction:
+        """Advance one distinct clean, flat-account check for an active fill episode."""
+        observed = _utc_datetime(at, "flat fill recovery check time")
+        if type(eligible) is not bool:
+            self._fail_schema(observed)
+            raise ValueError("flat fill recovery eligibility must be a bool")
+        if self._snapshot.fill_within_limit:
+            return self.current_action()
+        prior = self._snapshot.last_fill_recovery_at_utc
+        if prior is not None and observed <= prior:
+            return self.current_action()
+        self._pending_fill_recovery = eligible
+        checks = (
+            min(_API_SUCCESSES_REQUIRED, self._snapshot.fill_recovery_checks + 1)
+            if eligible
+            else 0
+        )
+        resolved = eligible and checks >= _API_SUCCESSES_REQUIRED
+        self._snapshot = replace(
+            self._snapshot,
+            fill_within_limit=resolved,
+            fill_deviation=(0.0 if resolved else self._snapshot.fill_deviation),
+            fill_recovery_checks=checks,
+            fill_anomaly_resolved_at_utc=(observed if resolved else None),
+            last_fill_recovery_at_utc=observed,
             last_observation_at_utc=_latest_observation(
                 self._snapshot.last_observation_at_utc,
                 observed,
@@ -558,32 +709,40 @@ class HealthMonitor:
         logical = _utc_datetime(logical_at, "logical event time")
         if not isinstance(event_id, str) or not event_id:
             raise ValueError("event_id must be non-empty")
+        payload = self._snapshot._to_storage_mapping()
         matching = tuple(
             event
             for event in store.replay_state().event_evidence
             if event.event_id == event_id
         )
         if matching:
-            return self._validate_duplicate_event(matching, logical)
+            sequence = self._validate_duplicate_event(matching, logical, payload)
+            self._pending_fill_recovery = None
+            return sequence
         try:
-            return store.append_event(
+            sequence = store.append_event(
                 event_id,
                 "HEALTH_STATE",
                 logical,
-                self._snapshot.to_mapping(),
+                payload,
             )
+            self._pending_fill_recovery = None
+            return sequence
         except IdempotencyConflictError:
             matching = tuple(
                 event
                 for event in store.replay_state().event_evidence
                 if event.event_id == event_id
             )
-            return self._validate_duplicate_event(matching, logical)
+            sequence = self._validate_duplicate_event(matching, logical, payload)
+            self._pending_fill_recovery = None
+            return sequence
 
     def _validate_duplicate_event(
         self,
         matching: Sequence[StoredEvent],
         logical_at: datetime,
+        payload: Mapping[str, object],
     ) -> int:
         if len(matching) != 1:
             raise IdempotencyConflictError("health event identity is not unique")
@@ -591,10 +750,10 @@ class HealthMonitor:
         if event.event_type != "HEALTH_STATE" or event.occurred_at_utc != logical_at:
             raise IdempotencyConflictError("health event identity conflicts")
         try:
-            stored = HealthSnapshot.from_event_mapping(event.payload)
+            HealthSnapshot.from_event_mapping(event.payload)
         except HealthStateError as error:
             raise StoreCorruptionError("stored health event is invalid") from error
-        if stored != self._snapshot:
+        if dict(event.payload) != dict(payload):
             raise IdempotencyConflictError("health event identity conflicts")
         return event.sequence
 
@@ -659,6 +818,92 @@ def _snapshot_from_health_event(event: StoredEvent) -> HealthSnapshot:
     return HealthSnapshot.from_event_mapping(event.payload)
 
 
+def _project_fill_recovery_evidence(
+    events: Sequence[StoredEvent],
+) -> HealthSnapshot:
+    """Rebuild v3 recovery fields from v2-compatible immutable health events."""
+    latest: HealthSnapshot | None = None
+    episode = 0
+    checks = 0
+    anomaly_deviation = 0.0
+    detected_at: datetime | None = None
+    resolved_at: datetime | None = None
+    last_recovery_at: datetime | None = None
+    active = False
+
+    for event in events:
+        if event.event_type != "HEALTH_STATE":
+            continue
+        stored = _snapshot_from_health_event(event)
+        observed = stored.last_observation_at_utc or event.occurred_at_utc
+        marker = _fill_recovery_marker(event.event_id)
+        was_active = active
+
+        if not stored.fill_within_limit and not was_active:
+            episode += 1
+            checks = 0
+            detected_at = observed
+            resolved_at = None
+            last_recovery_at = None
+            active = True
+        if not stored.fill_within_limit:
+            anomaly_deviation = max(
+                anomaly_deviation,
+                stored.fill_deviation,
+                stored.fill_anomaly_deviation,
+            )
+
+        if marker is not None:
+            if not was_active:
+                raise StoreCorruptionError(
+                    "flat fill recovery evidence has no active anomaly episode"
+                )
+            if last_recovery_at is not None and observed <= last_recovery_at:
+                raise StoreCorruptionError(
+                    "flat fill recovery evidence is duplicated or reversed"
+                )
+            checks = min(_API_SUCCESSES_REQUIRED, checks + 1) if marker else 0
+            last_recovery_at = observed
+            resolved = marker and checks >= _API_SUCCESSES_REQUIRED
+            if stored.fill_within_limit != resolved:
+                raise StoreCorruptionError(
+                    "flat fill recovery marker contradicts health state"
+                )
+            active = not resolved
+            resolved_at = observed if resolved else None
+        elif was_active and stored.fill_within_limit:
+            # A subsequent real fill is direct episode-resolution evidence.
+            checks = _API_SUCCESSES_REQUIRED
+            resolved_at = observed
+            active = False
+
+        latest = replace(
+            stored,
+            fill_anomaly_episode=episode,
+            fill_recovery_checks=checks,
+            fill_anomaly_deviation=anomaly_deviation,
+            fill_anomaly_detected_at_utc=detected_at,
+            fill_anomaly_resolved_at_utc=resolved_at,
+            last_fill_recovery_at_utc=last_recovery_at,
+        )
+
+    if latest is None:
+        raise StoreCorruptionError("health projection has no event evidence")
+    return latest
+
+
+def _fill_recovery_marker(event_id: str) -> bool | None:
+    if _FILL_RECOVERY_EVENT_SUFFIX not in event_id:
+        return None
+    prefix, outcome = event_id.rsplit(_FILL_RECOVERY_EVENT_SUFFIX, 1)
+    if not prefix.startswith("health:reconcile:") or outcome not in {
+        "eligible",
+        "ineligible",
+    }:
+        raise StoreCorruptionError("flat fill recovery event identity is invalid")
+    return outcome == "eligible"
+
+
 def _derive_reasons(snapshot: HealthSnapshot) -> tuple[str, ...]:
     active = {
         "API_FAILURES": snapshot.api_failure_latched,
@@ -720,6 +965,48 @@ def _validate_snapshot_relationships(
         snapshot.fill_deviation <= _FILL_DEVIATION_LIMIT
     ):
         raise HealthStateError("fill predicate contradicts deviation")
+    if snapshot.fill_recovery_checks > _API_SUCCESSES_REQUIRED:
+        raise HealthStateError("fill recovery checks exceed their canonical cap")
+    if snapshot.fill_anomaly_episode == 0:
+        if (
+            not snapshot.fill_within_limit
+            or snapshot.fill_recovery_checks != 0
+            or snapshot.fill_anomaly_deviation != 0.0
+            or snapshot.fill_anomaly_detected_at_utc is not None
+            or snapshot.fill_anomaly_resolved_at_utc is not None
+            or snapshot.last_fill_recovery_at_utc is not None
+        ):
+            raise HealthStateError("fill anomaly evidence exists without an episode")
+    else:
+        if snapshot.fill_anomaly_deviation <= _FILL_DEVIATION_LIMIT:
+            raise HealthStateError("fill anomaly episode lacks trigger evidence")
+        if snapshot.fill_within_limit:
+            if snapshot.fill_recovery_checks != _API_SUCCESSES_REQUIRED:
+                raise HealthStateError("resolved fill episode lacks bounded recovery evidence")
+        elif (
+            snapshot.fill_recovery_checks >= _API_SUCCESSES_REQUIRED
+            or snapshot.fill_anomaly_resolved_at_utc is not None
+        ):
+            raise HealthStateError("active fill episode contradicts recovery evidence")
+        if (
+            0 < snapshot.fill_recovery_checks < _API_SUCCESSES_REQUIRED
+            and snapshot.last_fill_recovery_at_utc is None
+        ):
+            raise HealthStateError("fill recovery counter lacks observation evidence")
+        if (
+            snapshot.fill_anomaly_detected_at_utc is not None
+            and snapshot.fill_anomaly_resolved_at_utc is not None
+            and snapshot.fill_anomaly_resolved_at_utc
+            < snapshot.fill_anomaly_detected_at_utc
+        ):
+            raise HealthStateError("fill anomaly resolution predates detection")
+        if (
+            snapshot.last_fill_recovery_at_utc is not None
+            and snapshot.fill_anomaly_resolved_at_utc is not None
+            and snapshot.last_fill_recovery_at_utc
+            > snapshot.fill_anomaly_resolved_at_utc
+        ):
+            raise HealthStateError("fill recovery cursor postdates resolution")
     if snapshot.api_failure_latched != ("API_FAILURES" in derived):
         raise HealthStateError("API latch contradicts reasons")
     if snapshot.api_failure_latched and snapshot.api_successes >= 3:

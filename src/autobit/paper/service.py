@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -24,6 +25,7 @@ from autobit.execution.paper_broker import (
 )
 from autobit.indicators.trend import compute_trend_indicators
 from autobit.persistence.sqlite_store import (
+    CycleLeaseLostError,
     PaperSnapshot,
     SQLiteStore,
     StoreCorruptionError,
@@ -148,7 +150,75 @@ class PaperService:
         self._costs = costs
         self._engine = StrategyEngine(strategy_config, costs)
         self._lease_ttl = lease_ttl
+        self._lease_epoch: int | None = None
         self._fault_hook = fault_hook
+
+    def acquire_cycle_lease(self) -> bool:
+        """Acquire a new process epoch and bind lease-aware data adapters."""
+        now = _clock_utc(self._clock)
+        expiry = _safe_add(now, self._lease_ttl, "lease expiry is outside datetime range")
+        epoch = self._store.acquire_cycle_lease_epoch(
+            self._lease_owner,
+            self._lease_token,
+            now,
+            expiry,
+        )
+        if epoch is None:
+            return False
+        self._lease_epoch = epoch
+        self._bind_source_lease()
+        return True
+
+    def renew_cycle_lease(self) -> bool:
+        """Renew only this process's extant fencing epoch."""
+        if self._lease_epoch is None:
+            return False
+        now = _clock_utc(self._clock)
+        expiry = _safe_add(now, self._lease_ttl, "lease expiry is outside datetime range")
+        renewed = self._store.renew_cycle_lease(
+            self._lease_owner,
+            self._lease_token,
+            self._lease_epoch,
+            now,
+            expiry,
+        )
+        if renewed:
+            self._bind_source_lease()
+        return renewed
+
+    def release_cycle_lease(self) -> bool:
+        epoch = self._lease_epoch
+        self._lease_epoch = None
+        if epoch is None:
+            return False
+        return self._store.release_cycle_lease(
+            self._lease_owner,
+            self._lease_token,
+            epoch,
+        )
+
+    @contextmanager
+    def fenced_cycle_transaction(self):
+        """Require this exact live epoch in the transaction owning mutations."""
+        if self._lease_epoch is None:
+            raise CycleLeaseLostError("paper cycle mutation has no acquired lease epoch")
+        with self._store.cycle_lease_transaction(
+            self._lease_owner,
+            self._lease_token,
+            self._lease_epoch,
+            _clock_utc(self._clock),
+        ) as transaction:
+            yield transaction
+
+    def _bind_source_lease(self) -> None:
+        binder = getattr(self._source, "bind_cycle_lease", None)
+        if callable(binder) and self._lease_epoch is not None:
+            binder(
+                owner=self._lease_owner,
+                token=self._lease_token,
+                epoch=self._lease_epoch,
+                ttl=self._lease_ttl,
+            )
 
     def oldest_required_end(self, latest_matured: datetime) -> datetime:
         """Resolve the oldest unfinished cycle exclusively from durable evidence."""
@@ -315,13 +385,7 @@ class PaperService:
             return CycleResult(CycleStatus.ALREADY_PROCESSED, end)
         _require_attempt_target(end, initial_attempted, initial_completed)
 
-        expires = _safe_add(now, self._lease_ttl, "lease expiry is outside datetime range")
-        if not self._store.acquire_cycle_lease(
-            self._lease_owner,
-            self._lease_token,
-            now,
-            expires,
-        ):
+        if not self.acquire_cycle_lease():
             return CycleResult(CycleStatus.LEASE_HELD, end)
 
         try:
@@ -355,19 +419,8 @@ class PaperService:
             bar_at = end - _FOUR_HOURS
             row = enriched.loc[bar_at] if bar_at in enriched.index else None
 
-            renewed_at = _clock_utc(self._clock)
-            renewed_expiry = _safe_add(
-                renewed_at,
-                self._lease_ttl,
-                "lease expiry is outside datetime range",
-            )
-            if not self._store.acquire_cycle_lease(
-                self._lease_owner,
-                self._lease_token,
-                renewed_at,
-                renewed_expiry,
-            ):
-                return CycleResult(CycleStatus.LEASE_HELD, end)
+            if not self.renew_cycle_lease():
+                return self._result_after_lost_lease(end, event_id)
             if _has_completed_cycle(
                 self._validated_snapshot(),
                 event_id,
@@ -399,19 +452,8 @@ class PaperService:
             # health/alert evidence cannot be rolled back with a failed fill.
             prepared_contexts = self._prepare_legacy_entry_contexts(bar_at, enriched)
 
-            renewed_at = _clock_utc(self._clock)
-            renewed_expiry = _safe_add(
-                renewed_at,
-                self._lease_ttl,
-                "lease expiry is outside datetime range",
-            )
-            if not self._store.acquire_cycle_lease(
-                self._lease_owner,
-                self._lease_token,
-                renewed_at,
-                renewed_expiry,
-            ):
-                return CycleResult(CycleStatus.LEASE_HELD, end)
+            if not self.renew_cycle_lease():
+                return self._result_after_lost_lease(end, event_id)
             if _has_completed_cycle(
                 self._validated_snapshot(),
                 event_id,
@@ -422,7 +464,7 @@ class PaperService:
 
             created_ids: list[str] = []
             filled_ids: list[str] = []
-            with self._store.transaction():
+            with self.fenced_cycle_transaction():
                 atomic_snapshot = self._validated_snapshot()
                 _validate_operational_alert_chain(atomic_snapshot.event_evidence)
                 if _has_completed_cycle(
@@ -508,16 +550,18 @@ class PaperService:
                 # Broker-owned partial BUY remainders are already canceled at
                 # process_open. A pending SELL coalesces a repeated exit intent.
                 if not reconciliation.active_orders:
-                    order = self._broker.submit_exit(
-                        bar_at, quantity=decision.quantity,
-                        owned_quantity=reconciliation.btc_quantity, reason=decision.reason,
-                    )
+                    with self.fenced_cycle_transaction():
+                        order = self._broker.submit_exit(
+                            bar_at, quantity=decision.quantity,
+                            owned_quantity=reconciliation.btc_quantity, reason=decision.reason,
+                        )
                     created_ids.append(order.order_id)
             elif decision.action == "buy":
-                order = self._broker.submit_entry(
-                    bar_at, quantity=decision.quantity, reason=decision.reason,
-                    execution_context=self._entry_context(bar_at, row, decision.risk),
-                )
+                with self.fenced_cycle_transaction():
+                    order = self._broker.submit_entry(
+                        bar_at, quantity=decision.quantity, reason=decision.reason,
+                        execution_context=self._entry_context(bar_at, row, decision.risk),
+                    )
                 created_ids.append(order.order_id)
                 self._fault("after_order_acceptance")
             elif position is not None and not reconciliation.active_orders:
@@ -533,8 +577,16 @@ class PaperService:
             )
             self._record_completion(event_id, result)
             return result
+        except CycleLeaseLostError:
+            return self._result_after_lost_lease(end, event_id)
         finally:
-            self._store.release_cycle_lease(self._lease_owner, self._lease_token)
+            self.release_cycle_lease()
+
+    def _result_after_lost_lease(self, end: datetime, event_id: str) -> CycleResult:
+        snapshot = self._validated_snapshot()
+        if _has_completed_cycle(snapshot, event_id, end, self._broker):
+            return CycleResult(CycleStatus.ALREADY_PROCESSED, end)
+        return CycleResult(CycleStatus.LEASE_HELD, end)
 
     def _validated_snapshot(self) -> PaperSnapshot:
         snapshot = self._store.replay_state()
@@ -575,16 +627,21 @@ class PaperService:
             if loader is None:
                 raise PaperServiceError("public position-history backfill is unavailable")
             held = loader(start, end)
+            if not self.renew_cycle_lease():
+                raise CycleLeaseLostError(
+                    "paper cycle lease was lost during position-history backfill"
+                )
         held = _validated_position_frame(held, start, end)
         initial = (float(observation.payload["initial_stop"]) if observation
                    else self._broker.initial_stop(entry.order_id))
         if initial is None:
             raise PaperServiceError("position history lacks immutable initial protection")
-        self._broker.observe_position(
-            entry.order_id,
-            [[_canonical_datetime(at.to_pydatetime()), float(row["high"])] for at, row in held.iterrows()],
-            initial,
-        )
+        with self.fenced_cycle_transaction():
+            self._broker.observe_position(
+                entry.order_id,
+                [[_canonical_datetime(at.to_pydatetime()), float(row["high"])] for at, row in held.iterrows()],
+                initial,
+            )
         self._fault("after_position_observation")
 
     def _legacy_entry_context(
@@ -663,13 +720,14 @@ class PaperService:
                 if stored.decision != final or (
                     final != base.decision and not current_is_bound
                 ):
-                    _persist_health_risk_followup(
-                        self._store,
-                        bar_at=bar_at,
-                        stored=base,
-                        final=final,
-                        health=health,
-                    )
+                    with self.fenced_cycle_transaction():
+                        _persist_health_risk_followup(
+                            self._store,
+                            bar_at=bar_at,
+                            stored=base,
+                            final=final,
+                            health=health,
+                        )
                     self._fault("after_health_risk_followup")
                 return final
 
@@ -680,25 +738,28 @@ class PaperService:
             row=row,
             completed_trades=reconciliation.completed_trades,
             risk_config=self._risk,
+            atr_period=self._strategy.atr_period,
             system_healthy=(
                 health.action is not None and not health.action.halt_entries
             ),
         )
-        self._store.append_event(
-            f"risk:{_canonical_datetime(bar_at)}",
-            "BREAKER_STATE",
-            bar_at,
-            _risk_state_payload(base),
-        )
+        with self.fenced_cycle_transaction():
+            self._store.append_event(
+                f"risk:{_canonical_datetime(bar_at)}",
+                "BREAKER_STATE",
+                bar_at,
+                _risk_state_payload(base),
+            )
         final = _apply_health_action(base.decision, health.action)
         if final != base.decision:
-            _persist_health_risk_followup(
-                self._store,
-                bar_at=bar_at,
-                stored=base,
-                final=final,
-                health=health,
-            )
+            with self.fenced_cycle_transaction():
+                _persist_health_risk_followup(
+                    self._store,
+                    bar_at=bar_at,
+                    stored=base,
+                    final=final,
+                    health=health,
+                )
             self._fault("after_health_risk_followup")
         return final
 
@@ -721,35 +782,38 @@ class PaperService:
         )
         active = reconciliation.active_stop
         if active is None:
-            self._broker.set_stop(
-                bar_at,
-                position.initial_stop,
-                active_after=active_after,
-                reason="HARD_STOP",
-                source_id=position.order.order_id,
-            )
+            with self.fenced_cycle_transaction():
+                self._broker.set_stop(
+                    bar_at,
+                    position.initial_stop,
+                    active_after=active_after,
+                    reason="HARD_STOP",
+                    source_id=position.order.order_id,
+                )
             return
         if candidate is not None and Decimal(str(candidate)) > Decimal(str(active.stop_price)):
-            self._broker.set_stop(
-                bar_at,
-                candidate,
-                reason="TRAILING_STOP",
-                source_id=position.order.order_id,
-            )
+            with self.fenced_cycle_transaction():
+                self._broker.set_stop(
+                    bar_at,
+                    candidate,
+                    reason="TRAILING_STOP",
+                    source_id=position.order.order_id,
+                )
 
     def _record_completion(self, event_id: str, result: CycleResult) -> None:
-        self._store.append_event(
-            event_id,
-            "PAPER_CYCLE",
-            result.end_utc,
-            {
-                "created_order_ids": list(result.created_order_ids),
-                "end_utc": _canonical_datetime(result.end_utc),
-                "filled_order_ids": list(result.filled_order_ids),
-                "reason_codes": list(result.reasons),
-                "status": result.status.value,
-            },
-        )
+        with self.fenced_cycle_transaction():
+            self._store.append_event(
+                event_id,
+                "PAPER_CYCLE",
+                result.end_utc,
+                {
+                    "created_order_ids": list(result.created_order_ids),
+                    "end_utc": _canonical_datetime(result.end_utc),
+                    "filled_order_ids": list(result.filled_order_ids),
+                    "reason_codes": list(result.reasons),
+                    "status": result.status.value,
+                },
+            )
 
     def _record_attempt(
         self,
@@ -762,15 +826,16 @@ class PaperService:
             observed_at = end - _FOUR_HOURS
         except OverflowError as error:
             raise ValueError("cycle attempt is outside datetime range") from error
-        self._store.append_event(
-            _cycle_attempt_id(end),
-            "PAPER_CYCLE_ATTEMPT",
-            observed_at,
-            {
-                "end_utc": _canonical_datetime(end),
-                "version": _CYCLE_ATTEMPT_VERSION,
-            },
-        )
+        with self.fenced_cycle_transaction():
+            self._store.append_event(
+                _cycle_attempt_id(end),
+                "PAPER_CYCLE_ATTEMPT",
+                observed_at,
+                {
+                    "end_utc": _canonical_datetime(end),
+                    "version": _CYCLE_ATTEMPT_VERSION,
+                },
+            )
 
     def _fault(self, boundary: str) -> None:
         if self._fault_hook is not None:
@@ -1125,11 +1190,11 @@ def _validated_position_frame(frame: pd.DataFrame, start: datetime, end: datetim
 def _advance_risk_state(
     prior: _RiskState, *, bar_at: datetime, equity: float, row: pd.Series,
     completed_trades: tuple[PaperTrade, ...], risk_config: RiskConfig,
-    system_healthy: bool,
+    atr_period: int, system_healthy: bool,
 ) -> _RiskState:
     """Normalize public/broker facts; durable v1/v2 validation stays above."""
     close = _positive_finite(row.get("close"), "risk close")
-    atr = _positive_finite(row.get(f"atr_{StrategyConfig().atr_period}"), "risk ATR")
+    atr = _positive_finite(row.get(f"atr_{atr_period}"), "risk ATR")
     baseline = _positive_finite(row.get("baseline_atr_pct"), "baseline ATR percent")
     try:
         return advance_risk_state(prior, RiskObservation(
@@ -1328,7 +1393,7 @@ def _health_gate_from_events(events: Sequence[StoredEvent]) -> _HealthGate:
         action=HealthMonitor(latest_snapshot).current_action(),
         evidence_event_id=latest_event.event_id,
         evidence_sequence=latest_event.sequence,
-        evidence_version=latest_snapshot.version,
+        evidence_version=int(latest_event.payload["version"]),
     )
 
 

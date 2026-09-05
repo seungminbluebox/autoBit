@@ -78,11 +78,12 @@ def reconcile_healthy(live, venue):
     assert not live.journal.pending()
 
 
-def prepared(rows):
+def prepared(rows, strategy=StrategyConfig()):
     frame = _history(END, 610)
     defaults = dict(ema_200=90., entry_high=120., previous_close=99.,
-                    previous_entry_high=99., atr_14=2., baseline_atr_pct=.02,
+                    previous_entry_high=99., baseline_atr_pct=.02,
                     exit_low=40., warmup_complete=False, entry_data_valid=True)
+    defaults[f'atr_{strategy.atr_period}'] = 2.
     for key, value in defaults.items():
         frame[key] = value
     for number, changes in enumerate(rows):
@@ -113,9 +114,10 @@ def recovery_rows(independent_halt):
     return rows
 
 
-def run_modes(monkeypatch, tmp_path, rows, *, mutation=False, gap=False):
+def run_modes(monkeypatch, tmp_path, rows, *, mutation=False, gap=False,
+              strategy=StrategyConfig()):
     """Capture actual common outputs and retain adapter submission/fill facts."""
-    frame = prepared(rows)
+    frame = prepared(rows, strategy)
     captured = {mode: [] for mode in ('paper', 'backtest', 'live')}
     mode = 'paper'
     original = StrategyEngine.decide
@@ -143,7 +145,7 @@ def run_modes(monkeypatch, tmp_path, rows, *, mutation=False, gap=False):
             end = END + (number + 1) * STEP
             source = _Source(frame.loc[frame.index < end])
             store, service = _service(tmp_path / 'paper.sqlite', source, store=store,
-                                      clock_at=end + timedelta(minutes=10))
+                                      clock_at=end + timedelta(minutes=10), strategy=strategy)
             assert service.process_completed_candle(end).status is CycleStatus.PROCESSED
             paper_states.append(PaperBroker(store, ZERO_COST).reconcile())
             before = store.replay_state()
@@ -154,7 +156,7 @@ def run_modes(monkeypatch, tmp_path, rows, *, mutation=False, gap=False):
             store.close()
 
     mode = 'backtest'
-    backtest = run_backtest(frame, BacktestConfig(costs=ZERO_COST))
+    backtest = run_backtest(frame, BacktestConfig(strategy=strategy, costs=ZERO_COST))
 
     mode = 'live'
     monkeypatch.setattr(guard, 'require_live_authorization', lambda: None)
@@ -163,7 +165,7 @@ def run_modes(monkeypatch, tmp_path, rows, *, mutation=False, gap=False):
     client = LiveClient(lambda: Credentials('fake-access', 'fake-secret'),
                         transport=httpx.MockTransport(venue))
     live = LiveService(tmp_path / 'live.sqlite', client,
-                       engine=StrategyEngine(StrategyConfig(), ZERO_COST), clock=lambda: venue.now)
+                       engine=StrategyEngine(strategy, ZERO_COST), clock=lambda: venue.now)
     live_states = []
     try:
         for number in range(len(rows)):
@@ -178,7 +180,7 @@ def run_modes(monkeypatch, tmp_path, rows, *, mutation=False, gap=False):
             cutoff = (bar_at + STEP).to_pydatetime()
             venue.now = cutoff
             observation = RiskObservation(cutoff, 100., (),
-                                          (row['atr_14'] / row['close']) / row['baseline_atr_pct'], True, True)
+                                          (row[f'atr_{strategy.atr_period}'] / row['close']) / row['baseline_atr_pct'], True, True)
             # Caller monetary values are deliberately normalized: LiveService
             # must replace them with its authoritative venue/journal facts.
             snapshot = DecisionInput(row, 100., 100., None, False, NORMAL)
@@ -193,7 +195,7 @@ def run_modes(monkeypatch, tmp_path, rows, *, mutation=False, gap=False):
                 # Reopen actual journal facts, not manually seeded money/risk.
                 live.close()
                 live = LiveService(tmp_path / 'live.sqlite', client,
-                                   engine=StrategyEngine(StrategyConfig(), ZERO_COST), clock=lambda: venue.now)
+                                   engine=StrategyEngine(strategy, ZERO_COST), clock=lambda: venue.now)
         final_live = live.journal.state()
     finally:
         live.close()
@@ -262,6 +264,25 @@ def test_three_real_paths_entry_close_and_delayed_trailing(monkeypatch, tmp_path
     assert float(final_live.cash) / SCALE == pytest.approx(paper[-1].cash, rel=1e-11, abs=1e-12)
     assert float(final_live.closed_trades[0].net_pnl) / SCALE == pytest.approx(quantity * 8, rel=1e-11, abs=1e-12)
     assert final_live.closed_trades[0].exit_time != paper[-1].completed_trades[0].exit_time
+
+
+def test_three_real_paths_share_non_default_atr_period(monkeypatch, tmp_path):
+    strategy = StrategyConfig(atr_period=7)
+
+    records, paper, backtest, live, final_live, venue = run_modes(
+        monkeypatch,
+        tmp_path,
+        normal_rows(),
+        strategy=strategy,
+    )
+
+    for mode, scale in [('paper', 1), ('backtest', 1), ('live', SCALE)]:
+        entry = policy_tuple(records[mode][0][1], scale, live=mode == 'live')
+        assert_policy_equal(entry, ('buy', 'ENTRY', .4, 95., .02, .7, None, ()))
+    assert paper[-1].completed_trades[0].net_pnl == pytest.approx(3.2)
+    assert backtest.trades[0].net_pnl == pytest.approx(3.2)
+    assert float(final_live.closed_trades[0].net_pnl) / SCALE == pytest.approx(3.2)
+    assert len(venue.posts) == 2
 
 
 @pytest.mark.parametrize('independent_halt', [False, True])

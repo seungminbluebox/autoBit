@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
@@ -97,6 +98,7 @@ def deliver_alert_once(
     source_event_type: str,
     source_payload: Mapping[str, object],
     logical_at: datetime,
+    mutation_boundary: Callable[[], AbstractContextManager[object]] | None = None,
 ) -> bool | None:
     """Persist an attempt before delivery; an existing exact attempt is skipped."""
     source_id = _nonempty(source_event_id, "source event id")
@@ -105,7 +107,6 @@ def deliver_alert_once(
         raise TypeError("source payload must be a mapping")
     if not isinstance(logical_at, datetime) or logical_at.tzinfo is None:
         raise ValueError("alert logical time must be timezone-aware")
-    _require_durable_source(store, source_id, source_type, source_payload)
     logical = logical_at.astimezone(timezone.utc)
     digest = sha256(f"{source_id}|{source_type}".encode("utf-8")).hexdigest()
     marker_id = f"alert-attempt:{digest}"
@@ -114,7 +115,14 @@ def deliver_alert_once(
         "source_event_type": source_type,
         "version": _ALERT_VERSION,
     }
-    if not _claim_attempt(store, marker_id, marker, logical):
+    if mutation_boundary is None:
+        _require_durable_source(store, source_id, source_type, source_payload)
+        claimed = _claim_attempt(store, marker_id, marker, logical)
+    else:
+        with mutation_boundary():
+            _require_durable_source(store, source_id, source_type, source_payload)
+            claimed = _claim_attempt(store, marker_id, marker, logical)
+    if not claimed:
         return None
 
     delivered = notifier.send(
@@ -134,13 +142,23 @@ def deliver_alert_once(
         "version": _ALERT_VERSION,
     }
     try:
-        _append_exact_once(
-            store,
-            f"alert-failure:{digest}",
-            "ALERT_FAILURE",
-            logical,
-            failure,
-        )
+        if mutation_boundary is None:
+            _append_exact_once(
+                store,
+                f"alert-failure:{digest}",
+                "ALERT_FAILURE",
+                logical,
+                failure,
+            )
+        else:
+            with mutation_boundary():
+                _append_exact_once(
+                    store,
+                    f"alert-failure:{digest}",
+                    "ALERT_FAILURE",
+                    logical,
+                    failure,
+                )
     except Exception:
         pass
     return False

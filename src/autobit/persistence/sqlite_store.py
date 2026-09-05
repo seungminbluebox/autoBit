@@ -35,6 +35,11 @@ _TOLERANCE = 1e-10
 _EPOCH = "1970-01-01T00:00:00Z"
 _EMPTY_EVENT_DIGEST = sha256(b"").hexdigest()
 _CYCLE_LEASE_KEY = "paper_cycle_lease"
+_CYCLE_LEASE_TOKEN_PREFIX = "autobit-fenced-lease-v1"
+_MAX_CYCLE_LEASE_EPOCH = 2_147_483_647
+_CYCLE_LEASE_TOKEN_PATTERN = re.compile(
+    rf"^{_CYCLE_LEASE_TOKEN_PREFIX}:([1-9][0-9]*):([0-9a-f]{{64}})$",
+)
 _FileIdentity = tuple[int, int, int, int, int, int, int]
 _UTC_Z_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$",
@@ -143,6 +148,10 @@ class StoreCorruptionError(StoreError):
 
 class IdempotencyConflictError(StoreError):
     """Raised when a durable identity is reused for different evidence."""
+
+
+class CycleLeaseLostError(StoreError):
+    """Raised when a stale paper-cycle owner reaches a mutation boundary."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,36 +408,83 @@ class SQLiteStore:
         expires_at_utc: datetime,
     ) -> bool:
         """Atomically acquire or renew the one paper-cycle process lease."""
+        return self.acquire_cycle_lease_epoch(
+            owner,
+            token,
+            now_utc,
+            expires_at_utc,
+        ) is not None
+
+    def acquire_cycle_lease_epoch(
+        self,
+        owner: str,
+        token: str,
+        now_utc: datetime,
+        expires_at_utc: datetime,
+    ) -> int | None:
+        """Acquire the lease and return its durable monotonic fencing epoch."""
         normalized_owner = _nonempty_text(owner, "lease owner must be non-empty")
         normalized_token = _nonempty_text(token, "lease token must be non-empty")
         _, now = _canonical_timestamp(now_utc)
         expires_text, expires = _canonical_timestamp(expires_at_utc)
         if expires <= now:
             raise ValueError("lease expiry must be strictly after now")
-        value = _canonical_json_value(
-            {
-                "expires_at_utc": expires_text,
-                "owner": normalized_owner,
-                "token": normalized_token,
-            }
-        )
 
         with self._mutation_transaction() as connection:
             self._replay_and_verify(connection)
+            counter = _cycle_lease_epoch(connection)
             row = connection.execute(
                 "SELECT value FROM metadata WHERE key = ?",
                 (_CYCLE_LEASE_KEY,),
             ).fetchone()
+            epoch: int
             if row is not None:
-                current_owner, current_token, current_expiry = _cycle_lease_metadata(
-                    row["value"],
-                    corruption=True,
+                (
+                    current_owner,
+                    stored_token,
+                    current_expiry,
+                    current_epoch,
+                ) = _cycle_lease_metadata(row["value"], corruption=True)
+                same_fenced_holder = (
+                    current_epoch is not None
+                    and current_owner == normalized_owner
+                    and stored_token
+                    == _cycle_lease_storage_token(normalized_token, current_epoch)
                 )
-                same_holder = (
-                    current_owner == normalized_owner and current_token == normalized_token
+                same_legacy_holder = (
+                    current_epoch is None
+                    and current_owner == normalized_owner
+                    and stored_token == normalized_token
                 )
-                if not same_holder and current_expiry > now:
-                    return False
+                if (
+                    not same_fenced_holder
+                    and not same_legacy_holder
+                    and current_expiry > now
+                ):
+                    return None
+                if current_epoch is not None:
+                    if counter != current_epoch:
+                        raise StoreCorruptionError(
+                            "paper cycle lease epoch contradicts its counter"
+                        )
+                    epoch = (
+                        current_epoch
+                        if same_fenced_holder
+                        else _next_cycle_lease_epoch(counter)
+                    )
+                else:
+                    epoch = _next_cycle_lease_epoch(counter)
+            else:
+                epoch = _next_cycle_lease_epoch(counter)
+            stored_token = _cycle_lease_storage_token(normalized_token, epoch)
+            value = _canonical_json_value(
+                {
+                    "expires_at_utc": expires_text,
+                    "owner": normalized_owner,
+                    "token": stored_token,
+                }
+            )
+            if row is not None:
                 connection.execute(
                     "UPDATE metadata SET value = ? WHERE key = ?",
                     (value, _CYCLE_LEASE_KEY),
@@ -438,12 +494,26 @@ class SQLiteStore:
                     "INSERT INTO metadata (key, value) VALUES (?, ?)",
                     (_CYCLE_LEASE_KEY, value),
                 )
-            return True
+            if epoch != counter:
+                connection.execute(f"PRAGMA user_version = {epoch}")
+            return epoch
 
-    def release_cycle_lease(self, owner: str, token: str) -> bool:
-        """Release the paper-cycle lease only for its exact owner and token."""
+    def renew_cycle_lease(
+        self,
+        owner: str,
+        token: str,
+        epoch: int,
+        now_utc: datetime,
+        expires_at_utc: datetime,
+    ) -> bool:
+        """Renew only the exact extant epoch; never reacquire after a takeover."""
         normalized_owner = _nonempty_text(owner, "lease owner must be non-empty")
         normalized_token = _nonempty_text(token, "lease token must be non-empty")
+        normalized_epoch = _positive_epoch(epoch)
+        _, now = _canonical_timestamp(now_utc)
+        expires_text, expires = _canonical_timestamp(expires_at_utc)
+        if expires <= now:
+            raise ValueError("lease expiry must be strictly after now")
         with self._mutation_transaction() as connection:
             self._replay_and_verify(connection)
             row = connection.execute(
@@ -452,17 +522,111 @@ class SQLiteStore:
             ).fetchone()
             if row is None:
                 return False
-            current_owner, current_token, _ = _cycle_lease_metadata(
+            current_owner, stored_token, _, current_epoch = _cycle_lease_metadata(
                 row["value"],
                 corruption=True,
             )
-            if current_owner != normalized_owner or current_token != normalized_token:
+            if (
+                current_owner != normalized_owner
+                or current_epoch != normalized_epoch
+                or stored_token
+                != _cycle_lease_storage_token(normalized_token, normalized_epoch)
+            ):
+                return False
+            connection.execute(
+                "UPDATE metadata SET value = ? WHERE key = ?",
+                (
+                    _canonical_json_value(
+                        {
+                            "expires_at_utc": expires_text,
+                            "owner": normalized_owner,
+                            "token": stored_token,
+                        }
+                    ),
+                    _CYCLE_LEASE_KEY,
+                ),
+            )
+            return True
+
+    def release_cycle_lease(
+        self,
+        owner: str,
+        token: str,
+        epoch: int | None = None,
+    ) -> bool:
+        """Release the paper-cycle lease only for its exact owner and token."""
+        normalized_owner = _nonempty_text(owner, "lease owner must be non-empty")
+        normalized_token = _nonempty_text(token, "lease token must be non-empty")
+        normalized_epoch = None if epoch is None else _positive_epoch(epoch)
+        with self._mutation_transaction() as connection:
+            self._replay_and_verify(connection)
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (_CYCLE_LEASE_KEY,),
+            ).fetchone()
+            if row is None:
+                return False
+            current_owner, stored_token, _, current_epoch = _cycle_lease_metadata(
+                row["value"],
+                corruption=True,
+            )
+            expected_token = (
+                normalized_token
+                if current_epoch is None
+                else _cycle_lease_storage_token(normalized_token, current_epoch)
+            )
+            if (
+                current_owner != normalized_owner
+                or stored_token != expected_token
+                or (
+                    normalized_epoch is not None
+                    and current_epoch != normalized_epoch
+                )
+            ):
                 return False
             connection.execute(
                 "DELETE FROM metadata WHERE key = ?",
                 (_CYCLE_LEASE_KEY,),
             )
             return True
+
+    @contextmanager
+    def cycle_lease_transaction(
+        self,
+        owner: str,
+        token: str,
+        epoch: int,
+        now_utc: datetime,
+    ) -> Iterator[_TransactionFacade]:
+        """Fence every enclosed mutation by ownership, epoch, and live expiry."""
+        normalized_owner = _nonempty_text(owner, "lease owner must be non-empty")
+        normalized_token = _nonempty_text(token, "lease token must be non-empty")
+        normalized_epoch = _positive_epoch(epoch)
+        _, now = _canonical_timestamp(now_utc)
+        self._ensure_ready()
+        self._ensure_writable()
+        with self._transaction(require_initialized=True) as connection:
+            self._replay_and_verify(connection)
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (_CYCLE_LEASE_KEY,),
+            ).fetchone()
+            if row is None:
+                raise CycleLeaseLostError("paper cycle lease is no longer held")
+            current_owner, stored_token, current_expiry, current_epoch = _cycle_lease_metadata(
+                row["value"],
+                corruption=True,
+            )
+            if (
+                current_owner != normalized_owner
+                or current_epoch != normalized_epoch
+                or stored_token
+                != _cycle_lease_storage_token(normalized_token, normalized_epoch)
+                or current_expiry <= now
+            ):
+                raise CycleLeaseLostError("paper cycle lease ownership or epoch was lost")
+            yield _TransactionFacade(connection)
+            self._replay_and_verify(connection)
 
     def append_event(
         self,
@@ -1047,8 +1211,16 @@ class SQLiteStore:
                 raise StoreCorruptionError(
                     f"stored initial equity is not 100: {metadata['initial_equity']}",
                 )
+            counter = _cycle_lease_epoch(connection)
             if _CYCLE_LEASE_KEY in metadata:
-                _cycle_lease_metadata(metadata[_CYCLE_LEASE_KEY], corruption=True)
+                _, _, _, active_epoch = _cycle_lease_metadata(
+                    metadata[_CYCLE_LEASE_KEY],
+                    corruption=True,
+                )
+                if active_epoch is not None and active_epoch != counter:
+                    raise StoreCorruptionError(
+                        "paper cycle lease epoch contradicts its counter"
+                    )
         except StoreCorruptionError:
             raise
         except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError, KeyError) as error:
@@ -2096,7 +2268,7 @@ def _cycle_lease_metadata(
     value: object,
     *,
     corruption: bool,
-) -> tuple[str, str, datetime]:
+) -> tuple[str, str, datetime, int | None]:
     error_type: type[Exception] = StoreCorruptionError if corruption else ValueError
     try:
         if not isinstance(value, str):
@@ -2115,9 +2287,48 @@ def _cycle_lease_metadata(
         expires_text, expires = _canonical_timestamp(payload["expires_at_utc"])
         if expires_text != payload["expires_at_utc"]:
             raise ValueError("lease expiry must be canonical UTC")
-        return owner, token, expires
+        epoch = _cycle_lease_token_epoch(token)
+        return owner, token, expires, epoch
     except (json.JSONDecodeError, TypeError, ValueError, OverflowError, KeyError) as error:
         raise error_type("paper cycle lease metadata is invalid") from error
+
+
+def _cycle_lease_epoch(connection: sqlite3.Connection) -> int:
+    row = connection.execute("PRAGMA user_version").fetchone()
+    if row is None or len(row) != 1 or type(row[0]) is not int:
+        raise StoreCorruptionError("paper cycle lease epoch is unreadable")
+    epoch = int(row[0])
+    if epoch < 0 or epoch > _MAX_CYCLE_LEASE_EPOCH:
+        raise StoreCorruptionError("paper cycle lease epoch is invalid")
+    return epoch
+
+
+def _next_cycle_lease_epoch(counter: int) -> int:
+    if counter >= _MAX_CYCLE_LEASE_EPOCH:
+        raise StoreError("paper cycle lease epoch is exhausted")
+    return counter + 1
+
+
+def _cycle_lease_storage_token(token: str, epoch: int) -> str:
+    normalized_epoch = _positive_epoch(epoch)
+    digest = sha256(token.encode("utf-8", errors="strict")).hexdigest()
+    return f"{_CYCLE_LEASE_TOKEN_PREFIX}:{normalized_epoch}:{digest}"
+
+
+def _cycle_lease_token_epoch(token: str) -> int | None:
+    match = _CYCLE_LEASE_TOKEN_PATTERN.fullmatch(token)
+    if match is None:
+        return None
+    epoch = _positive_epoch(int(match.group(1)))
+    if epoch > _MAX_CYCLE_LEASE_EPOCH:
+        raise ValueError("lease epoch exceeds its durable range")
+    return epoch
+
+
+def _positive_epoch(value: object) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError("lease epoch must be a positive integer")
+    return value
 
 
 def _canonical_json_value(value: object) -> str:

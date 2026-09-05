@@ -276,6 +276,49 @@ def test_fill_deviation_exact_five_percent_boundary(
     assert ("FILL_DEVIATION" in action.reasons) is excessive
 
 
+def test_flat_fill_anomaly_requires_three_distinct_clean_checks_and_retains_episode_evidence() -> None:
+    monitor = HealthMonitor()
+    monitor.record_fill_check(expected_price=100.0, actual_price=106.0, at=NOW)
+
+    for second in (1, 2):
+        monitor.record_api_success(NOW + timedelta(seconds=second))
+        action = monitor.record_flat_fill_recovery_check(
+            eligible=True,
+            at=NOW + timedelta(seconds=second),
+        )
+        assert action.reasons == ("FILL_DEVIATION",)
+
+    restarted = HealthMonitor.from_mapping(monitor.snapshot().to_mapping())
+    restarted.record_api_success(NOW + timedelta(seconds=3))
+    action = restarted.record_flat_fill_recovery_check(
+        eligible=True,
+        at=NOW + timedelta(seconds=3),
+    )
+
+    snapshot = restarted.snapshot()
+    assert action.stage is HealthStage.REDUCED
+    assert action.reasons == ()
+    assert snapshot.fill_recovery_checks == 3
+    assert snapshot.fill_anomaly_episode == 1
+    assert snapshot.fill_anomaly_deviation == pytest.approx(0.06)
+    assert snapshot.fill_anomaly_detected_at_utc == NOW
+    assert snapshot.fill_anomaly_resolved_at_utc == NOW + timedelta(seconds=3)
+    assert snapshot.fill_deviation == 0.0
+
+
+def test_ineligible_or_duplicate_flat_fill_recovery_checks_cannot_accelerate_release() -> None:
+    monitor = HealthMonitor()
+    monitor.record_fill_check(expected_price=100.0, actual_price=106.0, at=NOW)
+    monitor.record_flat_fill_recovery_check(eligible=True, at=NOW + timedelta(seconds=1))
+    monitor.record_flat_fill_recovery_check(eligible=True, at=NOW + timedelta(seconds=1))
+    assert monitor.snapshot().fill_recovery_checks == 1
+
+    monitor.record_flat_fill_recovery_check(eligible=False, at=NOW + timedelta(seconds=2))
+
+    assert monitor.snapshot().fill_recovery_checks == 0
+    assert monitor.current_action().reasons == ("FILL_DEVIATION",)
+
+
 @pytest.mark.parametrize(
     ("actual", "excessive"),
     [
@@ -414,7 +457,7 @@ def test_snapshot_canonical_round_trip_is_immutable_and_restart_exact() -> None:
     "mutate",
     [
         lambda p: p.__setitem__("extra", 1),
-        lambda p: p.__setitem__("version", 3),
+        lambda p: p.__setitem__("version", 4),
         lambda p: p.__setitem__("retry_attempts", True),
         lambda p: p.__setitem__("api_failures", -1),
         lambda p: p.__setitem__("ledger_cash_difference", inf),
@@ -545,6 +588,29 @@ def test_legacy_version_one_health_mapping_is_rejected_instead_of_inferred() -> 
 
     with pytest.raises(ValueError, match="version|keys"):
         HealthSnapshot.from_mapping(legacy)
+
+
+def test_version_two_health_mapping_is_strictly_migrated_with_fill_gate_preserved() -> None:
+    monitor = HealthMonitor()
+    monitor.record_fill_check(expected_price=100.0, actual_price=106.0, at=NOW)
+    legacy = dict(monitor.snapshot().to_mapping())
+    for key in (
+        "fill_anomaly_episode",
+        "fill_recovery_checks",
+        "fill_anomaly_deviation",
+        "fill_anomaly_detected_at_utc",
+        "fill_anomaly_resolved_at_utc",
+        "last_fill_recovery_at_utc",
+    ):
+        legacy.pop(key)
+    legacy["version"] = 2
+
+    restored = HealthMonitor.from_mapping(legacy)
+
+    assert restored.snapshot().version == 3
+    assert restored.snapshot().fill_anomaly_episode == 1
+    assert restored.snapshot().fill_anomaly_deviation == pytest.approx(0.06)
+    assert restored.current_action().reasons == ("FILL_DEVIATION",)
 
 
 @pytest.mark.parametrize("cursor", ["last_success_at_utc", "last_failure_at_utc"])

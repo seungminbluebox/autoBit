@@ -44,6 +44,7 @@ from autobit.paper.service import (
     _validate_operational_alert_chain,
 )
 from autobit.persistence.sqlite_store import (
+    CycleLeaseLostError,
     PaperSnapshot,
     SQLiteStore,
     StoreError,
@@ -420,6 +421,23 @@ class _ObservedCandleSource:
         self._clock = clock
         self._notifier = notifier
         self._prepared: dict[datetime, pd.DataFrame] = {}
+        self._lease_owner: str | None = None
+        self._lease_token: str | None = None
+        self._lease_epoch: int | None = None
+        self._lease_ttl: timedelta | None = None
+
+    def bind_cycle_lease(
+        self,
+        *,
+        owner: str,
+        token: str,
+        epoch: int,
+        ttl: timedelta,
+    ) -> None:
+        self._lease_owner = owner
+        self._lease_token = token
+        self._lease_epoch = epoch
+        self._lease_ttl = ttl
 
     def prepare(self, end_utc: datetime) -> pd.DataFrame:
         end = _paper_end(end_utc)
@@ -498,13 +516,61 @@ class _ObservedCandleSource:
         observed: datetime,
         outcome: str,
     ) -> StoredEvent:
+        self._renew_bound_lease()
+        assert self._lease_owner is not None
+        assert self._lease_token is not None
+        assert self._lease_epoch is not None
         event_id = f"health:public:{_format_utc(end)}:{_format_utc(observed)}:{outcome}"
-        monitor.persist(
-            self._store,
-            event_id=event_id,
-            logical_at=_monotonic_event_time(self._store, end - timedelta(hours=4)),
-        )
+        with self._store.cycle_lease_transaction(
+            self._lease_owner,
+            self._lease_token,
+            self._lease_epoch,
+            _clock_now(self._clock),
+        ):
+            monitor.persist(
+                self._store,
+                event_id=event_id,
+                logical_at=_monotonic_event_time(self._store, end - timedelta(hours=4)),
+            )
         return _event_by_id(self._store, event_id)
+
+    def _renew_bound_lease(self) -> None:
+        if (
+            self._lease_owner is None
+            or self._lease_token is None
+            or self._lease_epoch is None
+            or self._lease_ttl is None
+        ):
+            raise CycleLeaseLostError("observed candle source has no bound lease epoch")
+        now = _clock_now(self._clock)
+        try:
+            expires = now + self._lease_ttl
+        except OverflowError as error:
+            raise ValueError("lease expiry is outside datetime range") from error
+        if not self._store.renew_cycle_lease(
+            self._lease_owner,
+            self._lease_token,
+            self._lease_epoch,
+            now,
+            expires,
+        ):
+            raise CycleLeaseLostError(
+                "paper cycle lease was lost during public candle work"
+            )
+
+    def _fenced_lease_transaction(self):
+        if (
+            self._lease_owner is None
+            or self._lease_token is None
+            or self._lease_epoch is None
+        ):
+            raise CycleLeaseLostError("observed candle source has no bound lease epoch")
+        return self._store.cycle_lease_transaction(
+            self._lease_owner,
+            self._lease_token,
+            self._lease_epoch,
+            _clock_now(self._clock),
+        )
 
     def _notify(self, event: StoredEvent) -> None:
         if self._notifier is None:
@@ -517,6 +583,7 @@ class _ObservedCandleSource:
                 source_event_type=event.event_type,
                 source_payload=event.payload,
                 logical_at=event.occurred_at_utc,
+                mutation_boundary=self._fenced_lease_transaction,
             )
         except Exception:
             return
@@ -536,6 +603,7 @@ class _PaperApplication:
         costs: CostConfig = CostConfig(),
         lease_owner: str,
         lease_token: str,
+        lease_ttl: timedelta = timedelta(minutes=5),
     ) -> None:
         self._store = store
         self._clock = clock
@@ -552,6 +620,7 @@ class _PaperApplication:
             clock=clock,
             lease_owner=lease_owner,
             lease_token=lease_token,
+            lease_ttl=lease_ttl,
             costs=costs,
         )
         self._service = service
@@ -570,15 +639,28 @@ class _PaperApplication:
             if action.retry_delay_seconds > 0:
                 self._sleeper.sleep(float(action.retry_delay_seconds))
                 self._retry_delay_applied = True
-            self._source.prepare(current_end)
-            self._record_reconciliation(current_end, ())
-            refreshed = HealthMonitor.from_store(self._store).current_action()
-            return CycleResult(
-                CycleStatus.ALREADY_PROCESSED,
-                current_end,
-                reasons=refreshed.reasons,
-                equity=self._broker.reconcile().equity,
-            )
+            if not self._service.acquire_cycle_lease():
+                return CycleResult(CycleStatus.LEASE_HELD, current_end)
+            try:
+                self._source.prepare(current_end)
+                if not self._service.renew_cycle_lease():
+                    return CycleResult(CycleStatus.LEASE_HELD, current_end)
+                self._record_reconciliation(
+                    current_end,
+                    (),
+                    allow_flat_fill_recovery=True,
+                )
+                refreshed = HealthMonitor.from_store(self._store).current_action()
+                return CycleResult(
+                    CycleStatus.ALREADY_PROCESSED,
+                    current_end,
+                    reasons=refreshed.reasons,
+                    equity=self._broker.reconcile().equity,
+                )
+            except CycleLeaseLostError:
+                return CycleResult(CycleStatus.LEASE_HELD, current_end)
+            finally:
+                self._service.release_cycle_lease()
 
         scheduler = PaperScheduler(
             self._service,
@@ -592,14 +674,20 @@ class _PaperApplication:
             self._retry_delay_applied = True
             raise
         if result.status in {CycleStatus.PROCESSED, CycleStatus.ALREADY_PROCESSED}:
+            if not self._service.acquire_cycle_lease():
+                return CycleResult(CycleStatus.LEASE_HELD, result.end_utc)
             try:
                 self._record_reconciliation(result.end_utc, result.filled_order_ids)
                 if result.status is CycleStatus.PROCESSED:
                     self._promote_after_reduced_cycle(result.end_utc)
                 self._notify_cycle(result.end_utc)
+            except CycleLeaseLostError:
+                return CycleResult(CycleStatus.LEASE_HELD, result.end_utc)
             except Exception:
                 self._sleep_failsafe_retry()
                 raise
+            finally:
+                self._service.release_cycle_lease()
         return result
 
     @property
@@ -636,6 +724,8 @@ class _PaperApplication:
         self,
         end: datetime,
         filled_order_ids: tuple[str, ...],
+        *,
+        allow_flat_fill_recovery: bool = False,
     ) -> None:
         health_events = tuple(
             event
@@ -677,11 +767,29 @@ class _PaperApplication:
                 actual_price=fill.fill_price,
                 at=observed,
             )
-        monitor.persist(
-            self._store,
-            event_id=event_id,
-            logical_at=_monotonic_event_time(self._store, end),
-        )
+        if allow_flat_fill_recovery and not monitor.snapshot().fill_within_limit:
+            health = monitor.snapshot()
+            durable = self._store.replay_state()
+            monitor.record_flat_fill_recovery_check(
+                eligible=(
+                    reconciliation.btc_quantity == 0.0
+                    and not reconciliation.active_orders
+                    and not durable.pending_orders
+                    and health.unresolved_orders == 0
+                    and health.ledger_matches
+                    and health.timestamps_monotonic
+                    and health.schema_valid
+                    and health.latest_candle_valid
+                ),
+                at=observed,
+            )
+            event_id = monitor.persistence_event_id(event_id)
+        with self._service.fenced_cycle_transaction():
+            monitor.persist(
+                self._store,
+                event_id=event_id,
+                logical_at=_monotonic_event_time(self._store, end),
+            )
 
     def _promote_after_reduced_cycle(self, end: datetime) -> None:
         monitor = HealthMonitor.from_store(self._store)
@@ -691,11 +799,12 @@ class _PaperApplication:
         if _find_event(self._store, event_id) is not None:
             return
         monitor.record_recovery_cycle_success(_clock_now(self._clock))
-        monitor.persist(
-            self._store,
-            event_id=event_id,
-            logical_at=_monotonic_event_time(self._store, end),
-        )
+        with self._service.fenced_cycle_transaction():
+            monitor.persist(
+                self._store,
+                event_id=event_id,
+                logical_at=_monotonic_event_time(self._store, end),
+            )
 
     def _notify_cycle(self, end: datetime) -> None:
         if self._notifier is None:
@@ -709,6 +818,7 @@ class _PaperApplication:
                 source_event_type=event.event_type,
                 source_payload=event.payload,
                 logical_at=event.occurred_at_utc,
+                mutation_boundary=self._service.fenced_cycle_transaction,
             )
         except Exception:
             return
