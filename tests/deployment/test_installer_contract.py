@@ -5,6 +5,7 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tarfile
@@ -181,3 +182,158 @@ def test_library_sourcing_has_no_dispatch_or_shell_option_side_effects():
     )
     assert result.returncode == 0
     assert result.stdout == b""
+
+
+def _run_linux_python(code, *args):
+    """Use a native Linux temporary filesystem for real symlink/permission tests."""
+    prefix = _shell_prefix()[:-1]
+    return subprocess.run(
+        [*prefix, "/usr/bin/python3", "-", *args], input=code,
+        capture_output=True, text=True, encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("existing_leaf", [False, True])
+def test_directory_creation_cannot_follow_ancestor_swap_after_path_check(existing_leaf):
+    installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
+    function = re.search(r"^managed_directory\(\) \{\n.*?^\}", installer, re.M | re.S)
+    assert function is not None
+    result = _run_linux_python(r'''
+from pathlib import Path
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+with tempfile.TemporaryDirectory(prefix="autobit-directory-race-") as fixture:
+    base = Path(fixture)
+    (base / "cache").mkdir()
+    outside = base / "outside"
+    outside.mkdir(mode=0o755)
+    if sys.argv[3] == "True":
+        (outside / "smoke").mkdir(mode=0o755)
+    before = (outside / "smoke").stat() if (outside / "smoke").exists() else None
+    # Substitute only the lexical allowlist with a temporary fixture mapping.
+    # The attacker swaps the accepted ancestor immediately after that check.
+    script = 'source "$1"\n' + sys.argv[2] + r"""
+fixture=$2
+require_literal_managed_path() {
+    [ "$(readlink -m -- "$1")" = "$1" ] || return 1
+    mv -- "$fixture/cache" "$fixture/cache-original"
+    ln -s -- "$fixture/outside" "$fixture/cache"
+}
+managed_directory "$fixture/cache/smoke" "$(id -un)" "$(id -gn)" 0700
+"""
+    operation = subprocess.run(["bash", "-s", "--", sys.argv[1], fixture],
+                               input=script, text=True, capture_output=True)
+    if before is None:
+        assert not (outside / "smoke").exists(), "root creation escaped into the outside directory"
+    else:
+        after = (outside / "smoke").stat()
+        assert (after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode)) == (
+            before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode)
+        ), "root chown/chmod followed the swapped ancestor"
+    assert operation.returncode != 0, "a symlinked ancestor must fail closed"
+''', _linux_path(ROOT / "deploy/oci/libdeploy.sh"), function.group(0), str(existing_leaf))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_candidate_unit_write_is_outside_service_owned_smoke_after_swap():
+    installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
+    start = installer.index('    /usr/bin/python3 - "$staging/deploy/oci/systemd/autobit-paper.service"')
+    end = installer.index('\n    /usr/bin/python3 - "$staging/.autobit-release"', start)
+    writer = installer[start:end]
+    result = _run_linux_python(r'''
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+with tempfile.TemporaryDirectory(prefix="autobit-unit-race-") as fixture:
+    base = Path(fixture)
+    staging = base / "staging"
+    unit = staging / "deploy/oci/systemd/autobit-paper.service"
+    unit.parent.mkdir(parents=True)
+    original = "WorkingDirectory=/opt/autobit/current\nExecStart=/opt/autobit/current/.venv/bin/python -m autobit.cli paper-run\n"
+    unit.write_text(original)
+    scratch = base / "private-scratch"
+    scratch.mkdir(mode=0o700)
+    smoke = base / "smoke"
+    smoke.mkdir()
+    outside = base / "outside-system-unit-directory"
+    outside.mkdir()
+    # A compromised service replaces its smoke directory after paper-status.
+    smoke.rename(base / "old-smoke")
+    smoke.symlink_to(outside, target_is_directory=True)
+    script = r"""
+set -eu
+staging=$1
+smoke=$2
+download_dir=$3
+systemd-analyze() { [ "$1" = verify ] && [ -f "$2" ]; }
+""" + sys.argv[1]
+    operation = subprocess.run(["bash", "-s", "--", str(staging), str(smoke), str(scratch)],
+                               input=script, text=True, capture_output=True)
+    assert not (outside / "autobit-paper.service").exists(), "root wrote a unit through service-owned ancestors"
+    assert operation.returncode == 0, operation.stderr
+    assert (scratch / "autobit-paper.service").read_text() == original.replace("/opt/autobit/current", str(staging))
+    assert unit.read_text() == original
+''', writer)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("swap_at", ["none", "cache", "smoke"])
+@pytest.mark.parametrize("mode", ["0700", "0755"])
+def test_directory_descriptors_pin_ancestors_and_leaf_during_mutation(swap_at, mode):
+    library = (ROOT / "deploy/oci/libdeploy.sh").read_text(encoding="utf-8")
+    helper = library.split("make_directory_nofollow() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    result = _run_linux_python(r'''
+from pathlib import Path
+import grp
+import os
+import pwd
+import stat
+import sys
+import tempfile
+code, swap_at, wanted_mode = sys.argv[1:]
+with tempfile.TemporaryDirectory(prefix="autobit-descriptor-race-") as fixture:
+    base = Path(fixture)
+    cache = base / "cache"
+    cache.mkdir()
+    (cache / "smoke").mkdir(mode=0o755)
+    outside = base / "outside"
+    outside.mkdir(mode=0o755)
+    original_open = os.open
+    swapped = False
+    def racing_open(path, flags, *args, **kwargs):
+        global swapped
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if not swapped and path == swap_at:
+            # Swap after the real open returns, before the following root
+            # mkdir/chown/chmod: only a pinned descriptor stays on this inode.
+            swapped = True
+            target = cache if swap_at == "cache" else cache / "smoke"
+            target.rename(base / "pinned-original")
+            target.symlink_to(outside, target_is_directory=True)
+        return descriptor
+    sys.argv = ["make_directory_nofollow", str(cache / "smoke"),
+                pwd.getpwuid(os.getuid()).pw_name, grp.getgrgid(os.getgid()).gr_name, wanted_mode]
+    os.open = racing_open
+    try:
+        exec(compile(code, "libdeploy.sh:make_directory_nofollow", "exec"), {})
+    finally:
+        os.open = original_open
+    assert swapped == (swap_at != "none")
+    assert list(outside.iterdir()) == [], "directory creation followed the replaced name"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o755, "metadata mutation followed the replaced name"
+    if swap_at == "cache":
+        target = base / "pinned-original/smoke"
+    elif swap_at == "smoke":
+        target = base / "pinned-original"
+    else:
+        target = cache / "smoke"
+    info = target.stat()
+    assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (
+        os.getuid(), os.getgid(), int(wanted_mode, 8)
+    )
+''', helper, swap_at, mode)
+    assert result.returncode == 0, result.stdout + result.stderr

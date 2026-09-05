@@ -28,7 +28,7 @@ PY
 
 managed_directory() {
     require_literal_managed_path "$1"
-    install -d -o "$2" -g "$3" -m "$4" -- "$1"
+    make_directory_nofollow "$1" "$2" "$3" "$4"
 }
 
 prepare_directories() {
@@ -186,7 +186,9 @@ prepare_release() {
     candidate_python -m autobit.cli paper-status --db "$smoke/paper.sqlite3"
     # The candidate executable exists at staging until the atomic publication.
     # Verify that exact path; the tracked unit itself retains its current path.
-    /usr/bin/python3 - "$staging/deploy/oci/systemd/autobit-paper.service" "$smoke/autobit-paper.service" "$staging" <<'PY'
+    # Root-written artifacts stay in root-private scratch, never in the smoke
+    # directory whose ancestors a running autobit process is allowed to rename.
+    /usr/bin/python3 - "$staging/deploy/oci/systemd/autobit-paper.service" "$download_dir/autobit-paper.service" "$staging" <<'PY'
 from pathlib import Path
 import sys
 text = Path(sys.argv[1]).read_text()
@@ -195,7 +197,7 @@ if text.count("/opt/autobit/current") != 2:
 with Path(sys.argv[2]).open("x") as output:
     output.write(text.replace("/opt/autobit/current", sys.argv[3]))
 PY
-    systemd-analyze verify "$smoke/autobit-paper.service"
+    systemd-analyze verify "$download_dir/autobit-paper.service"
     /usr/bin/python3 - "$staging/.autobit-release" "$commit" "$uv_version" "$python_version" "$uv_lock_sha256" "$source_archive_sha256" <<'PY'
 import json
 from pathlib import Path

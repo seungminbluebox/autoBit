@@ -23,8 +23,8 @@ require_managed_path() {
     esac
 }
 
-# Mutating operations additionally reject symlinked managed components, including
-# links within the allowlist, so two nominally distinct managed paths cannot alias.
+# This is a policy/preflight check, not protection against concurrent renames.
+# Mutations beneath service-owned directories must also use directory descriptors.
 require_literal_managed_path() {
     require_managed_path "$1"
     [ "$(readlink -m -- "$1")" = "$1" ] || die "managed path is not canonical"
@@ -33,6 +33,47 @@ require_literal_managed_path() {
         [ ! -L "$part" ] || die "managed path contains a symbolic link"
         part=$(dirname -- "$part")
     done
+}
+
+make_directory_nofollow() {
+    /usr/bin/python3 - "$@" <<'PY'
+import grp
+import os
+import pwd
+import sys
+
+path, owner, group, mode = sys.argv[1:]
+parts = path.split("/")
+if not path.startswith("/") or any(part in ("", ".", "..") for part in parts[1:]):
+    raise SystemExit("directory path must be canonical and absolute")
+uid = pwd.getpwnam(owner).pw_uid
+gid = grp.getgrnam(group).gr_gid
+permissions = int(mode, 8)
+if permissions not in (0o700, 0o755):
+    raise SystemExit("unsupported managed directory mode")
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+parent = os.open("/", flags)
+try:
+    # Open each existing ancestor separately: O_NOFOLLOW on the leaf alone does
+    # not prevent a symlink in an ancestor. Keep the current ancestor pinned.
+    for component in parts[1:-1]:
+        child = os.open(component, flags, dir_fd=parent)
+        os.close(parent)
+        parent = child
+    try:
+        os.mkdir(parts[-1], mode=0o700, dir_fd=parent)
+    except FileExistsError:
+        pass
+    directory = os.open(parts[-1], flags, dir_fd=parent)
+    try:
+        # Do not resolve the pathname again, even after an attacker renames it.
+        os.fchown(directory, uid, gid)
+        os.fchmod(directory, permissions)
+    finally:
+        os.close(directory)
+finally:
+    os.close(parent)
+PY
 }
 
 require_input_file() {
