@@ -337,3 +337,72 @@ with tempfile.TemporaryDirectory(prefix="autobit-descriptor-race-") as fixture:
     )
 ''', helper, swap_at, mode)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _fresh_host_hierarchy_result(prepare_function):
+    return _run_linux_python(r'''
+from pathlib import Path
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+expected = {
+    "/opt/autobit": ("root", "root", "0755"),
+    "/opt/autobit/releases": ("root", "root", "0755"),
+    "/opt/autobit/tools": ("root", "root", "0755"),
+    "/var/lib/autobit": ("autobit", "autobit", "0700"),
+    "/var/lib/autobit/paper": ("autobit", "autobit", "0700"),
+    "/var/lib/autobit/raw": ("autobit", "autobit", "0700"),
+    "/var/lib/autobit/raw/paper": ("autobit", "autobit", "0700"),
+    "/var/lib/autobit/.cache": ("autobit", "autobit", "0700"),
+    "/var/backups/autobit": ("root", "root", "0700"),
+    "/var/backups/autobit/paper": ("root", "root", "0700"),
+    "/var/backups/autobit/config": ("root", "root", "0700"),
+}
+with tempfile.TemporaryDirectory(prefix="autobit-fresh-hierarchy-") as fixture:
+    base = Path(fixture)
+    # Only the normal OS ancestors exist; no autobit directory is pre-created.
+    for ancestor in ("opt", "var/lib", "var/backups"):
+        (base / ancestor).mkdir(parents=True, exist_ok=True)
+    script = 'set -eu\nsource "$1"\n' + sys.argv[2] + r"""
+fixture=$2
+fixture_owner=$(command id -un)
+fixture_group=$(command id -gn)
+# Account lookup and absolute managed paths are mapped to the disposable tree.
+# All directory creation/metadata work still runs the production descriptor helper.
+getent() { printf '%s\n' 'autobit:x:123:123::/var/lib/autobit:/usr/sbin/nologin'; }
+id() {
+    case "$1" in -gn) printf 'autobit\n' ;; -u) printf '123\n' ;; *) return 1 ;; esac
+}
+useradd() { return 99; }
+require_literal_managed_path() { :; }
+managed_directory() {
+    printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >> "$fixture/requests"
+    make_directory_nofollow "$fixture$1" "$fixture_owner" "$fixture_group" "$4"
+}
+prepare_directories
+"""
+    operation = subprocess.run(["bash", "-s", "--", sys.argv[1], fixture],
+                               input=script, text=True, capture_output=True)
+    assert operation.returncode == 0, operation.stderr
+    requests = [line.split() for line in (base / "requests").read_text().splitlines()]
+    assert {path: tuple(values) for path, *values in requests} == expected
+    paths = [request[0] for request in requests]
+    assert paths.index("/var/lib/autobit/raw") < paths.index("/var/lib/autobit/raw/paper")
+    for path, (_, _, mode) in expected.items():
+        target = base / path.lstrip("/")
+        assert target.is_dir() and not target.is_symlink(), path
+        info = target.stat()
+        assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (
+            os.getuid(), os.getgid(), int(mode, 8)
+        ), path
+''', _linux_path(ROOT / "deploy/oci/libdeploy.sh"), prepare_function)
+
+
+def test_fresh_host_prepares_entire_hierarchy_with_raw_parent_before_paper():
+    installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
+    function = re.search(r"^prepare_directories\(\) \{\n.*?^\}", installer, re.M | re.S)
+    assert function is not None
+    result = _fresh_host_hierarchy_result(function.group(0))
+    assert result.returncode == 0, result.stdout + result.stderr
