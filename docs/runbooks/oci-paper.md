@@ -30,7 +30,7 @@ ssh @SshOptions "ubuntu@$HostName" 'uname -m; cat /etc/os-release; systemctl --f
 
 `Prepare`는 정확한 remote `main` 커밋을 패키징해 immutable release를 만들고 ARM64 runtime, frozen dependency, import, CLI, unit, 분리된 smoke ledger를 검증한다. 서비스의 stop/start/restart, enable/disable, `current` 변경을 하지 않는다.
 
-런타임 도구는 archive hash, 소유권과 버전을 검증한 뒤 서비스 사용자에게 필요한 읽기·디렉터리 통과 권한만 부여하고 group/other 쓰기는 허용하지 않는다. 같은 버전의 기존 도구도 검증 후 이 권한을 다시 정규화하므로 중간 실패 뒤 재실행할 수 있다.
+런타임 도구는 먼저 트리 경계와 archive hash, 소유권, 버전을 검증하고, 그 뒤 서비스 사용자에게 필요한 읽기·디렉터리 통과 권한만 부여한다. 권한 정규화는 경계 전체를 다시 확인한 다음 열린 파일 디스크립터에만 적용하며 group/other 쓰기는 허용하지 않는다. 마지막으로 같은 검증을 다시 실행한다. 같은 버전의 기존 도구도 `검증 → 정규화 → 재검증` 순서를 따르므로 중간 실패 뒤 재실행할 수 있다. 도구 트리 아래에 별도 mount가 있거나 외부 hard link가 있으면 아무 권한도 바꾸기 전에 실패한다.
 
 ```powershell
 & ".\deploy\oci\Deploy-OciPaper.ps1" -Mode Prepare -Commit $Commit -HostName $HostName -User ubuntu -IdentityFile $IdentityFile
@@ -44,7 +44,7 @@ ssh @SshOptions "ubuntu@$HostName" "sudo cat /opt/autobit/releases/$Commit/.auto
 
 Prepare 성공은 활성화 승인이 아니다. 이 시점에 현재 서비스와 운영 원장은 바뀌지 않아야 한다.
 
-Prepare가 실패하면 출력된 `.staging-<commit>-<pid>`와 `/tmp/autobit-prepare.<suffix>`를 진단 증거로 보존한다. 경로를 추측해 삭제하거나 같은 명령을 반복하지 말고, 실패 지점과 권한·소유권을 읽기 전용으로 조사한다. 수정된 새 remote `main` 커밋으로 다시 Prepare하기 전에는 변경 범위를 다시 보고하고 승인을 받으며, 보존된 실패 증거의 삭제도 정확한 경로를 확인한 뒤 별도로 승인받는다.
+Prepare가 실패하면 출력된 `/opt/autobit/releases/.staging-<40자리 commit>-<pid>`와 `/tmp/autobit-prepare.<8자리 suffix>`를 진단 증거로 보존한다. 도구 게시 전 실패라면 `/opt/autobit/tools/<kind>/<version>.staging-<pid>`도 출력될 수 있다. 출력된 경로가 이미 최종 도구 경로로 게시되어 존재하지 않을 수도 있으므로 실제 존재 여부를 읽기 전용으로 확인한다. 경로를 추측해 삭제하거나 같은 명령을 반복하지 말고, 실패 지점과 권한·소유권을 읽기 전용으로 조사한다. 수정된 새 remote `main` 커밋으로 다시 Prepare하기 전에는 변경 범위를 다시 보고하고 승인을 받으며, 보존된 실패 증거의 삭제도 정확한 경로를 확인한 뒤 별도로 승인받는다.
 
 ## 3. Activate: 별도 변경 승인 뒤 실행
 

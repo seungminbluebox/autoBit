@@ -24,9 +24,12 @@ def main() -> None:
     scenario = sys.argv[2]
     if scenario not in {"new", "existing"}:
         raise AssertionError(f"unsupported scenario: {scenario}")
-    match = re.search(r"^install_tool\(\) \{\n.*?^\}", installer, re.M | re.S)
-    if match is None:
-        raise AssertionError("install_tool function is missing")
+    normalize = re.search(
+        r"^normalize_tool_permissions\(\) \{\n.*?^\}", installer, re.M | re.S
+    )
+    install = re.search(r"^install_tool\(\) \{\n.*?^\}", installer, re.M | re.S)
+    if normalize is None or install is None:
+        raise AssertionError("tool permission or installation function is missing")
 
     with tempfile.TemporaryDirectory(prefix="autobit-tool-permissions-") as fixture:
         root = Path(fixture)
@@ -60,7 +63,8 @@ def main() -> None:
             library.chmod(0o600)
         script = f'''set -eu
 umask 077
-{match.group(0)}
+{normalize.group(0)}
+{install.group(0)}
 download_dir=$1
 tool=$2
 require_literal_managed_path() {{ :; }}

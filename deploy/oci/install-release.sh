@@ -84,10 +84,137 @@ load_runtime() {
     [ "$runtime_schema" = 1 ] || die "unsupported runtime schema"
 }
 
+normalize_tool_permissions() {
+    local directory="$1" operation="${2:-normalize}"
+    require_literal_managed_path "$directory"
+    [ "$operation" = check ] || [ "$operation" = normalize ] \
+        || die "unsupported tool permission operation"
+    /usr/bin/python3 - "$directory" "$operation" <<'PY'
+import os
+import re
+import stat
+import sys
+from collections import Counter
+
+root_path, operation = sys.argv[1:]
+open_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+directory_flags = open_flags | os.O_DIRECTORY
+
+
+def mount_path(value):
+    return re.sub(r"\\([0-7]{3})", lambda item: chr(int(item.group(1), 8)), value)
+
+
+def reject_nested_mounts(root):
+    prefix = root.rstrip(os.sep) + os.sep
+    with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+        for line in stream:
+            fields = line.split()
+            if len(fields) < 6:
+                raise SystemExit("invalid mountinfo entry")
+            mounted_at = mount_path(fields[4])
+            if mounted_at.startswith(prefix):
+                raise SystemExit("tool directory contains a nested mount: " + mounted_at)
+
+
+def scan(directory_fd, relative=()):
+    entries = []
+    with os.scandir(directory_fd) as children:
+        ordered = sorted(children, key=lambda item: item.name)
+        for child in ordered:
+            name = child.name
+            if name in ("", ".", "..") or "/" in name or "\x00" in name:
+                raise SystemExit("invalid tool tree entry")
+            info = child.stat(follow_symlinks=False)
+            child_relative = relative + (name,)
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        raise SystemExit("tool directory changed during validation")
+                    entries.append((child_relative, opened))
+                    entries.extend(scan(child_fd, child_relative))
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(info.st_mode):
+                entries.append((child_relative, info))
+            else:
+                raise SystemExit("tool tree contains an unsupported file type")
+    return entries
+
+
+def open_relative(root_fd, relative, is_directory):
+    descriptor = os.dup(root_fd)
+    try:
+        for index, name in enumerate(relative):
+            flags = open_flags
+            if index < len(relative) - 1 or is_directory:
+                flags |= os.O_DIRECTORY
+            next_descriptor = os.open(name, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+root_fd = os.open(root_path, directory_flags)
+try:
+    resolved_root = os.readlink("/proc/self/fd/{}".format(root_fd))
+    if not resolved_root.startswith("/") or resolved_root.endswith(" (deleted)"):
+        raise SystemExit("tool directory path is unstable")
+    reject_nested_mounts(resolved_root)
+    root_info = os.fstat(root_fd)
+    plan = [((), root_info)] + scan(root_fd)
+    regular_links = Counter(
+        (info.st_dev, info.st_ino)
+        for _, info in plan
+        if stat.S_ISREG(info.st_mode)
+    )
+    for _, info in plan:
+        if stat.S_ISREG(info.st_mode):
+            if regular_links[(info.st_dev, info.st_ino)] != info.st_nlink:
+                raise SystemExit("tool file has a hard link outside the tool directory")
+        elif not stat.S_ISDIR(info.st_mode):
+            raise SystemExit("invalid tool permission target")
+    if operation == "check":
+        raise SystemExit(0)
+
+    # Recheck the namespace before the first mutation. A service process cannot
+    # create host mounts, and descriptor/inode checks below pin every target.
+    reject_nested_mounts(resolved_root)
+    for relative, expected in plan:
+        is_directory = stat.S_ISDIR(expected.st_mode)
+        descriptor = open_relative(root_fd, relative, is_directory)
+        try:
+            current = os.fstat(descriptor)
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                raise SystemExit("tool tree changed before permission repair")
+            mode = stat.S_IMODE(current.st_mode)
+            if is_directory:
+                wanted = (mode | 0o555) & ~0o022
+            else:
+                wanted = (mode | 0o444) & ~0o022
+                if mode & 0o111:
+                    wanted |= 0o111
+            os.fchmod(descriptor, wanted)
+        finally:
+            os.close(descriptor)
+finally:
+    os.close(root_fd)
+PY
+}
+
 verify_tool() {
     local directory="$1" digest="$2" kind="$3" actual
     require_literal_managed_path "$directory"
-    [ -d "$directory" ] || die "tool directory is missing"
+    [ -d "$directory" ] && [ ! -L "$directory" ] || die "tool directory is missing or linked"
+    # Reject mount and hard-link escapes before reading or executing tool data.
+    normalize_tool_permissions "$directory" check
     [ -f "$directory/.archive-sha256" ] && [ ! -L "$directory/.archive-sha256" ] || die "tool hash record missing"
     [ "$(cat -- "$directory/.archive-sha256")" = "$digest" ] || die "installed tool archive hash differs"
     # Existing root-owned tools must not be writable by the service account.
@@ -110,7 +237,8 @@ install_tool() {
     require_literal_managed_path "$directory"
     if [ -e "$directory" ]; then
         verify_tool "$directory" "$digest" "$kind"
-        chmod -R a+rX,go-w -- "$directory"
+        normalize_tool_permissions "$directory"
+        verify_tool "$directory" "$digest" "$kind"
         return
     fi
     curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 --output "$download_dir/$name" "$url"
@@ -126,8 +254,8 @@ install_tool() {
         python) tar --extract --gzip --file "$download_dir/$name" --directory "$tool_stage" --no-same-owner ;;
     esac
     printf '%s\n' "$digest" > "$tool_stage/.archive-sha256"
-    chown -R root:root -- "$tool_stage"
-    chmod -R a+rX,go-w -- "$tool_stage"
+    verify_tool "$tool_stage" "$digest" "$kind"
+    normalize_tool_permissions "$tool_stage"
     verify_tool "$tool_stage" "$digest" "$kind"
     mv -T --no-clobber -- "$tool_stage" "$directory"
     [ ! -e "$tool_stage" ] || die "tool publication was refused"

@@ -62,7 +62,7 @@
 
 구현 시점의 공식 안정 릴리스 중 프로젝트 의존성이 설치되고 테스트되는 조합을 한 번 선택해 위 값을 고정한다. `latest` URL, 변경 가능한 태그, 버전 범위, `curl | sh`는 사용하지 않는다. 다운로드 파일의 SHA-256이 저장된 값과 다르면 압축 해제나 실행 전에 실패한다. 서버의 `/usr/bin/python3`와 OS 패키지는 교체하지 않는다.
 
-고정 런타임 압축은 `root`의 제한적인 `umask` 아래에서 해제하되, 검증된 도구 트리는 서비스 사용자가 읽고 디렉터리를 통과할 수 있도록 `a+rX`를 적용하고 group/other 쓰기 권한은 제거한다. 이미 설치된 같은 버전의 도구는 archive hash, `root:root` 소유권, 쓰기 금지와 실제 버전을 먼저 검증한 뒤 동일한 권한 정규화를 다시 적용한다. 이 규칙은 부분 실패 뒤 재실행해도 `autobit` 사용자가 Python 실행 경로에 접근할 수 있게 한다.
+고정 런타임 압축은 `root`의 제한적인 `umask`와 `--no-same-owner` 아래에서 해제한다. 신규·기존 도구 모두 별도 mount, 외부 hard link, 지원하지 않는 파일 형식이 없는지 먼저 검사하고 archive hash, `root:root` 소유권, 쓰기 금지와 실제 버전을 검증한다. 검증에 성공한 뒤에만 전체 트리를 다시 확인하고 열린 파일 디스크립터를 통해 서비스 사용자에게 필요한 읽기·디렉터리 통과 권한을 부여하며 group/other 쓰기 권한은 제거한다. 심볼릭 링크 자체는 변경하지 않는다. 마지막으로 동일한 검증을 다시 실행한다. 따라서 검증 실패는 권한을 바꾸지 않고, 부분 실패 뒤 재실행해도 `autobit` 사용자가 Python 실행 경로에 접근할 수 있다.
 
 새 릴리스의 `.venv`는 해당 릴리스 안에 생성한다. 빌드가 끝나면 다음 검사에 모두 성공해야 현재 릴리스 후보가 된다.
 
@@ -117,7 +117,7 @@ stdout의 cycle JSON과 stderr의 안전한 오류 메시지는 systemd journal�
 배포 순서는 다음과 같다.
 
 1. 디스크 여유, 허용 경로, 기존 서비스 상태, wrapper가 검증한 원격 `main` 커밋 manifest와 서버 아키텍처를 읽기 전용으로 검사한다.
-2. 실행 중인 기존 서비스에는 손대지 않고 새 커밋을 `/opt/autobit/releases/.staging-` 뒤에 40자리 커밋을 붙인 경로에 준비한다.
+2. 실행 중인 기존 서비스에는 손대지 않고 새 커밋을 `/opt/autobit/releases/.staging-<40자리 commit>-<pid>` 경로에 준비한다. 다운로드 scratch는 `/tmp/autobit-prepare.<8자리 suffix>`, 게시 전 도구 staging은 `/opt/autobit/tools/<kind>/<version>.staging-<pid>` 형식이다. 실패 시 출력된 실제 경로를 보존하며, 도구 staging 메시지가 게시 전에 출력되었더라도 최종 경로로 이미 이동되었는지는 따로 확인한다.
 3. 고정 런타임 설치, lock 검증, import·CLI·원장 복사본 smoke test와 `systemd-analyze verify`를 통과시킨다.
 4. staging을 최종 40자리 커밋 경로로 바꾸고 읽기 전용으로 만든다. 같은 커밋 릴리스가 이미 검증되어 있으면 재사용하고, 내용이 다르면 실패한다.
 5. `autobit-paper.service`를 `SIGINT`로 정상 정지하고 inactive 상태와 단일 writer 종료를 확인한다.
@@ -148,6 +148,7 @@ stdout의 cycle JSON과 stderr의 안전한 오류 메시지는 systemd journal�
 - systemd unit의 실행 명령, 사용자, 재시작, 종료 신호, hardening, writable path 정적 계약 테스트
 - 런타임 manifest의 exact-version·SHA-256·금지 패턴(`latest`, pipe-to-shell) 테스트
 - 제한적인 `umask`로 해제된 신규·기존 런타임 도구가 `autobit` 사용자에게 읽기·디렉터리 통과 가능하고 쓰기 불가능한지 확인하는 Linux 권한 테스트
+- 잘못된 hash·버전·소유권은 권한을 바꾸기 전에 실패하고, 별도 mount의 내용은 변경하지 않은 채 도구 트리를 거부하는 Linux 경계 테스트
 - `uv.lock` frozen 설치와 Python 3.12 import/CLI smoke test
 - 백업 묶음, WAL 포함, `-shm` 제외, 해시·읽기 검증 테스트
 - 배포 실패 시 이전 링크 복구와 실제 원장 무삭제 테스트

@@ -235,6 +235,49 @@ def test_existing_runtime_tool_tree_is_made_service_traversable():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_runtime_tool_repair_is_bounded_and_reverified():
+    installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
+    install = re.search(r"^install_tool\(\) \{\n.*?^\}", installer, re.M | re.S)
+    assert install is not None
+    text = install.group(0)
+    assert "chmod -R" not in text
+    existing = text[text.index('if [ -e "$directory" ]'):text.index("    curl --fail")]
+    assert existing.count('verify_tool "$directory" "$digest" "$kind"') == 2
+    assert existing.index('verify_tool "$directory"') < existing.index(
+        'normalize_tool_permissions "$directory"'
+    ) < existing.rindex('verify_tool "$directory"')
+    new_tree = text[text.index('printf \'%s\\n\' "$digest"'):]
+    assert new_tree.count('verify_tool "$tool_stage" "$digest" "$kind"') == 2
+    assert new_tree.index('verify_tool "$tool_stage"') < new_tree.index(
+        'normalize_tool_permissions "$tool_stage"'
+    ) < new_tree.rindex('verify_tool "$tool_stage"')
+
+
+@pytest.mark.parametrize("scenario", ["valid", "bad-digest", "bad-version", "bad-owner"])
+def test_existing_runtime_tool_is_verified_before_permission_repair(scenario):
+    probe = (ROOT / "tests/deployment/tool_validation_probe.py").read_text(encoding="utf-8")
+    result = _run_linux_python(
+        probe,
+        _linux_path(ROOT / "deploy/oci/install-release.sh"),
+        scenario,
+    )
+    if result.returncode == 77:
+        pytest.skip(result.stderr.strip())
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_runtime_tool_permission_repair_rejects_nested_mount():
+    probe = (ROOT / "tests/deployment/tool_validation_probe.py").read_text(encoding="utf-8")
+    result = _run_linux_python(
+        probe,
+        _linux_path(ROOT / "deploy/oci/install-release.sh"),
+        "nested-mount",
+    )
+    if result.returncode == 77:
+        pytest.skip(result.stderr.strip())
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("existing_leaf", [False, True])
 def test_directory_creation_cannot_follow_ancestor_swap_after_path_check(existing_leaf):
     installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")
