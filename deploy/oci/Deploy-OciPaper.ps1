@@ -149,6 +149,7 @@ sudo /bin/bash -- "$remoteDirectory/install-release.sh" prepare --archive "$remo
 rm -f -- "$remoteDirectory/source.tar.gz" "$remoteDirectory/bundle.env" "$remoteDirectory/install-release.sh" "$remoteDirectory/libdeploy.sh"
 rmdir -- "$remoteDirectory"
 "@
+        $prepareCommand = $prepareCommand.Replace("`r`n", "`n").Replace("`r", "`n")
         & ssh @sshOptions $target $prepareCommand
         if ($LASTEXITCODE -ne 0) {
             Fail "Remote prepare failed."
