@@ -215,6 +215,26 @@ def _run_linux_python(code, *args):
     )
 
 
+def test_new_runtime_tool_tree_is_service_traversable():
+    probe = (ROOT / "tests/deployment/tool_permissions_probe.py").read_text(encoding="utf-8")
+    result = _run_linux_python(
+        probe,
+        _linux_path(ROOT / "deploy/oci/install-release.sh"),
+        "new",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_existing_runtime_tool_tree_is_made_service_traversable():
+    probe = (ROOT / "tests/deployment/tool_permissions_probe.py").read_text(encoding="utf-8")
+    result = _run_linux_python(
+        probe,
+        _linux_path(ROOT / "deploy/oci/install-release.sh"),
+        "existing",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("existing_leaf", [False, True])
 def test_directory_creation_cannot_follow_ancestor_swap_after_path_check(existing_leaf):
     installer = (ROOT / "deploy/oci/install-release.sh").read_text(encoding="utf-8")

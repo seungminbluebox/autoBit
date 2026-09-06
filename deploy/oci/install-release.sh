@@ -110,6 +110,7 @@ install_tool() {
     require_literal_managed_path "$directory"
     if [ -e "$directory" ]; then
         verify_tool "$directory" "$digest" "$kind"
+        chmod -R a+rX,go-w -- "$directory"
         return
     fi
     curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 --output "$download_dir/$name" "$url"
@@ -126,7 +127,7 @@ install_tool() {
     esac
     printf '%s\n' "$digest" > "$tool_stage/.archive-sha256"
     chown -R root:root -- "$tool_stage"
-    chmod -R go-w -- "$tool_stage"
+    chmod -R a+rX,go-w -- "$tool_stage"
     verify_tool "$tool_stage" "$digest" "$kind"
     mv -T --no-clobber -- "$tool_stage" "$directory"
     [ ! -e "$tool_stage" ] || die "tool publication was refused"

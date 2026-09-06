@@ -62,6 +62,8 @@
 
 구현 시점의 공식 안정 릴리스 중 프로젝트 의존성이 설치되고 테스트되는 조합을 한 번 선택해 위 값을 고정한다. `latest` URL, 변경 가능한 태그, 버전 범위, `curl | sh`는 사용하지 않는다. 다운로드 파일의 SHA-256이 저장된 값과 다르면 압축 해제나 실행 전에 실패한다. 서버의 `/usr/bin/python3`와 OS 패키지는 교체하지 않는다.
 
+고정 런타임 압축은 `root`의 제한적인 `umask` 아래에서 해제하되, 검증된 도구 트리는 서비스 사용자가 읽고 디렉터리를 통과할 수 있도록 `a+rX`를 적용하고 group/other 쓰기 권한은 제거한다. 이미 설치된 같은 버전의 도구는 archive hash, `root:root` 소유권, 쓰기 금지와 실제 버전을 먼저 검증한 뒤 동일한 권한 정규화를 다시 적용한다. 이 규칙은 부분 실패 뒤 재실행해도 `autobit` 사용자가 Python 실행 경로에 접근할 수 있게 한다.
+
 새 릴리스의 `.venv`는 해당 릴리스 안에 생성한다. 빌드가 끝나면 다음 검사에 모두 성공해야 현재 릴리스 후보가 된다.
 
 1. 인터프리터가 ARM64용 Python 3.12의 고정된 patch 버전인지 확인한다.
@@ -145,6 +147,7 @@ stdout의 cycle JSON과 stderr의 안전한 오류 메시지는 systemd journal�
 - 커밋 형식·원격 `main` 일치·동시 배포 잠금 테스트
 - systemd unit의 실행 명령, 사용자, 재시작, 종료 신호, hardening, writable path 정적 계약 테스트
 - 런타임 manifest의 exact-version·SHA-256·금지 패턴(`latest`, pipe-to-shell) 테스트
+- 제한적인 `umask`로 해제된 신규·기존 런타임 도구가 `autobit` 사용자에게 읽기·디렉터리 통과 가능하고 쓰기 불가능한지 확인하는 Linux 권한 테스트
 - `uv.lock` frozen 설치와 Python 3.12 import/CLI smoke test
 - 백업 묶음, WAL 포함, `-shm` 제외, 해시·읽기 검증 테스트
 - 배포 실패 시 이전 링크 복구와 실제 원장 무삭제 테스트
