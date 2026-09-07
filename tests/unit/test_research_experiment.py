@@ -59,6 +59,12 @@ def test_research_refuses_imports_from_a_different_checkout(tmp_path):
         validate_source_imports(tmp_path)
 
 
+def test_source_check_accepts_our_real_namespace_packages():
+    from pathlib import Path
+    from tools.research.run_experiment import validate_source_imports
+    validate_source_imports(Path(__file__).resolve().parents[2])
+
+
 def test_resume_rejects_incomplete_reports_and_changed_summaries(tmp_path):
     from tools.research.run_experiment import _report_bundle, _write_or_verify
     folder=tmp_path/'report'; folder.mkdir()

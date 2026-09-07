@@ -76,7 +76,8 @@ def validate_source_imports(root):
     for name, module in tuple(sys.modules.items()):
         if name == 'autobit' or name.startswith('autobit.'):
             origin = getattr(module, '__file__', None)
-            if origin is None or not Path(origin).resolve().is_relative_to(expected):
+            origins = [origin] if origin else list(getattr(module, '__path__', ()))
+            if not origins or any(not Path(p).resolve().is_relative_to(expected) for p in origins):
                 raise ValueError('autobit import came from a different checkout; set PYTHONPATH to this checkout/src')
 
 
