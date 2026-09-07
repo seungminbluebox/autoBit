@@ -1,7 +1,7 @@
 # OCI 모의매매 상시 운영·배포 설계
 
 작성일: 2026-09-05
-상태: 대화에서 승인된 OCI 네이티브 운영 방향을 구현 계약으로 문서화. 이 문서 검토가 끝난 뒤 별도 구현 계획을 작성한다.
+상태: 대화에서 승인된 OCI 네이티브 운영 방향을 구현 계약으로 문서화. 2026-09-07 승인된 Telegram 자격증명 분리 확장을 반영했다.
 
 ## 1. 목적과 범위
 
@@ -31,7 +31,7 @@
 - OS 기본 Python 3.10은 프로젝트 계약 `>=3.12,<3.13`과 호환되지 않는다. OS Python을 교체하거나 덮어쓰지 않는다.
 - Docker와 Podman은 설치하지 않는다. 기존 `git`, `curl`, `systemd`를 활용한다.
 - 서버 시간대는 UTC로 유지한다. 전략과 스케줄러도 UTC 확정봉을 기준으로 하므로 시스템 시간대를 변경하거나 cron 시간대에 의존하지 않는다.
-- 알려진 기존 애플리케이션 트리 `/home/ubuntu/autoBit`와 그 안의 `.env`는 읽기·source·복사·이동·수정·권한 변경·삭제하지 않는다. 새 서비스는 `ProtectHome=true`로 홈 디렉터리 접근 자체를 차단한다.
+- 알려진 기존 애플리케이션 트리 `/home/ubuntu/autoBit`와 그 안의 `.env`는 일반 배포에서 읽기·source·복사·이동·수정·권한 변경·삭제하지 않는다. 사용자가 승인한 1회 Telegram migration만 정확히 두 Telegram 값을 읽어 별도 root 전용 파일로 분리한다. 원본은 수정하지 않으며 새 서비스는 `ProtectHome=true`로 홈 디렉터리 접근 자체를 차단한다.
 - 새 수신 포트를 열지 않는다. 서비스는 공개 업비트 캔들 HTTPS 요청을 위한 outbound 연결만 사용한다.
 - 단 하나의 `paper-run` 프로세스만 같은 원장을 쓴다. systemd 서비스와 배포 잠금이 두 번째 실행자를 만들지 못하게 한다.
 - 서비스나 배포 스크립트는 `live` 명령을 실행하거나 실전 잠금을 해제하는 옵션을 제공하지 않는다.
@@ -46,6 +46,7 @@
 | `/var/lib/autobit/paper/paper.sqlite3` | 모의 계좌·주문·체결·위험·상태 원장 | `autobit:autobit`, 디렉터리 모드 `0700`; 릴리스와 분리하여 영속 보존한다. |
 | `/var/lib/autobit/raw/paper/` | 공개 캔들 원본·checkpoint·manifest | `autobit:autobit`, 디렉터리 모드 `0700`; 재배포 때 삭제하지 않는다. |
 | `/var/backups/autobit/paper/` | 배포 직전 원장 묶음과 해시 | `root:root`, 디렉터리 모드 `0700`; 자동 배포가 기존 백업을 덮어쓰지 않는다. |
+| `/etc/autobit/paper-notify.env` | Telegram token·chat ID 두 값 | `root:root`, 파일 모드 `0600`; legacy 원본과 Upbit 키는 서비스에 노출하지 않는다. |
 | systemd journal | stdout·stderr 운영 로그 | 영속 journal을 사용하며 서비스가 직접 로그 파일을 관리하지 않는다. |
 
 `autobit`은 로그인할 수 없는 전용 시스템 사용자와 그룹으로 만든다. 릴리스 코드는 쓸 수 없고 `/var/lib/autobit`만 쓸 수 있다. 배포 스크립트는 모든 대상 경로를 절대 경로로 정규화한 뒤 허용된 `/opt/autobit`, `/var/lib/autobit`, `/var/backups/autobit` 아래인지 검사한다. 빈 경로, `/`, `/home`, `/home/ubuntu/autoBit` 또는 그 하위 경로가 전달되면 변경 전에 실패한다.
@@ -77,9 +78,12 @@
 
 ```text
 WorkingDirectory=/opt/autobit/current
+EnvironmentFile=/etc/autobit/paper-notify.env
 ExecStart=/opt/autobit/current/.venv/bin/python -m autobit.cli paper-run \
   --db /var/lib/autobit/paper/paper.sqlite3 \
-  --data-dir /var/lib/autobit/raw/paper
+  --data-dir /var/lib/autobit/raw/paper \
+  --telegram-token-env AUTOBIT_TELEGRAM_TOKEN \
+  --telegram-chat-env AUTOBIT_TELEGRAM_CHAT_ID
 ```
 
 - `Wants=network-online.target`, `After=network-online.target`로 네트워크 준비 뒤 시작한다.
@@ -90,14 +94,14 @@ ExecStart=/opt/autobit/current/.venv/bin/python -m autobit.cli paper-run \
 - `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`로 로컬 SQLite와 공개 HTTPS에 필요한 주소 체계만 허용한다.
 - 1 OCPU 환경의 과도한 수치 연산 스레드를 막기 위해 `OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `NUMEXPR_NUM_THREADS=1`을 서비스 환경에 고정한다.
 - 전용 사용자의 home은 `/var/lib/autobit`으로 두고 `HOME=/var/lib/autobit`, `XDG_CACHE_HOME=/var/lib/autobit/.cache`, `PYTHONDONTWRITEBYTECODE=1`을 고정한다. 라이브러리 캐시가 필요한 경우에만 영속 상태 트리 안에 쓰고 읽기 전용 릴리스에는 bytecode를 만들지 않는다.
-- `.env` 또는 `EnvironmentFile`을 사용하지 않는다. Telegram 알림 자격증명도 이 최초 배포에는 넣지 않는다.
+- 서비스는 legacy `.env`를 읽지 않고 root 전용 `/etc/autobit/paper-notify.env`만 `EnvironmentFile`로 사용한다. Activate는 서비스 정지 전에 이 파일의 소유권·모드·정확한 두 변수와 값 형식을 검증한다. Upbit 키나 추가 변수가 있으면 실패한다.
 - `systemctl enable`로 부팅 자동 시작을 설정한다. 복구 가능한 공개 API 오류는 애플리케이션 내부 재시도가 담당하고, systemd 재시작은 프로세스 종료에 대한 두 번째 안전망이다.
 
 원장이 손상되거나 검증할 수 없는 경우에는 새 빈 원장으로 자동 교체하거나 상태를 추측하지 않는다. 서비스는 재시작을 계속 시도하고 안전 오류만 기록하지만 거래 판단은 하지 않는다. “완전 자동 재개”는 검증된 기존 상태와 공개 데이터가 회복된다는 조건에서 적용되며, 상태 증거를 버리고 매매를 강행한다는 뜻이 아니다.
 
 ## 7. 로그 보존
 
-stdout의 cycle JSON과 stderr의 안전한 오류 메시지는 systemd journal에만 기록한다. 토큰, 키, JWT, 인증 헤더, 원장 전체 내용과 예외 원문은 로그에 추가하지 않는다. 현재 paper 서비스는 공개 API만 사용하며 비밀을 주입하지 않는다.
+stdout의 cycle JSON과 stderr의 안전한 오류 메시지는 systemd journal에만 기록한다. 토큰, 키, JWT, 인증 헤더, 원장 전체 내용과 예외 원문은 로그에 추가하지 않는다. 현재 paper 서비스는 공개 캔들 API와 선택적 Telegram `sendMessage`만 사용한다. Telegram 알림 실패는 모의매매 상태를 바꾸지 않으며 Upbit 자격증명은 주입하지 않는다.
 
 재부팅 뒤에도 로그가 남도록 journald를 영속 모드로 구성한다. 이 설정은 서비스 하나가 아니라 서버 journal 전체에 영향을 주므로 다음 전역 상한을 명시적으로 적용하고 운영 문서에 그 영향을 알린다.
 
@@ -120,11 +124,12 @@ stdout의 cycle JSON과 stderr의 안전한 오류 메시지는 systemd journal�
 2. 실행 중인 기존 서비스에는 손대지 않고 새 커밋을 `/opt/autobit/releases/.staging-<40자리 commit>-<pid>` 경로에 준비한다. 다운로드 scratch는 `/tmp/autobit-prepare.<8자리 suffix>`, 게시 전 도구 staging은 `/opt/autobit/tools/<kind>/<version>.staging-<pid>` 형식이다. 실패 시 출력된 실제 경로를 보존하며, 도구 staging 메시지가 게시 전에 출력되었더라도 최종 경로로 이미 이동되었는지는 따로 확인한다.
 3. 고정 런타임 설치, lock 검증, import·CLI·원장 복사본 smoke test와 `systemd-analyze verify`를 통과시킨다.
 4. staging을 최종 40자리 커밋 경로로 바꾸고 읽기 전용으로 만든다. 같은 커밋 릴리스가 이미 검증되어 있으면 재사용하고, 내용이 다르면 실패한다.
-5. `autobit-paper.service`를 `SIGINT`로 정상 정지하고 inactive 상태와 단일 writer 종료를 확인한다.
-6. 기존 운영 원장이 있으면 닫힌 `paper.sqlite3`와 존재하는 같은 시점의 `paper.sqlite3-wal`을 새 백업 디렉터리에 한 묶음으로 복사한다. `-shm`은 복사하지 않는다. 각 파일 SHA-256과 배포 전 `paper-status` 출력을 함께 저장하고 백업본을 다시 읽어 검증한다. 최초 설치로 원장이 없으면 DB·WAL·SHM이 모두 없음을 확인하고 `NO_EXISTING_LEDGER` manifest를 남긴다. DB 없이 WAL이나 SHM만 있으면 상태를 추측하지 않고 배포를 중단한다.
-7. 임시 심볼릭 링크를 만든 뒤 같은 파일시스템에서 rename하여 `/opt/autobit/current`를 원자적으로 교체한다.
-8. 필요한 unit 변경을 설치하고 daemon-reload한 뒤 서비스를 enable/start한다.
-9. 서비스가 active인지, 프로세스가 단일 인스턴스인지, 같은 원장을 읽는 `paper-status`가 성공하는지, journal에 새 실행 기록이 생기는지 확인한다.
+5. Telegram 전용 파일이 정확히 두 허용 변수만 가진 root 소유 모드 `0600` 파일인지 검증한다. 없거나 추가 변수·Upbit 키·부적합한 값이 있으면 기존 서비스를 정지하기 전에 실패한다.
+6. `autobit-paper.service`를 `SIGINT`로 정상 정지하고 inactive 상태와 단일 writer 종료를 확인한다.
+7. 기존 운영 원장이 있으면 닫힌 `paper.sqlite3`와 존재하는 같은 시점의 `paper.sqlite3-wal`을 새 백업 디렉터리에 한 묶음으로 복사한다. `-shm`은 복사하지 않는다. 각 파일 SHA-256과 배포 전 `paper-status` 출력을 함께 저장하고 백업본을 다시 읽어 검증한다. 최초 설치로 원장이 없으면 DB·WAL·SHM이 모두 없음을 확인하고 `NO_EXISTING_LEDGER` manifest를 남긴다. DB 없이 WAL이나 SHM만 있으면 상태를 추측하지 않고 배포를 중단한다.
+8. 임시 심볼릭 링크를 만든 뒤 같은 파일시스템에서 rename하여 `/opt/autobit/current`를 원자적으로 교체한다.
+9. 필요한 unit 변경을 설치하고 daemon-reload한 뒤 서비스를 enable/start한다.
+10. 서비스가 active인지, 프로세스가 단일 인스턴스인지, 같은 원장을 읽는 `paper-status`가 성공하는지, journal에 새 실행 기록이 생기는지 확인한다.
 
 새 릴리스가 시작 검증에 실패하면 이전 심볼릭 링크로 원자적으로 되돌리고 이전 서비스를 다시 시작한다. 실제 원장은 자동 복원하지 않는다. 자동 복원은 새 릴리스가 이미 남긴 유효 이벤트를 지울 수 있기 때문이다. 모든 릴리스의 SQLite 변경은 이전 릴리스가 읽을 수 있는 비파괴·후방 호환 변경이어야 하며, 이 조건을 만족하지 않는 향후 DB 변경은 별도 마이그레이션·복원 설계 없이는 이 배포 경로에 넣지 않는다.
 
@@ -153,13 +158,15 @@ stdout의 cycle JSON과 stderr의 안전한 오류 메시지는 systemd journal�
 - 백업 묶음, WAL 포함, `-shm` 제외, 해시·읽기 검증 테스트
 - 배포 실패 시 이전 링크 복구와 실제 원장 무삭제 테스트
 - 기존 paper 인수 시험, 세 환경 공통 전략 계약, 라이브 잠금·무자격증명·무개인요청 안전 시험
+- legacy `.env`를 실행하지 않고 Telegram 두 값만 분리하며 기존 목적 파일·부적합한 값·추가 키를 거부하는 migration 시험
 - 전체 테스트 suite 및 shell syntax 검사
 
 ### OCI 활성화 전에 수행
 
 - 실제 ARM64에서 고정 Python·의존성 설치와 `systemd-analyze verify`
 - 서비스 시작 전 시험용 임시 원장으로 smoke test
-- 기존 legacy 홈 트리와 `.env`의 경로·크기·mtime·소유권 같은 metadata를 `stat`으로만 기록해 배포 전후 동일함을 검증한다. `.env` 내용은 열거나 해시하지 않는다.
+- 승인된 1회 Telegram migration 전후 legacy 홈 트리와 `.env`의 경로·크기·mtime·소유권 metadata가 동일한지 검증한다. 값은 출력하거나 hash하지 않는다.
+- `/etc/autobit/paper-notify.env`의 root 소유, 모드 `0600`, 허용된 두 변수만 존재한다는 검증을 통과시킨다. 실제 값은 출력하지 않는다.
 - 새 수신 포트가 생기지 않았고 서비스 사용자에게 홈 접근 권한이 없음을 검증
 
 ### OCI 활성화 후 수행
@@ -193,7 +200,7 @@ stdout의 cycle JSON과 stderr의 안전한 오류 메시지는 systemd journal�
 - `autobit-paper.service`가 부팅 자동 시작, 충돌 자동 재시작, 정상 SIGINT 종료를 수행한다.
 - 코드 교체 뒤에도 SQLite 원장과 공개 캔들 증거가 같은 영속 경로에 남는다.
 - 서비스 restart 전후 상태·중복 방지·journal 보존 시험이 통과한다.
-- 기존 legacy `.env`와 홈 트리가 변하지 않고 서비스가 접근할 수 없다.
+- 기존 legacy `.env`와 홈 트리가 변하지 않고 서비스가 직접 접근할 수 없다. 승인된 migration으로 분리한 Telegram 두 값만 root 전용 파일을 통해 주입된다.
 - 실전 잠금이 유지되고 실제 주문·개인 API 요청·키 사용이 0건이다.
 - 새 수신 포트, 유료 Shape 확장, 추가 Block Volume 같은 과금 가능 변경이 없다.
 

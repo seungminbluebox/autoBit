@@ -17,7 +17,7 @@ Get-Command pwsh, ssh, scp
 Get-Item -LiteralPath $IdentityFile | Select-Object FullName, Length, LastWriteTimeUtc
 ```
 
-서버의 SSH known-host 항목은 운영자가 이미 검증한 값이어야 한다. 다음 SSH 조회는 원격 상태를 바꾸지 않는다. `/home`의 legacy tree나 `.env`는 읽거나 hash하지 않으며, 필요한 경우 별도 승인된 preflight에서 `stat` metadata만 확인한다.
+서버의 SSH known-host 항목은 운영자가 이미 검증한 값이어야 한다. 다음 SSH 조회는 원격 상태를 바꾸지 않는다. 일반 배포와 preflight는 `/home`의 legacy tree나 `.env`를 읽거나 hash하지 않으며, 필요한 경우 별도 승인된 preflight에서 `stat` metadata만 확인한다. 아래 2.1의 명시적으로 승인된 Telegram 1회 migration만 이 규칙의 좁은 예외다.
 
 ```powershell
 $SshOptions = @("-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes", "-i", $IdentityFile)
@@ -46,9 +46,20 @@ Prepare 성공은 활성화 승인이 아니다. 이 시점에 현재 서비스�
 
 Prepare가 실패하면 출력된 `/opt/autobit/releases/.staging-<40자리 commit>-<pid>`와 `/tmp/autobit-prepare.<8자리 suffix>`를 진단 증거로 보존한다. 도구 게시 전 실패라면 `/opt/autobit/tools/<kind>/<version>.staging-<pid>`도 출력될 수 있다. 출력된 경로가 이미 최종 도구 경로로 게시되어 존재하지 않을 수도 있으므로 실제 존재 여부를 읽기 전용으로 확인한다. 경로를 추측해 삭제하거나 같은 명령을 반복하지 말고, 실패 지점과 권한·소유권을 읽기 전용으로 조사한다. 수정된 새 remote `main` 커밋으로 다시 Prepare하기 전에는 변경 범위를 다시 보고하고 승인을 받으며, 보존된 실패 증거의 삭제도 정확한 경로를 확인한 뒤 별도로 승인받는다.
 
+### 2.1 승인된 기존 Telegram 값의 1회 분리
+
+Telegram 연결을 사용자가 명시적으로 승인한 경우에만 준비된 정확한 릴리스의 migration 도구를 한 번 실행한다. 이 도구는 legacy `.env`를 shell로 source하거나 실행하지 않는다. `TELEGRAM_TOKEN`과 `TELEGRAM_CHAT_ID`만 읽어 형식을 검증하고 이름을 `AUTOBIT_TELEGRAM_TOKEN`과 `AUTOBIT_TELEGRAM_CHAT_ID`로 바꿔 `/etc/autobit/paper-notify.env`에 원자적으로 기록한다. `UPBIT_ACCESS_KEY`, `UPBIT_SECRET_KEY`와 그 밖의 값은 복사하지 않는다. 비밀값은 stdout, stderr, 명령줄이나 journal에 출력하지 않는다.
+
+```powershell
+ssh @SshOptions "ubuntu@$HostName" "sudo env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 /opt/autobit/releases/$Commit/deploy/oci/telegram_credentials.py"
+ssh @SshOptions "ubuntu@$HostName" "sudo stat -c '%n|%F|%a|%U:%G|%s' /etc/autobit /etc/autobit/paper-notify.env"
+```
+
+성공 조건은 디렉터리 `/etc/autobit`가 `root:root` 모드 `0700`, 파일이 `root:root` 모드 `0600`인 것이다. 파일 내용은 `cat`, hash, shell source로 확인하지 않는다. 도구는 기존 목적 파일을 덮어쓰지 않으므로 이미 존재하면 중단하고 별도 회전 절차를 설계한다. 원본 legacy `.env`는 읽기 전후 metadata가 같아야 한다.
+
 ## 3. Activate: 별도 변경 승인 뒤 실행
 
-`server-change approval`을 별도로 받은 뒤에만 다음 명령을 실행한다. Activate는 기존 paper 서비스를 정상 종료하고, 닫힌 원장 backup bundle을 만들고, unit/journald 설정을 설치한 뒤 `current`를 원자적으로 바꾸고 서비스를 enable/start한다. journald가 재시작될 수 있다.
+`server-change approval`을 별도로 받은 뒤에만 다음 명령을 실행한다. Telegram-enabled 릴리스의 Activate는 서비스 정지 전에 `/etc/autobit/paper-notify.env`가 root 소유 모드 `0600`이며 정확히 두 Telegram 변수만 포함하는지 검사한다. 검증 뒤 기존 paper 서비스를 정상 종료하고, 닫힌 원장 backup bundle을 만들고, unit/journald 설정을 설치한 뒤 `current`를 원자적으로 바꾸고 서비스를 enable/start한다. journald가 재시작될 수 있다.
 
 ```powershell
 & ".\deploy\oci\Deploy-OciPaper.ps1" -Mode Activate -Commit $Commit -HostName $HostName -User ubuntu -IdentityFile $IdentityFile
@@ -72,7 +83,7 @@ ssh @SshOptions "ubuntu@$HostName" 'sudo -u autobit env -i PATH=/usr/bin:/bin HO
 ssh @SshOptions "ubuntu@$HostName" 'sudo journalctl -u autobit-paper.service --no-pager'
 ```
 
-`systemctl status`는 active 상태와 단일 MainPID를, `paper-status`는 `market=KRW-BTC`, `mode=normalized-paper`와 ledger health를 보여야 한다. journal은 현재 invocation의 기록을 포함해야 한다.
+`systemctl status`는 active 상태와 단일 MainPID를, `paper-status`는 `market=KRW-BTC`, `mode=normalized-paper`와 ledger health를 보여야 한다. 실행 인수에는 Telegram 환경변수의 **이름**만 있고 값은 없어야 한다. journal은 현재 invocation의 기록을 포함해야 하며 알림 실패도 비밀값이나 예외 원문 없이 안전 코드로만 남아야 한다.
 
 ## 5. Inspect와 통제된 service restart 증거
 
@@ -94,7 +105,8 @@ ssh @SshOptions "ubuntu@$HostName" 'sudo bash /opt/autobit/current/deploy/oci/ve
 
 ## 6. 보안·보존·OCI 경계
 
-- `/home`의 legacy `.env`는 사용하지 않는다. systemd unit에는 `EnvironmentFile`이 없고 legacy tree의 내용은 읽지 않는다.
+- systemd는 `/home`의 legacy `.env`를 직접 사용하지 않는다. 승인된 1회 migration만 그 파일에서 두 Telegram 값을 분리하며, 이후 서비스는 `/etc/autobit/paper-notify.env`만 `EnvironmentFile`로 읽는다. legacy 원본은 수정하지 않고 `ProtectHome=true`를 유지한다.
+- `/etc/autobit/paper-notify.env`에는 `AUTOBIT_TELEGRAM_TOKEN`과 `AUTOBIT_TELEGRAM_CHAT_ID`만 허용한다. 파일은 `root:root` 모드 `0600`이며 Upbit 키를 포함하면 Activate 전에 실패한다.
 - live는 자격증명 접근·인증 요청·주문 전에 계속 잠겨 있다. OCI 서비스와 이 runbook은 paper-only 경계를 해제하지 않는다.
 - journald의 `Storage`, `SystemMaxUse`, `SystemKeepFree`, retention 설정은 host 전체에 적용되는 global limits다. 다른 unit의 로그 영향까지 검토한 별도 승인 없이 바꾸지 않는다.
 - `/var/backups/autobit`의 same-volume backup은 실수와 code 전환 증거에는 유용하지만 boot volume 장애나 disk loss를 보호하지 않는다.

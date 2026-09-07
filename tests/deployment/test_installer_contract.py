@@ -17,7 +17,8 @@ COMMIT = "1" * 40
 REQUIRED = (
     "deploy/oci/runtime.env", "deploy/oci/systemd/autobit-paper.service",
     "deploy/oci/journald/99-autobit-persistence.conf", "deploy/oci/sqlite_tools.py",
-    "deploy/oci/libdeploy.sh", "deploy/oci/install-release.sh", "uv.lock", "pyproject.toml",
+    "deploy/oci/libdeploy.sh", "deploy/oci/install-release.sh",
+    "deploy/oci/telegram_credentials.py", "uv.lock", "pyproject.toml",
 )
 
 

@@ -72,6 +72,7 @@ def candidate(base, *, metadata=True):
     (deploy / "systemd").mkdir(parents=True)
     (deploy / "journald").mkdir()
     shutil.copyfile(SQLITE_TOOLS, deploy / "sqlite_tools.py")
+    (deploy / "telegram_credentials.py").write_text("# migration tool\n")
     (deploy / "systemd/autobit-paper.service").write_text("[Service]\n")
     (deploy / "journald/99-autobit-persistence.conf").write_text("[Journal]\n")
     for path in deploy.rglob("*"):
@@ -630,6 +631,8 @@ with tempfile.TemporaryDirectory(prefix="autobit-service-command-") as fixture:
         "/opt/autobit/current/.venv/bin/python", "-m", "autobit.cli", "paper-run",
         "--db", "/var/lib/autobit/paper/paper.sqlite3",
         "--data-dir", "/var/lib/autobit/raw/paper",
+        "--telegram-token-env", "AUTOBIT_TELEGRAM_TOKEN",
+        "--telegram-chat-env", "AUTOBIT_TELEGRAM_CHAT_ID",
     ]
     def check(arguments):
         (proc / "cmdline").write_bytes(b"\0".join(value.encode() for value in arguments) + b"\0")
@@ -649,5 +652,76 @@ with tempfile.TemporaryDirectory(prefix="autobit-service-command-") as fixture:
     )
     for arguments in near_matches:
         assert check(arguments).returncode != 0, arguments
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_candidate_missing_telegram_migration_tool_is_refused():
+    result = _run_linux_python(HARNESS + r'''
+with tempfile.TemporaryDirectory(prefix="autobit-readiness-telegram-") as fixture:
+    base = Path(fixture)
+    release = candidate(base)
+    (release / "deploy/oci/telegram_credentials.py").unlink()
+    operation = run('validate_release_candidate\n', base)
+    assert operation.returncode != 0
+    assert "telegram_credentials.py" in operation.stderr
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_notification_config_requires_exact_private_two_key_file():
+    result = _run_linux_python(HARNESS + r'''
+with tempfile.TemporaryDirectory(prefix="autobit-notification-config-") as fixture:
+    base = Path(fixture)
+    config = base / "paper-notify.env"
+    uid = os.getuid()
+
+    def check(payload, mode=0o600):
+        config.write_text(payload)
+        config.chmod(mode)
+        operation = run(
+            f'validate_notification_config "$fixture/paper-notify.env" {uid} {os.getgid()}\n',
+            base,
+        )
+        config.unlink()
+        return operation
+
+    valid = check(
+        "AUTOBIT_TELEGRAM_TOKEN=123456789:abcdefghijklmnopqrstuvwxyz_ABCD\n"
+        "AUTOBIT_TELEGRAM_CHAT_ID=-123456789\n"
+    )
+    assert valid.returncode == 0, valid.stderr
+
+    invalid_payloads = (
+        "AUTOBIT_TELEGRAM_TOKEN=123456789:abcdefghijklmnopqrstuvwxyz_ABCD\n",
+        "AUTOBIT_TELEGRAM_CHAT_ID=-123456789\n",
+        "AUTOBIT_TELEGRAM_TOKEN=token\nAUTOBIT_TELEGRAM_CHAT_ID=-123\n",
+        "AUTOBIT_TELEGRAM_TOKEN=123456789:abcdefghijklmnopqrstuvwxyz_ABCD\n"
+        "AUTOBIT_TELEGRAM_CHAT_ID=-123456789\nUPBIT_ACCESS_KEY=forbidden\n",
+        "AUTOBIT_TELEGRAM_TOKEN=123456789:abcdefghijklmnopqrstuvwxyz_ABCD\n"
+        "AUTOBIT_TELEGRAM_TOKEN=123456789:abcdefghijklmnopqrstuvwxyz_ABCD\n"
+        "AUTOBIT_TELEGRAM_CHAT_ID=-123456789\n",
+    )
+    for payload in invalid_payloads:
+        rejected = check(payload)
+        assert rejected.returncode != 0, payload
+
+    public = check(
+        "AUTOBIT_TELEGRAM_TOKEN=123456789:abcdefghijklmnopqrstuvwxyz_ABCD\n"
+        "AUTOBIT_TELEGRAM_CHAT_ID=-123456789\n",
+        mode=0o644,
+    )
+    assert public.returncode != 0
+
+    config.write_text(
+        "AUTOBIT_TELEGRAM_TOKEN=123456789:abcdefghijklmnopqrstuvwxyz_ABCD\n"
+        "AUTOBIT_TELEGRAM_CHAT_ID=-123456789\n"
+    )
+    config.chmod(0o600)
+    wrong_group = run(
+        f'validate_notification_config "$fixture/paper-notify.env" {uid} {os.getgid() + 1}\n',
+        base,
+    )
+    assert wrong_group.returncode != 0
 ''')
     assert result.returncode == 0, result.stdout + result.stderr

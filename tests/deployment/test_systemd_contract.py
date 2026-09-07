@@ -13,14 +13,17 @@ def _read_unit(relative_path: str) -> configparser.RawConfigParser:
     return parser
 
 
-def test_service_is_paper_only_and_home_is_inaccessible():
+def test_service_is_paper_only_and_loads_only_dedicated_telegram_credentials():
     unit = _read_unit("deploy/oci/systemd/autobit-paper.service")
     service = unit["Service"]
     assert service["ExecStart"] == (
         "/opt/autobit/current/.venv/bin/python -m autobit.cli paper-run "
         "--db /var/lib/autobit/paper/paper.sqlite3 "
-        "--data-dir /var/lib/autobit/raw/paper"
+        "--data-dir /var/lib/autobit/raw/paper "
+        "--telegram-token-env AUTOBIT_TELEGRAM_TOKEN "
+        "--telegram-chat-env AUTOBIT_TELEGRAM_CHAT_ID"
     )
+    assert service["EnvironmentFile"] == "/etc/autobit/paper-notify.env"
     assert service["User"] == service["Group"] == "autobit"
     assert service["Restart"] == "always"
     assert service["KillSignal"] == "SIGINT"
@@ -28,9 +31,10 @@ def test_service_is_paper_only_and_home_is_inaccessible():
     assert service["ProtectSystem"] == "strict"
     assert service["ReadWritePaths"] == "/var/lib/autobit"
     text = (ROOT / "deploy/oci/systemd/autobit-paper.service").read_text(encoding="utf-8")
-    assert "EnvironmentFile" not in text
+    assert "/home/ubuntu/autoBit/.env" not in text
+    assert "UPBIT_ACCESS_KEY" not in text
+    assert "UPBIT_SECRET_KEY" not in text
     assert " live" not in text.lower()
-    assert "telegram" not in text.lower()
 
 
 def test_service_has_exact_restart_shutdown_and_resource_controls():

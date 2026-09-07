@@ -223,11 +223,8 @@ def _assert_oci_deployment_surface_is_safe(
         path.read_text(encoding="utf-8", errors="strict") for path in files
     )
     forbidden = (
-        "EnvironmentFile",
         "UPBIT_ACCESS_KEY",
         "UPBIT_SECRET_KEY",
-        "--telegram-token-env",
-        "--telegram-chat-env",
         "autobit.cli live",
         "/v1/orders",
         "/v1/accounts",
@@ -244,6 +241,9 @@ def _assert_oci_deployment_surface_is_safe(
     assert not re.search(r"\bSHA256:[A-Za-z0-9+/=]+", combined)
     assert "paper-run" in service_text
     assert "ProtectHome=true" in service_text
+    assert "EnvironmentFile=/etc/autobit/paper-notify.env" in service_text
+    assert "--telegram-token-env AUTOBIT_TELEGRAM_TOKEN" in service_text
+    assert "--telegram-chat-env AUTOBIT_TELEGRAM_CHAT_ID" in service_text
 
 
 def test_oci_deployment_surface_cannot_activate_live_or_load_secrets() -> None:

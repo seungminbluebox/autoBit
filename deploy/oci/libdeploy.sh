@@ -269,6 +269,7 @@ commit = sys.argv[2]
 required = (
     (".autobit-release", False),
     ("deploy/oci/sqlite_tools.py", False),
+    ("deploy/oci/telegram_credentials.py", False),
     ("deploy/oci/systemd/autobit-paper.service", False),
     ("deploy/oci/journald/99-autobit-persistence.conf", False),
 )
@@ -352,6 +353,52 @@ for cmdline_path in proc_root.glob("[0-9]*/cmdline"):
     )
     if is_paper_run and uses_ledger:
         raise SystemExit("paper ledger writer remains active")
+PY
+}
+
+validate_notification_config() {
+    local path="$1" expected_uid="$2" expected_gid="$3"
+    /usr/bin/python3 - "$path" "$expected_uid" "$expected_gid" <<'PY'
+from pathlib import Path
+import os
+import re
+import stat
+import sys
+
+path = Path(sys.argv[1])
+expected_uid = int(sys.argv[2])
+expected_gid = int(sys.argv[3])
+try:
+    info = path.lstat()
+except FileNotFoundError:
+    raise SystemExit("notification environment is missing")
+if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_uid != expected_uid
+    or info.st_gid != expected_gid
+    or info.st_nlink != 1
+    or stat.S_IMODE(info.st_mode) != 0o600
+):
+    raise SystemExit("notification environment must be a private trusted file")
+data = path.read_bytes()
+if not data.endswith(b"\n") or b"\r" in data or b"\0" in data or len(data) > 4096:
+    raise SystemExit("notification environment has invalid bytes")
+try:
+    lines = data.decode("ascii").splitlines()
+except UnicodeDecodeError:
+    raise SystemExit("notification environment must be ASCII")
+values = {}
+for line in lines:
+    name, separator, value = line.partition("=")
+    if not separator or name in values or not value:
+        raise SystemExit("notification environment has invalid assignments")
+    values[name] = value
+if set(values) != {"AUTOBIT_TELEGRAM_TOKEN", "AUTOBIT_TELEGRAM_CHAT_ID"}:
+    raise SystemExit("notification environment must contain only Telegram keys")
+if re.fullmatch(r"[1-9][0-9]{5,19}:[A-Za-z0-9_-]{20,128}", values["AUTOBIT_TELEGRAM_TOKEN"]) is None:
+    raise SystemExit("notification token has an invalid shape")
+if re.fullmatch(r"-?[1-9][0-9]{0,19}", values["AUTOBIT_TELEGRAM_CHAT_ID"]) is None:
+    raise SystemExit("notification chat ID has an invalid shape")
 PY
 }
 
@@ -603,6 +650,8 @@ arguments = command[:-1].split(b"\0")
 expected = [
     python.encode(), b"-m", b"autobit.cli", b"paper-run",
     b"--db", ledger.encode(), b"--data-dir", data.encode(),
+    b"--telegram-token-env", b"AUTOBIT_TELEGRAM_TOKEN",
+    b"--telegram-chat-env", b"AUTOBIT_TELEGRAM_CHAT_ID",
 ]
 if arguments != expected:
     raise SystemExit(1)
@@ -737,6 +786,7 @@ activate_transaction() {
     candidate_start_attempted=0
 
     validate_release_candidate
+    validate_notification_config /etc/autobit/paper-notify.env 0 0
     if [ -L "$current_link" ]; then
         previous_release=$(readlink -- "$current_link")
         previous_commit=${previous_release#/opt/autobit/releases/}
