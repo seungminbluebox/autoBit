@@ -133,3 +133,38 @@ def test_migration_rejects_symlink_source_and_existing_destination(tmp_path):
             trusted_gid=_trusted_gid(destination_dir),
         )
     assert destination.read_bytes() == before
+
+
+def test_migration_never_overwrites_destination_created_during_publish(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    source = tmp_path / "legacy.env"
+    source.write_text(
+        "TELEGRAM_TOKEN=123456789:abcdefghijklmnopqrstuvwxyz_ABCD\n"
+        "TELEGRAM_CHAT_ID=-123456789\n",
+        encoding="utf-8",
+    )
+    destination_dir = tmp_path / "etc-autobit"
+    destination_dir.mkdir(mode=0o700)
+    destination_dir.chmod(0o700)
+    destination = destination_dir / "paper-notify.env"
+    competitor_payload = b"keep-concurrently-created\n"
+    real_link = module.os.link
+
+    def create_competitor_then_link(source_path, destination_path):
+        destination.write_bytes(competitor_payload)
+        return real_link(source_path, destination_path)
+
+    monkeypatch.setattr(module.os, "link", create_competitor_then_link)
+
+    with pytest.raises(FileExistsError):
+        module.migrate_legacy_telegram(
+            source,
+            destination,
+            trusted_uid=_trusted_uid(destination_dir),
+            trusted_gid=_trusted_gid(destination_dir),
+        )
+
+    assert destination.read_bytes() == competitor_payload

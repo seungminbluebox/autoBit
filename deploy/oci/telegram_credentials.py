@@ -95,6 +95,18 @@ def _validate_destination_parent(path: Path, trusted_uid: int, trusted_gid: int)
         raise ValueError("notification directory must have mode 0700")
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist a completed directory-entry update on the production POSIX host."""
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def migrate_legacy_telegram(
     source: Path,
     destination: Path,
@@ -132,9 +144,12 @@ def migrate_legacy_telegram(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-        if os.path.lexists(destination):
-            raise FileExistsError("notification environment appeared during migration")
-        os.replace(temporary, destination)
+        # A hard-link publish is atomic and fails if another invocation created
+        # destination after the earlier check. Unlike os.replace(), it can never
+        # overwrite credentials that are already installed.
+        os.link(temporary, destination)
+        temporary.unlink()
+        _fsync_directory(parent)
         installed = destination.lstat()
         if (
             not stat.S_ISREG(installed.st_mode)
