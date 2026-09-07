@@ -96,3 +96,56 @@ def test_research_request_keeps_phase_boundaries_and_ignores_future_prices():
     assert request.config.strategy.trailing_atr_mult==4.0
     assert request.config.force_liquidate_at_end
     assert request.config.risk.hard_drawdown==0.15
+
+
+def test_provenance_uses_only_fixed_read_only_commands(monkeypatch, tmp_path):
+    import importlib.metadata
+    import subprocess
+    from tools.research.provenance import read_provenance
+
+    calls = []
+    responses = iter((b'a.py\0b.py\0', b'', b'abc123\n'))
+    def capture(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return next(responses)
+    packages = []
+    def version(name):
+        packages.append(name)
+        return '1.0'
+    monkeypatch.setattr(subprocess, 'check_output', capture)
+    monkeypatch.setattr(importlib.metadata, 'version', version)
+    result = read_provenance(tmp_path)
+    assert calls == [
+        (['git', '--no-optional-locks', 'ls-files', '-z'], {'cwd': tmp_path}),
+        (['git', '--no-optional-locks', 'status', '--porcelain', '--untracked-files=no'], {'cwd': tmp_path}),
+        (['git', '--no-optional-locks', 'rev-parse', 'HEAD'], {'cwd': tmp_path}),
+    ]
+    assert result == {'tracked': ['a.py', 'b.py'], 'commit': 'abc123',
+                      'dependencies': {p: '1.0' for p in packages}}
+    assert packages == ['backtrader', 'pandas', 'numpy', 'pandas-ta', 'scipy', 'httpx']
+
+
+def test_provenance_refuses_dirty_or_failed_git_reads(monkeypatch, tmp_path):
+    import subprocess
+    from tools.research.provenance import read_provenance
+
+    responses = iter((b'a.py\0', b' M a.py\n'))
+    monkeypatch.setattr(subprocess, 'check_output', lambda *a, **k: next(responses))
+    with pytest.raises(ValueError, match='commit tracked changes'):
+        read_provenance(tmp_path)
+    def failed(*a, **k):
+        raise subprocess.CalledProcessError(1, 'git')
+    monkeypatch.setattr(subprocess, 'check_output', failed)
+    with pytest.raises(subprocess.CalledProcessError):
+        read_provenance(tmp_path)
+
+
+def test_source_check_rejects_research_metadata_from_another_checkout(monkeypatch, tmp_path):
+    from pathlib import Path
+    import sys
+    from types import SimpleNamespace
+    from tools.research.run_experiment import validate_source_imports
+    monkeypatch.setitem(sys.modules, 'tools.research.provenance',
+                        SimpleNamespace(__file__=str(tmp_path / 'provenance.py')))
+    with pytest.raises(ValueError, match='different checkout'):
+        validate_source_imports(Path(__file__).resolve().parents[2])

@@ -8,13 +8,12 @@ from dataclasses import replace
 from datetime import datetime
 import gzip
 import hashlib
-import importlib.metadata
 import json
 from pathlib import Path
-import subprocess
 import sys
 import zipfile
 from uuid import uuid4
+from tools.research.provenance import read_provenance
 
 from autobit.backtest.engine import BacktestConfig, BacktestResult, EquityPoint, OrderRecord, TradeRecord, run_backtest
 from autobit.backtest.analyzers import calculate_metrics
@@ -72,13 +71,17 @@ def prepare_output(output, manifest, resume=False):
 
 
 def validate_source_imports(root):
-    expected = (root / 'src').resolve()
     for name, module in tuple(sys.modules.items()):
         if name == 'autobit' or name.startswith('autobit.'):
-            origin = getattr(module, '__file__', None)
-            origins = [origin] if origin else list(getattr(module, '__path__', ()))
-            if not origins or any(not Path(p).resolve().is_relative_to(expected) for p in origins):
-                raise ValueError('autobit import came from a different checkout; set PYTHONPATH to this checkout/src')
+            expected = (root / 'src' / 'autobit').resolve()
+        elif name == 'tools.research' or name.startswith('tools.research.'):
+            expected = (root / 'tools' / 'research').resolve()
+        else:
+            continue
+        origin = getattr(module, '__file__', None)
+        origins = [origin] if origin else list(getattr(module, '__path__', ()))
+        if not origins or any(not Path(p).resolve().is_relative_to(expected) for p in origins):
+            raise ValueError('research import came from a different checkout; set PYTHONPATH to this checkout/src and root')
 
 
 def save_cell(path, result, identity=None):
@@ -173,18 +176,15 @@ def main():
         raise ValueError('at least two complete folds required')
     costs = tuple(c for c in registered_cost_scenarios() if c.cost_id in ('baseline','stress_20bps'))
     trial = registered_trials()[0]
-    tracked = subprocess.check_output(['git','ls-files','-z'],cwd=root).decode().split('\0')
-    snapshot = {name: _hash((root/name).read_bytes()) for name in tracked if name}
-    dirty = subprocess.check_output(['git','status','--porcelain','--untracked-files=no'],cwd=root).decode()
-    if dirty:
-        raise ValueError('commit tracked changes before recording an experiment')
+    provenance = read_provenance(root)
+    snapshot = {name: _hash((root/name).read_bytes()) for name in provenance['tracked']}
     manifest = {
         'schema': 2, 'research_id': 'R20260908', 'evaluation': 'EXPLORATORY_NOT_OFFICIAL_PASS',
-        'commit': subprocess.check_output(['git','rev-parse','HEAD'],cwd=root).decode().strip(),
+        'commit': provenance['commit'],
         'data_sha256': _hash(args.input.read_bytes()), 'source_files': snapshot,
         'quality_sha256': _hash(args.input.with_name('quality.json').read_bytes()),
         'python': sys.version,
-        'dependencies': {p:importlib.metadata.version(p) for p in ('backtrader','pandas','numpy','pandas-ta','scipy','httpx')},
+        'dependencies': provenance['dependencies'],
         'configs': {n:candidate_config(BacktestConfig(),n) for n in CANDIDATES},
         'costs': costs, 'split': WalkForwardConfig(),
         'folds': [{'id':f.fold_id,'train_start':f.train_start.isoformat(),'train_end':f.train_end.isoformat(),

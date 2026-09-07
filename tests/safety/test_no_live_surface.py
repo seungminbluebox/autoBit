@@ -189,6 +189,24 @@ _LIVE_API_URLS = tuple('https://api.upbit.com' + path for path in (
     '/v1/accounts', '/v1/order', '/v1/orders', '/v1/orders/chance',
 ))
 
+# Separate from locked-live allowances: exactly three fixed local Git reads and
+# six installed-version reads. Runtime tests assert argv/cwd and dirty/error
+# rejection; fingerprint mutation/copy tests keep the general import ban intact.
+_AUDITED_RESEARCH_AST = {
+    'tools/research/provenance.py': '4177fcd860cc15920c62f2db097be8e2473048e6eb8461747863918f1cf2e19f',
+}
+
+
+def _audited_research_scan(label: str, source: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    try:
+        tree = ast.parse(source, filename=label)
+    except SyntaxError:
+        return (f'{label}: invalid audited research metadata source',), ()
+    fingerprint = hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
+    if fingerprint != _AUDITED_RESEARCH_AST[_surface_path(label)]:
+        return (f'{label}: unaudited change to read-only research metadata boundary',), ()
+    return (), ()
+
 
 def _audited_live_scan(label: str, source: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     path = _surface_path(label)
@@ -1115,6 +1133,8 @@ def _python_surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tupl
 def _surface_scan(label: str, source: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if _surface_path(label) in _AUDITED_LIVE_AST:
         return _audited_live_scan(label, source)
+    if _surface_path(label) in _AUDITED_RESEARCH_AST:
+        return _audited_research_scan(label, source)
     if label.lower().endswith(".py"):
         return _python_surface_scan(label, source)
     lowered = source.lower()
@@ -1245,6 +1265,30 @@ def test_repository_source_has_only_the_audited_locked_live_surface() -> None:
         violations.extend(surface_violations)
 
     assert violations == []
+
+
+@pytest.mark.parametrize('surface', ('index', 'worktree'))
+def test_research_metadata_boundary_accepts_only_reviewed_source(surface):
+    source = Path('tools/research/provenance.py').read_text(encoding='utf-8')
+    assert _surface_scan(f'{surface}:tools/research/provenance.py', source) == ((), ())
+    violations, _ = _surface_scan(f'{surface}:tools/research/copied_provenance.py', source)
+    assert any('forbidden import: subprocess' in item for item in violations)
+
+
+@pytest.mark.parametrize('surface', ('index', 'worktree'))
+@pytest.mark.parametrize('mutation', ('command', 'shell', 'network', 'syntax'))
+def test_research_metadata_boundary_rejects_every_unaudited_change(surface, mutation):
+    source = Path('tools/research/provenance.py').read_text(encoding='utf-8')
+    changed = {
+        'command': source.replace("'ls-files', '-z'", "'push', 'origin'"),
+        'shell': source.replace('cwd=root,', 'cwd=root, shell=True,'),
+        'network': source + '\nimport httpx\n',
+        'syntax': source + '\nthis is invalid syntax !\n',
+    }[mutation]
+    assert changed != source
+    violations, urls = _surface_scan(f'{surface}:tools/research/provenance.py', changed)
+    assert violations
+    assert not urls
 
 
 def test_network_api_urls_are_public_or_exact_audited_locked_live_contracts() -> None:
