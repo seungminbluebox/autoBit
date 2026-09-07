@@ -14,6 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 import zipfile
+from uuid import uuid4
 
 from autobit.backtest.engine import BacktestConfig, BacktestResult, EquityPoint, OrderRecord, TradeRecord, run_backtest
 from autobit.backtest.analyzers import calculate_metrics
@@ -36,6 +37,11 @@ def candidate_config(base, name):
     if name not in changes:
         raise ValueError('unregistered candidate')
     return replace(base, strategy=replace(base.strategy, **changes[name]))
+
+
+def research_request(frame, fold, cost, phase, name):
+    request=_request_for_phase(frame,fold=fold,trial=registered_trials()[0],cost=cost,phase=phase)
+    return replace(request,config=candidate_config(request.config,name))
 
 
 def _bytes(value):
@@ -65,20 +71,32 @@ def prepare_output(output, manifest, resume=False):
         (output / 'experiment.json').write_bytes(expected)
 
 
-def save_cell(path, result):
-    payload = gzip.compress(_bytes(result), mtime=0)
+def validate_source_imports(root):
+    expected = (root / 'src').resolve()
+    for name, module in tuple(sys.modules.items()):
+        if name == 'autobit' or name.startswith('autobit.'):
+            origin = getattr(module, '__file__', None)
+            if origin is None or not Path(origin).resolve().is_relative_to(expected):
+                raise ValueError('autobit import came from a different checkout; set PYTHONPATH to this checkout/src')
+
+
+def save_cell(path, result, identity=None):
+    payload = gzip.compress(_bytes({'identity':identity,'result':result}), mtime=0)
     with path.open('xb') as stream:
         stream.write(payload)
     with path.with_suffix(path.suffix + '.sha256').open('x', encoding='ascii') as stream:
         stream.write(_hash(payload))
 
 
-def load_cell(path):
+def load_cell(path, identity=None):
     payload = path.read_bytes()
     checksum = path.with_suffix(path.suffix + '.sha256')
     if not checksum.is_file() or _hash(payload) != checksum.read_text(encoding='ascii'):
         raise ValueError('cell checksum mismatch; preserve and investigate')
-    raw = json.loads(gzip.decompress(payload))
+    envelope = json.loads(gzip.decompress(payload))
+    if envelope['identity'] != _json_value(identity):
+        raise ValueError('cell identity mismatch')
+    raw = envelope['result']
     for item in raw['equity_curve']:
         item['timestamp'] = datetime.fromisoformat(item['timestamp'])
     for item in raw['orders']:
@@ -102,13 +120,41 @@ def _metrics(result):
                              total_slippage=result.total_slippage)
 
 
-def _cell(path, frame, config, request=None):
-    result = load_cell(path) if path.exists() else run_backtest(frame, config)
+def _cell(path, frame, config, request=None, identity=None):
+    result = load_cell(path,identity) if path.exists() else run_backtest(frame, config)
     if request is not None:
         _validate_backtest_result(result, request)
     if not path.exists():
-        save_cell(path, result)
+        save_cell(path, result,identity)
     return result
+
+
+def _write_or_verify(path, value):
+    if path.exists():
+        if path.read_bytes() != _bytes(value):
+            raise ValueError('stored summary differs from validated cells')
+    else:
+        _write(path,value)
+
+
+def _report_bundle(path, identity, **kwargs):
+    marker=path/'complete.json'
+    if path.exists():
+        if not marker.is_file():
+            raise ValueError('incomplete report bundle; preserve and investigate')
+        record=json.loads(marker.read_bytes())
+        if record['identity'] != _json_value(identity):
+            raise ValueError('report identity mismatch')
+        names={p.name for p in path.iterdir() if p.name!='complete.json'}
+        if names!=set(record['files']) or any(_hash((path/n).read_bytes())!=h for n,h in record['files'].items()):
+            raise ValueError('report checksum mismatch')
+        return
+    # Incomplete staging directories are preserved; a later resume can publish a fresh one.
+    staging=path.with_name(path.name+'.staging-'+uuid4().hex)
+    write_report_bundle(staging,**kwargs)
+    _write(staging/'complete.json',{'identity':identity,'files':{
+        p.name:_hash(p.read_bytes()) for p in staging.iterdir() if p.is_file()}})
+    staging.rename(path)
 
 
 def main():
@@ -118,6 +164,7 @@ def main():
     parser.add_argument('--resume', action='store_true')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
+    validate_source_imports(root)
     frame = _read_walk_forward_csv(args.input)
     quality = _load_quality_provenance(args.input, len(frame))
     folds = tuple(build_rolling_folds(frame.index, WalkForwardConfig()))
@@ -131,7 +178,7 @@ def main():
     if dirty:
         raise ValueError('commit tracked changes before recording an experiment')
     manifest = {
-        'schema': 1, 'research_id': 'R20260908', 'evaluation': 'EXPLORATORY_NOT_OFFICIAL_PASS',
+        'schema': 2, 'research_id': 'R20260908', 'evaluation': 'EXPLORATORY_NOT_OFFICIAL_PASS',
         'commit': subprocess.check_output(['git','rev-parse','HEAD'],cwd=root).decode().strip(),
         'data_sha256': _hash(args.input.read_bytes()), 'source_files': snapshot,
         'quality_sha256': _hash(args.input.with_name('quality.json').read_bytes()),
@@ -145,6 +192,7 @@ def main():
         'prior_exposure': 'Seven years and previous OOS results have already been inspected; not untouched holdout.',
     }
     prepare_output(args.output, manifest, args.resume)
+    experiment_hash=_hash(_bytes(manifest))
     archive = args.output/'source.zip'
     if not archive.exists():
         with zipfile.ZipFile(archive,'x',zipfile.ZIP_DEFLATED) as bundle:
@@ -172,20 +220,21 @@ def main():
             config=candidate_config(BacktestConfig(),name)
             config=replace(config,costs=replace(config.costs,fee_rate=cost.fee_rate,slippage_rate=cost.slippage_rate))
             enriched=compute_trend_indicators(frame,config.strategy)
-            full=_cell(folder/f'full-{cost.cost_id}.json.gz',enriched,config)
+            full_identity={'experiment':experiment_hash,'candidate':name,'cost':cost.cost_id,'phase':'FULL','config':config}
+            full=_cell(folder/f'full-{cost.cost_id}.json.gz',enriched,config,identity=full_identity)
             full_metrics=_metrics(full)
             report_dir=folder/f'full-{cost.cost_id}'
-            if not report_dir.exists():
-                write_report_bundle(report_dir,result=full,metrics=full_metrics,quality=quality,config=config,
-                    data_path=args.input,benchmark=run_buy_and_hold(enriched,config.costs),source_root=root/'src/autobit')
+            _report_bundle(report_dir,full_identity,result=full,metrics=full_metrics,quality=quality,config=config,
+                data_path=args.input,benchmark=run_buy_and_hold(enriched,config.costs),source_root=root/'src/autobit')
             runs=[]
             for fold in folds:
                 for phase in ('TRAIN','OOS'):
-                    request=_request_for_phase(frame,fold=fold,trial=trial,cost=cost,phase=phase)
-                    request=replace(request,config=candidate_config(request.config,name))
+                    request=research_request(frame,fold,cost,phase,name)
                     path=folder/f'{fold.fold_id}-{cost.cost_id}-{phase}.json.gz'
                     try:
-                        result=_cell(path,request.frame,request.config,request)
+                        identity={'experiment':experiment_hash,'candidate':name,'cost':cost.cost_id,
+                                  'fold':fold.fold_id,'phase':phase,'config':request.config}
+                        result=_cell(path,request.frame,request.config,request,identity)
                         runs.append(WalkForwardRun(phase,fold.fold_id,trial.trial_id,cost.cost_id,'COMPLETED',result,_metrics(result)))
                     except Exception as error:
                         failure=folder/f'{fold.fold_id}-{cost.cost_id}-{phase}-failure.json'
@@ -194,12 +243,13 @@ def main():
                         raise
                 print(f'{name} {cost.cost_id} {fold.fold_id} complete',flush=True)
             stitched=_stitch_oos(runs,folds,trial,cost)
+            oos_record={'candidate':name,'cost':cost.cost_id,'experiment':experiment_hash,'stitched':stitched}
             detail=folder/f'oos-{cost.cost_id}.json'
             if detail.exists():
-                if detail.read_bytes()!=_bytes(stitched):
+                if detail.read_bytes()!=_bytes(oos_record):
                     raise ValueError('stored OOS differs from validated cells')
             else:
-                _write(detail,stitched)
+                _write(detail,oos_record)
             train=[r.metrics.sharpe_ratio for r in runs if r.phase=='TRAIN']
             oos=[r for r in runs if r.phase=='OOS']
             rows.append({'candidate':name,'cost':cost.cost_id,'full':full_metrics,
@@ -209,8 +259,7 @@ def main():
                          'fold_count':len(folds),'mean_train_sharpe':sum(train)/len(train),
                          'folds':[{'id':r.fold_id,'metrics':r.metrics} for r in oos]})
             summary=folder/f'summary-{cost.cost_id}.json'
-            if not summary.exists():
-                _write(summary,rows[-1])
+            _write_or_verify(summary,rows[-1])
     combined=args.output/'comparison.json'
     if not combined.exists():
         _write(combined,rows)

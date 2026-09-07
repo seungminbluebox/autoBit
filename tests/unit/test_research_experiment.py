@@ -43,3 +43,50 @@ def test_resume_requires_matching_manifest_and_never_adopts_unknown_folder(tmp_p
     with pytest.raises(ValueError, match='manifest'):
         prepare_output(unknown,{},resume=True)
     assert (unknown/'keep').read_text()=='mine'
+
+
+def test_cell_cannot_be_reused_for_another_candidate_or_cost(tmp_path):
+    result=BacktestResult((),(),(),100.,0.,0.)
+    path=tmp_path/'cell.json.gz'
+    save_cell(path,result,identity={'candidate':'baseline','cost':'baseline'})
+    with pytest.raises(ValueError, match='identity'):
+        load_cell(path,identity={'candidate':'trail_4atr','cost':'baseline'})
+
+
+def test_research_refuses_imports_from_a_different_checkout(tmp_path):
+    from tools.research.run_experiment import validate_source_imports
+    with pytest.raises(ValueError, match='checkout'):
+        validate_source_imports(tmp_path)
+
+
+def test_resume_rejects_incomplete_reports_and_changed_summaries(tmp_path):
+    from tools.research.run_experiment import _report_bundle, _write_or_verify
+    folder=tmp_path/'report'; folder.mkdir()
+    (folder/'summary.json').write_text('{}')
+    with pytest.raises(ValueError,match='incomplete report'):
+        _report_bundle(folder,{'candidate':'baseline'})
+    p=tmp_path/'summary.json'
+    _write_or_verify(p,{'equity':100})
+    with pytest.raises(ValueError,match='stored summary'):
+        _write_or_verify(p,{'equity':110})
+
+
+def test_research_request_keeps_phase_boundaries_and_ignores_future_prices():
+    import pandas as pd
+    from tools.research.run_experiment import research_request
+    from autobit.validation.splits import build_rolling_folds
+    from autobit.validation.models import WalkForwardConfig
+    from autobit.validation.trials import registered_cost_scenarios
+    index=pd.date_range('2020-01-01',periods=6000,freq='4h',tz='UTC')
+    frame=pd.DataFrame({'open':100.,'high':101.,'low':99.,'close':100.,'volume':10.},index=index)
+    fold=tuple(build_rolling_folds(index,WalkForwardConfig()))[0]
+    cost=registered_cost_scenarios()[1]
+    request=research_request(frame,fold,cost,'OOS','trail_4atr')
+    changed=frame.copy(); changed.loc[changed.index>=fold.test_end,'close']=99999.
+    replay=research_request(changed,fold,cost,'OOS','trail_4atr')
+    pd.testing.assert_frame_equal(request.frame,replay.frame)
+    assert request.frame.index.min()>=fold.test_start
+    assert request.frame.index.max()<fold.test_end
+    assert request.config.strategy.trailing_atr_mult==4.0
+    assert request.config.force_liquidate_at_end
+    assert request.config.risk.hard_drawdown==0.15
