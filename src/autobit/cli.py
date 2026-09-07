@@ -1707,15 +1707,30 @@ def _read_ohlcv(path: Path) -> pd.DataFrame:
     else:
         raise ValueError("input must be JSON or CSV")
 
-    rename = {
-        "candle_date_time_utc": "timestamp",
-        "opening_price": "open",
-        "high_price": "high",
-        "low_price": "low",
-        "trade_price": "close",
-        "candle_acc_trade_volume": "volume",
-    }
-    frame = frame.rename(columns=rename)
+    provider_columns = [
+        "candle_date_time_utc",
+        "opening_price",
+        "high_price",
+        "low_price",
+        "trade_price",
+        "candle_acc_trade_volume",
+    ]
+    canonical_columns = ["timestamp", "open", "high", "low", "close", "volume"]
+    attributes = frame.attrs.copy()
+    if set(provider_columns).issubset(frame.columns):
+        frame = frame.loc[:, provider_columns].rename(
+            columns={
+                "candle_date_time_utc": "timestamp",
+                "opening_price": "open",
+                "high_price": "high",
+                "low_price": "low",
+                "trade_price": "close",
+                "candle_acc_trade_volume": "volume",
+            }
+        )
+    elif set(canonical_columns).issubset(frame.columns):
+        frame = frame.loc[:, canonical_columns].copy()
+    frame.attrs = attributes
     if "timestamp" not in frame:
         raise ValueError("input must contain a timestamp column")
     frame.index = pd.to_datetime(frame.pop("timestamp"), utc=True, errors="raise")

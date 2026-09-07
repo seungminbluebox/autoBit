@@ -527,6 +527,102 @@ def test_runner_accepts_tiny_initial_equity_floating_point_drift() -> None:
     assert run.status == "COMPLETED"
 
 
+def test_runner_rejects_huge_quantity_mismatch_above_bounded_tolerance() -> None:
+    """Relative tolerance must not turn a one-BTC ledger error into rounding."""
+    request = _real_core_request(
+        _frame(3),
+        BacktestConfig(force_liquidate_at_end=True),
+    )
+    moment = request.frame.index[-1].to_pydatetime()
+    quantity = 1_000_000_000_000.0
+    result = _ledger_result(
+        request,
+        values=(100.0, 100.0, 100.0),
+        orders=(
+            *_filled_lifecycle(
+                order_id="huge-buy",
+                side="BUY",
+                quantity=quantity,
+                occurred_at=moment,
+                fill_price=100.0,
+            ),
+            *_filled_lifecycle(
+                order_id="huge-sell",
+                side="SELL",
+                quantity=quantity,
+                occurred_at=moment,
+                fill_price=100.0,
+            ),
+        ),
+        trades=(
+            TradeRecord(
+                entry_time=moment,
+                exit_time=moment,
+                quantity=quantity - 0.5,
+                entry_price=100.0,
+                exit_price=100.0,
+                gross_pnl=0.0,
+                net_pnl=0.0,
+                fees=0.0,
+                exit_reason="FORCED_END",
+            ),
+        ),
+        total_fees=0.0,
+    )
+
+    run = _run_request(request, lambda _: result)
+
+    assert run.status == "FAILED"
+    assert "trade" in (run.error or "")
+
+
+def test_runner_uses_one_scaled_tolerance_for_near_zero_inventory() -> None:
+    """A tolerated fill rounding residual must also count as flat inventory."""
+    request = _real_core_request(
+        _frame(3),
+        BacktestConfig(force_liquidate_at_end=True),
+    )
+    moment = request.frame.index[-1].to_pydatetime()
+    result = _ledger_result(
+        request,
+        values=(100.0, 100.0, 100.0),
+        orders=(
+            *_filled_lifecycle(
+                order_id="rounded-buy",
+                side="BUY",
+                quantity=1.0,
+                occurred_at=moment,
+                fill_price=100.0,
+            ),
+            *_filled_lifecycle(
+                order_id="rounded-sell",
+                side="SELL",
+                quantity=1.0 + 5e-13,
+                occurred_at=moment,
+                fill_price=100.0,
+            ),
+        ),
+        trades=(
+            TradeRecord(
+                entry_time=moment,
+                exit_time=moment,
+                quantity=1.0,
+                entry_price=100.0,
+                exit_price=100.0,
+                gross_pnl=0.0,
+                net_pnl=0.0,
+                fees=0.0,
+                exit_reason="FORCED_END",
+            ),
+        ),
+        total_fees=0.0,
+    )
+
+    run = _run_request(request, lambda _: result)
+
+    assert run.status == "COMPLETED", run.error
+
+
 def test_runner_retains_economically_inconsistent_order_and_trade_evidence() -> None:
     """A well-shaped ledger must still conserve inventory and closed trade quantity."""
     frame = _frame()
@@ -882,6 +978,26 @@ def test_runner_phase_validation_accepts_real_core_lifecycles(
     assert run.status == "COMPLETED", run.error
     assert run.result is not None
     assert run.result.equity_curve[0].equity == pytest.approx(request.initial_equity)
+
+
+def test_runner_accepts_real_partial_fills_with_sub_epsilon_crypto_quantities() -> None:
+    """Normalized equity can make a legitimate BTC remainder smaller than 1e-10."""
+    frame = _fixture("entry_next_open.csv").copy()
+    price_columns = ["open", "high", "low", "close"]
+    frame.loc[:, price_columns] = frame.loc[:, price_columns] * 1_000_000_000
+    request = _real_core_request(
+        frame,
+        BacktestConfig(force_liquidate_at_end=True),
+    )
+
+    run = _run_request(request, core_backtest)
+
+    assert run.status == "COMPLETED", run.error
+    assert run.result is not None
+    partial = next(
+        order for order in run.result.orders if order.status is OrderStatus.PARTIAL
+    )
+    assert 0.0 < partial.remainder_quantity < 1e-10
 
 
 def test_runner_phase_validation_accepts_real_core_same_bar_stop() -> None:

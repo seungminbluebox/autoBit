@@ -27,6 +27,23 @@ def _candle(timestamp: str, price: float = 100.0) -> dict[str, object]:
     }
 
 
+def _real_upbit_candle(timestamp: str, price: float = 100.0) -> dict[str, object]:
+    """Mirror every field returned by the real 240-minute candle endpoint."""
+    moment = pd.Timestamp(timestamp)
+    row = _candle(timestamp, price)
+    row.update(
+        {
+            "candle_date_time_kst": moment.tz_convert("Asia/Seoul").strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            ),
+            "timestamp": int(moment.timestamp() * 1_000),
+            "candle_acc_trade_price": price * 10.0,
+            "unit": 240,
+        }
+    )
+    return row
+
+
 class _ScriptedPublicClient:
     source_url = PUBLIC_CANDLE_URL
 
@@ -732,6 +749,42 @@ def test_data_quality_accepts_completed_evidence_chain_offline(tmp_path: Path) -
     assert main(["data-quality", "--input", str(evidence_root), "--output", str(output)]) == 0
 
     processed = pd.read_csv(output / "processed.csv")
+    assert processed["timestamp"].tolist() == [
+        "2026-01-01 00:00:00+00:00",
+        "2026-01-01 04:00:00+00:00",
+        "2026-01-01 08:00:00+00:00",
+    ]
+
+
+def test_data_quality_prefers_utc_time_over_real_upbit_epoch_timestamp(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "real-upbit-evidence"
+    _collect(
+        evidence_root,
+        _ScriptedPublicClient(
+            [
+                [
+                    _real_upbit_candle("2026-01-01T08:00:00Z", 108),
+                    _real_upbit_candle("2026-01-01T04:00:00Z", 104),
+                ],
+                [
+                    _real_upbit_candle("2026-01-01T04:00:00Z", 104),
+                    _real_upbit_candle("2026-01-01T00:00:00Z", 100),
+                    _real_upbit_candle("2025-12-31T20:00:00Z", 96),
+                ],
+            ]
+        ),
+    )
+    output = tmp_path / "quality"
+
+    assert main(["data-quality", "--input", str(evidence_root), "--output", str(output)]) == 0
+
+    processed = pd.read_csv(output / "processed.csv")
+    quality = json.loads((output / "quality.json").read_text(encoding="utf-8"))
+    assert processed.columns.tolist().count("timestamp") == 1
+    assert quality["quality"]["duplicates"] == 1
+    assert quality["quality"]["conflicting_duplicates"] == 0
     assert processed["timestamp"].tolist() == [
         "2026-01-01 00:00:00+00:00",
         "2026-01-01 04:00:00+00:00",

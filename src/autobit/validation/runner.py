@@ -36,6 +36,10 @@ from autobit.validation.trials import registered_cost_scenarios, registered_tria
 
 _CANDLE_FREQUENCY = pd.Timedelta(hours=4)
 _RECONCILIATION_TOLERANCE = 1e-10
+_QUANTITY_ABSOLUTE_TOLERANCE = 1e-18
+_QUANTITY_RELATIVE_TOLERANCE = 1e-12
+# Never let scale-based float forgiveness hide a material BTC ledger mismatch.
+_QUANTITY_MAX_TOLERANCE = 1e-12
 _PHASES: tuple[Literal["TRAIN", "OOS"], ...] = ("TRAIN", "OOS")
 _TRIAL_IDS = (
     "baseline",
@@ -664,8 +668,9 @@ def _validate_orders(orders: tuple[OrderRecord, ...], request: BacktestRequest) 
         requested, filled, remainder, fee, slippage = _finite_order_values(order)
         if requested <= 0.0 or filled < 0.0 or remainder < 0.0 or fee < 0.0 or slippage < 0.0:
             raise ValueError("backtest order quantities and costs must be nonnegative")
-        if filled > requested + 1e-10 or not math.isclose(
-            requested, filled + remainder, rel_tol=0.0, abs_tol=1e-10
+        quantity_tolerance = _quantity_tolerance(requested, filled, remainder)
+        if filled > requested + quantity_tolerance or not _quantity_close(
+            requested, filled + remainder
         ):
             raise ValueError("backtest order quantities must reconcile")
         occurred_at = _phase_timestamp(order.occurred_at, "backtest order occurred_at", request)
@@ -725,7 +730,7 @@ def _validate_orders(orders: tuple[OrderRecord, ...], request: BacktestRequest) 
         else:
             inventory -= fill.quantity
             sell_quantity += fill.quantity
-        if inventory < -_RECONCILIATION_TOLERANCE:
+        if inventory < -_quantity_tolerance(buy_quantity, sell_quantity):
             raise ValueError("backtest fills must not create negative BTC inventory")
     total_fees = sum(order.fee for order in final_orders)
     fill_fees = sum(fill.fee for fill in fills)
@@ -780,7 +785,7 @@ def _reconstruct_closed_trade_cycles(
 
     for fill in fills:
         if fill.side == "BUY":
-            if _close_enough(inventory, 0.0):
+            if _quantity_close(inventory, 0.0):
                 entry_time = fill.timestamp
             inventory += fill.quantity
             entry_quantity += fill.quantity
@@ -794,11 +799,13 @@ def _reconstruct_closed_trade_cycles(
         exit_notional += fill.notional
         exit_fees += fill.fee
         exit_slippage += fill.slippage
-        if inventory < -_RECONCILIATION_TOLERANCE:
+        if inventory < -_quantity_tolerance(entry_quantity, exit_quantity):
             raise ValueError("backtest fills must not create negative BTC inventory")
-        if not _close_enough(inventory, 0.0):
+        if not _quantity_close(
+            inventory, 0.0, entry_quantity, exit_quantity
+        ):
             continue
-        if entry_time is None or not _close_enough(entry_quantity, exit_quantity):
+        if entry_time is None or not _quantity_close(entry_quantity, exit_quantity):
             raise ValueError("backtest trade cycles must close matched BTC quantity")
         cycles.append(
             _ClosedTradeCycle(
@@ -811,6 +818,7 @@ def _reconstruct_closed_trade_cycles(
                 slippage=entry_slippage + exit_slippage,
             )
         )
+        inventory = 0.0
         entry_time = None
         entry_quantity = 0.0
         entry_notional = 0.0
@@ -821,7 +829,7 @@ def _reconstruct_closed_trade_cycles(
         exit_fees = 0.0
         exit_slippage = 0.0
 
-    if not _close_enough(inventory, 0.0):
+    if not _quantity_close(inventory, 0.0):
         raise ValueError("forced-liquidation phase must finish with zero BTC inventory")
     return tuple(cycles)
 
@@ -833,8 +841,10 @@ def _validate_order_lifecycle(
     if first.record.status is not OrderStatus.CREATED:
         raise ValueError("backtest order lifecycle must begin CREATED")
     if (
-        not _close_enough(first.record.filled_quantity, 0.0)
-        or not _close_enough(first.record.remainder_quantity, first.record.requested_quantity)
+        not _quantity_close(
+            first.record.filled_quantity, 0.0, first.record.requested_quantity
+        )
+        or not _quantity_close(first.record.remainder_quantity, first.record.requested_quantity)
         or not _close_enough(first.record.fee, 0.0)
         or not _close_enough(first.record.slippage, 0.0)
     ):
@@ -858,16 +868,26 @@ def _validate_order_lifecycle(
     for current in lifecycle[1:]:
         if (
             current.record.side != previous.record.side
-            or not _close_enough(current.record.requested_quantity, previous.record.requested_quantity)
+            or not _quantity_close(
+                current.record.requested_quantity, previous.record.requested_quantity
+            )
             or current.signal_time != previous.signal_time
         ):
             raise ValueError("backtest order lifecycle fields must remain stable")
         if current.record.status not in transitions.get(previous.record.status, set()):
             raise ValueError("backtest order lifecycle transition is invalid")
+        quantity_tolerance = _quantity_tolerance(
+            current.record.requested_quantity,
+            current.record.filled_quantity,
+            previous.record.filled_quantity,
+            current.record.remainder_quantity,
+            previous.record.remainder_quantity,
+        )
         if (
-            current.record.filled_quantity + _RECONCILIATION_TOLERANCE < previous.record.filled_quantity
+            current.record.filled_quantity + quantity_tolerance
+            < previous.record.filled_quantity
             or current.record.remainder_quantity
-            > previous.record.remainder_quantity + _RECONCILIATION_TOLERANCE
+            > previous.record.remainder_quantity + quantity_tolerance
             or current.record.fee + _RECONCILIATION_TOLERANCE < previous.record.fee
             or current.record.slippage + _RECONCILIATION_TOLERANCE < previous.record.slippage
         ):
@@ -876,27 +896,33 @@ def _validate_order_lifecycle(
         fee_delta = current.record.fee - previous.record.fee
         slippage_delta = current.record.slippage - previous.record.slippage
         if current.record.status in terminal and current.record.status is not OrderStatus.COMPLETED:
-            if fill_delta > _RECONCILIATION_TOLERANCE:
+            if fill_delta > quantity_tolerance:
                 raise ValueError("terminal order states must not add fills")
         if current.record.status in {OrderStatus.CREATED, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED} and (
-            fill_delta > _RECONCILIATION_TOLERANCE
+            fill_delta > quantity_tolerance
         ):
             raise ValueError("unfilled order lifecycle states must not add fills")
         if current.record.status is OrderStatus.PARTIAL and (
-            fill_delta <= _RECONCILIATION_TOLERANCE
-            or current.record.filled_quantity >= current.record.requested_quantity - _RECONCILIATION_TOLERANCE
+            fill_delta <= quantity_tolerance
+            or current.record.remainder_quantity <= quantity_tolerance
         ):
             raise ValueError("PARTIAL order states require a proper incremental fill")
         if current.record.status is OrderStatus.COMPLETED and (
-            current.record.filled_quantity <= _RECONCILIATION_TOLERANCE
-            or not _close_enough(current.record.filled_quantity, current.record.requested_quantity)
-            or not _close_enough(current.record.remainder_quantity, 0.0)
-            or fill_delta <= _RECONCILIATION_TOLERANCE
+            current.record.filled_quantity <= quantity_tolerance
+            or not _quantity_close(
+                current.record.filled_quantity, current.record.requested_quantity
+            )
+            or not _quantity_close(
+                current.record.remainder_quantity,
+                0.0,
+                current.record.requested_quantity,
+            )
+            or fill_delta <= quantity_tolerance
         ):
             raise ValueError("COMPLETED orders must fully settle exactly once")
-        if fill_delta <= _RECONCILIATION_TOLERANCE:
+        if fill_delta <= quantity_tolerance:
             pending_slippage += max(0.0, slippage_delta)
-        if fill_delta > _RECONCILIATION_TOLERANCE:
+        if fill_delta > quantity_tolerance:
             if current.fill_time is None:
                 raise ValueError("incremental backtest fills require a fill timestamp")
             previous_notional = _cumulative_order_notional(previous.record)
@@ -923,7 +949,7 @@ def _validate_order_lifecycle(
 
 
 def _cumulative_order_notional(order: OrderRecord) -> float:
-    if order.filled_quantity <= _RECONCILIATION_TOLERANCE:
+    if order.filled_quantity <= _QUANTITY_ABSOLUTE_TOLERANCE:
         return 0.0
     if order.fill_price is None or not _is_finite_number(order.fill_price):
         raise ValueError("filled backtest orders require finite fill notional")
@@ -974,7 +1000,7 @@ def _validate_trades(
         if (
             entry_time != cycle.entry_time
             or exit_time != cycle.exit_time
-            or not _close_enough(trade.quantity, cycle.quantity)
+            or not _quantity_close(trade.quantity, cycle.quantity)
             or not _close_enough(trade.entry_price, expected_entry_price)
             or not _close_enough(trade.exit_price, expected_exit_price)
             or not _close_enough(trade.fees, cycle.fees)
@@ -993,7 +1019,7 @@ def _validate_trades(
         trade_quantity += trade.quantity
         trade_fees += trade.fees
         realized_net_pnl += trade.net_pnl
-    if not _close_enough(trade_quantity, order_evidence.sell_quantity):
+    if not _quantity_close(trade_quantity, order_evidence.sell_quantity):
         raise ValueError("closed trade quantity must reconcile with sell fills")
     if not _close_enough(trade_fees, order_evidence.total_fees):
         raise ValueError("closed trade fees must reconcile with order fills")
@@ -1017,6 +1043,33 @@ def _close_enough(left: object, right: object) -> bool:
             float(right),
             rel_tol=0.0,
             abs_tol=_RECONCILIATION_TOLERANCE,
+        )
+    )
+
+
+def _quantity_tolerance(*values: object) -> float:
+    scale = max(
+        (abs(float(value)) for value in values if _is_finite_number(value)),
+        default=0.0,
+    )
+    return max(
+        _QUANTITY_ABSOLUTE_TOLERANCE,
+        min(
+            scale * _QUANTITY_RELATIVE_TOLERANCE,
+            _QUANTITY_MAX_TOLERANCE,
+        ),
+    )
+
+
+def _quantity_close(left: object, right: object, *scale_values: object) -> bool:
+    return (
+        _is_finite_number(left)
+        and _is_finite_number(right)
+        and abs(float(left) - float(right))
+        <= _quantity_tolerance(
+            left,
+            right,
+            *scale_values,
         )
     )
 
