@@ -144,6 +144,27 @@ def test_interrupted_collection_resumes_from_saved_page_without_refetching_it(
     assert len(result.evidence.pages) == 2
 
 
+def test_documented_timezone_less_utc_pages_keep_raw_bytes_and_validate_checkpoint(
+    tmp_path: Path,
+) -> None:
+    pages = [
+        [_candle("2026-01-01T08:00:00", 108), _candle("2026-01-01T04:00:00", 104)],
+        [_candle("2026-01-01T00:00:00", 100), _candle("2025-12-31T20:00:00", 96)],
+    ]
+    result = _collect(tmp_path, _ScriptedPublicClient(pages))
+
+    assert result.evidence.complete
+    assert [page.oldest_timestamp_utc for page in result.evidence.pages] == [
+        "2026-01-01T04:00:00Z",
+        "2025-12-31T20:00:00Z",
+    ]
+    raw_pages = storage.load_raw_pages(result.evidence)
+    assert [row["candle_date_time_utc"] for row in raw_pages[0]] == [
+        "2026-01-01T08:00:00",
+        "2026-01-01T04:00:00",
+    ]
+
+
 def test_identical_cross_page_overlap_is_counted_and_uses_later_collected_provenance(
     tmp_path: Path,
 ) -> None:

@@ -386,7 +386,17 @@ class _PublicPaperCandleSource:
         raw = collected.frame
         if "market" not in raw or not raw["market"].eq("KRW-BTC").all():
             raise _CandleSchemaError("public candle market evidence is invalid")
-        renamed = raw.rename(
+        source_columns = [
+            "candle_date_time_utc",
+            "opening_price",
+            "high_price",
+            "low_price",
+            "trade_price",
+            "candle_acc_trade_volume",
+        ]
+        if not set(source_columns).issubset(raw.columns):
+            raise _CandleSchemaError("public candles are missing required fields")
+        frame = raw.loc[:, source_columns].rename(
             columns={
                 "candle_date_time_utc": "timestamp",
                 "opening_price": "open",
@@ -395,10 +405,7 @@ class _PublicPaperCandleSource:
                 "trade_price": "close",
                 "candle_acc_trade_volume": "volume",
             }
-        )
-        if "timestamp" not in renamed:
-            raise _CandleSchemaError("public candles are missing timestamps")
-        frame = renamed.loc[:, ["timestamp", "open", "high", "low", "close", "volume"]].copy()
+        ).copy()
         try:
             frame.index = pd.to_datetime(frame.pop("timestamp"), utc=True, errors="raise")
         except (TypeError, ValueError) as error:

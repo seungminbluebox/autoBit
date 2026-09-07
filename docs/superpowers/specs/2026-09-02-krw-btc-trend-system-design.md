@@ -161,6 +161,7 @@ close[t] < exit_low[t]
 
 - 240분 캔들 지원, 요청당 최대 200개, 캔들 그룹 IP 기준 초당 최대 10회: [분 캔들 조회](https://docs.upbit.com/kr/reference/list-candles-minutes)
 - 거래가 없는 시간에는 캔들이 생성되지 않음: [분 캔들 조회](https://docs.upbit.com/kr/reference/list-candles-minutes)
+- 응답의 `candle_date_time_utc`는 UTC 기준이지만 공식 형식 `yyyy-MM-dd'T'HH:mm:ss`에는 timezone suffix가 없다. 공개 데이터 adapter는 이 정확한 무표시 형식만 UTC로 해석하고, 명시된 offset이 있다면 UTC가 아닌 값을 거부한다. 원본 응답 문자열은 증거에 그대로 보존하며 pagination checkpoint에는 정규화한 `Z` 형식을 기록한다. 별도의 숫자형 `timestamp`는 마지막 체결 저장 시각이므로 4시간봉 기준 시각으로 사용하지 않는다: [분 캔들 조회](https://docs.upbit.com/kr/reference/list-candles-minutes)
 - 일별 기준은 UTC이며 KST는 UTC+9: [거래 이용 안내](https://support.upbit.com/hc/ko/articles/4403838454809-%EA%B1%B0%EB%9E%98-%EC%9D%B4%EC%9A%A9-%EC%95%88%EB%82%B4)
 - KRW 마켓 최소 주문금액 5,000 KRW와 가격 구간별 호가 단위: [KRW 마켓 주문 정책](https://docs.upbit.com/kr/docs/krw-market-info)
 - 현재 KRW 마켓 수수료 예시 0.05%: [업비트 전략 도구 기술 문서](https://docs.upbit.com/kr/docs/upbit-strategy-toolkit-reference)

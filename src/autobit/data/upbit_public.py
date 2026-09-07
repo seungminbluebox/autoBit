@@ -2,6 +2,8 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import re
 import time
 from typing import Final
 
@@ -12,10 +14,28 @@ from autobit.config import DataConfig
 
 PUBLIC_CANDLE_URL: Final = "https://api.upbit.com/v1/candles/minutes/240"
 _RETRY_DELAYS_SECONDS: Final = (1.0, 2.0, 4.0)
+_TIMEZONE_LESS_UTC: Final = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$"
+)
 
 
 class PublicDataUnavailable(RuntimeError):
     """Raised after all retry attempts for public candle data fail."""
+
+
+def parse_candle_utc(value: str) -> datetime:
+    """Parse Upbit's UTC candle field, including its documented suffix-less form."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("candle_date_time_utc is invalid") from error
+    if parsed.tzinfo is None:
+        if not _TIMEZONE_LESS_UTC.fullmatch(value):
+            raise ValueError("candle_date_time_utc has an invalid timezone-less format")
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError("candle_date_time_utc must represent UTC")
+    return parsed.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)

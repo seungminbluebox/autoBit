@@ -13,7 +13,7 @@ from autobit.data.storage import (
     load_raw_pages,
     persist_raw_page,
 )
-from autobit.data.upbit_public import UpbitPublicClient
+from autobit.data.upbit_public import UpbitPublicClient, parse_candle_utc
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +100,7 @@ def collect_evidence_range(
                 _frame_from_pages(load_raw_pages(evidence), start, end), evidence
             )
 
-        timestamps = [_parse_utc(_timestamp_from(row)) for row in page]
+        timestamps = [_parse_candle_utc(_timestamp_from(row)) for row in page]
         oldest = min(timestamps)
         if oldest >= request_boundary:
             raise ValueError("public candle page did not move backward")
@@ -134,7 +134,7 @@ def _collect_legacy_range(
         if not page:
             break
 
-        timestamps = [_parse_utc(_timestamp_from(row)) for row in page]
+        timestamps = [_parse_candle_utc(_timestamp_from(row)) for row in page]
         oldest = min(timestamps)
         pages.append(page)
 
@@ -158,7 +158,7 @@ def _frame_from_pages(
     for page_index, page in enumerate(pages):
         for row_index, row in enumerate(page):
             timestamp_text = _timestamp_from(row)
-            timestamp = _parse_utc(timestamp_text)
+            timestamp = _parse_candle_utc(timestamp_text)
             if start <= timestamp <= end:
                 provenance = f"page:{page_index}:row:{row_index}"
                 existing = records.get(timestamp)
@@ -209,6 +209,10 @@ def _parse_utc(value: str) -> pd.Timestamp:
     if timestamp.tzinfo is None:
         raise ValueError("timestamps must be timezone-aware UTC values")
     return timestamp.tz_convert("UTC")
+
+
+def _parse_candle_utc(value: str) -> pd.Timestamp:
+    return pd.Timestamp(parse_candle_utc(value))
 
 
 def _format_utc(timestamp: pd.Timestamp) -> str:

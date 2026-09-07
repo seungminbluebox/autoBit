@@ -222,6 +222,43 @@ def test_collect_range_moves_backward_deduplicates_and_stops_before_start() -> N
     assert frame["candle_date_time_utc"].is_monotonic_increasing
 
 
+def test_collect_range_accepts_upbit_documented_timezone_less_utc_candles() -> None:
+    """Upbit labels this exact timezone-less response field as UTC."""
+    client = _client(
+        lambda _: httpx.Response(
+            200,
+            json=[
+                _candle("2026-01-01T08:00:00", 108),
+                _candle("2025-12-31T20:00:00", 96),
+            ],
+        )
+    )
+
+    frame = collect_range(
+        client,
+        start_utc="2026-01-01T00:00:00Z",
+        end_utc="2026-01-01T12:00:00Z",
+    )
+
+    assert frame["candle_date_time_utc"].tolist() == ["2026-01-01T08:00:00"]
+
+
+def test_collect_range_rejects_non_utc_offset_in_utc_candle_field() -> None:
+    client = _client(
+        lambda _: httpx.Response(
+            200,
+            json=[_candle("2026-01-01T08:00:00+09:00")],
+        )
+    )
+
+    with pytest.raises(ValueError, match="UTC"):
+        collect_range(
+            client,
+            start_utc="2026-01-01T00:00:00Z",
+            end_utc="2026-01-01T12:00:00Z",
+        )
+
+
 def test_collect_range_stops_when_a_repeated_page_cannot_move_backward() -> None:
     calls = 0
 

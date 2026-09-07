@@ -10,6 +10,7 @@ from typing import Final
 from uuid import uuid4
 
 from autobit.config import DataConfig
+from autobit.data.upbit_public import parse_candle_utc
 from autobit.data.upbit_public import PUBLIC_CANDLE_URL
 
 
@@ -629,7 +630,10 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 def _oldest_timestamp(payload: list[dict[str, object]]) -> str | None:
     timestamps = [row["candle_date_time_utc"] for row in payload if isinstance(row.get("candle_date_time_utc"), str)]
-    return min(timestamps) if timestamps else None
+    if not timestamps:
+        return None
+    oldest = min(parse_candle_utc(value) for value in timestamps)
+    return oldest.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _atomic_write(destination: Path, contents: bytes) -> None:

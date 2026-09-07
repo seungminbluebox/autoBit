@@ -959,6 +959,27 @@ def test_public_source_binds_cache_to_exclusive_end_and_requires_601_bars(
     assert len(client.calls) == 1
 
 
+def test_public_source_selects_candle_time_when_upbit_trade_timestamp_is_present(
+    tmp_path: Path,
+) -> None:
+    start = END - timedelta(hours=4 * 601)
+    rows = [_raw_row(start - timedelta(hours=4))]
+    rows.extend(_raw_row(start + timedelta(hours=4 * index)) for index in range(601))
+    for index, row in enumerate(rows):
+        row["candle_date_time_utc"] = str(row["candle_date_time_utc"]).removesuffix("Z")
+        row["timestamp"] = 1_700_000_000_000 + index
+
+    frame = _PublicPaperCandleSource(
+        tmp_path,
+        client=_PublicClient(list(reversed(rows))),
+    ).load_completed_candles(END)
+
+    assert len(frame) == 601
+    assert frame.index[0].to_pydatetime() == start
+    assert frame.index[-1].to_pydatetime() == END - timedelta(hours=4)
+    assert frame.index.tz is not None
+
+
 def test_corrupt_public_cache_fails_before_network_and_is_not_replaced(
     tmp_path: Path,
 ) -> None:
