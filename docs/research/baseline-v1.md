@@ -61,3 +61,5 @@ python -m autobit.cli walk-forward --input data/processed/krw-btc-7y-20260907T04
 ```
 
 새 결과에는 존재하지 않는 경로를 사용합니다. 기존 보고서·데이터는 변경하지 않습니다. 저장 위치와 원격 보관 한계는 [연구 기록 안내](README.md)를 참고합니다.
+
+[전체 거래 118회](baseline-v1-trades.md) · [후속 실험 비교](R20260908-results.md)
