@@ -1,4 +1,4 @@
-# PR 초안: 실제 업비트 데이터 백테스트 입력·수량 검증 수정
+# PR #2: 실제 업비트 데이터 백테스트 입력·수량 검증 수정
 
 대상: `codex/fix-real-upbit-timestamp` → `main`, 커밋 `f719dae`.
 
@@ -8,4 +8,4 @@
 
 이전 작업 기록: 관련 192 passed, 전체 1465 passed / 70 skipped, 독립 리뷰 지적 없음. 이 수치는 이전 실행 증거이며 이번 실행 결과와 구분합니다. 이번 재검증은 연구 결과 문서에 별도로 기록합니다.
 
-현재 PR은 로컬 초안입니다. 원격 push·PR 생성·main 병합·OCI 배포는 수행하지 않았습니다.
+2026-09-08 사용자 승인으로 원격 업로드와 [PR #2 생성](https://github.com/seungminbluebox/autoBit/pull/2)을 완료했습니다. main 병합·OCI 배포는 수행하지 않았습니다. 아래 연구 기록은 [후속 PR #3](https://github.com/seungminbluebox/autoBit/pull/3)에서 별도로 검토합니다.

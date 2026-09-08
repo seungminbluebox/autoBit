@@ -9,7 +9,9 @@
 - [실험 R20260908 사전 계획](R20260908-plan.md)
 - [당시 코드·입력 복구와 이어하기](reproduction.md)
 - [검증과 독립 리뷰 기록](verification.md)
-- [오류 수정 PR 초안](backtest-fix-pr.md)
+- [오류 수정 PR #2](backtest-fix-pr.md)
+
+2026-09-08 사용자 승인으로 코드와 문서를 GitHub에 업로드했습니다. [오류 수정 PR #2](https://github.com/seungminbluebox/autoBit/pull/2)는 main을 대상으로 하고, [연구 기록 PR #3](https://github.com/seungminbluebox/autoBit/pull/3)은 오류 수정 브랜치를 대상으로 합니다. #2 병합 후 #3의 대상을 main으로 바꾸고 차이를 확인할 예정입니다. 두 PR 모두 이번 작업에서는 병합하지 않았으며 서버 전략도 변경하지 않았습니다.
 
 전략 버전은 규칙 묶음, 실험 번호는 특정 데이터·비용·검증 조건의 시험을 뜻합니다. 채택되지 않은 후보도 삭제하지 않습니다. 각 실행에는 Git 커밋, 전체 설정, 데이터 SHA256, 의존성 잠금 파일, 실행 코드 사본과 결과 파일을 연결합니다. 기존 결과는 덮어쓰지 않습니다.
 
